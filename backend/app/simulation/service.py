@@ -39,8 +39,8 @@ class SimulationService:
         # Retrieve analysis details if available
         analysis = await get_analysis_by_id(req.analysis_id)
         segments_dict = []
-        if analysis and analysis.road_network:
-            segments_dict = [s.model_dump() for s in analysis.road_network.segments]
+        if analysis and analysis.segments:
+            segments_dict = [s.model_dump() for s in analysis.segments]
 
         # Build SUMO network files
         builder = SumoNetworkBuilder(work_dir)

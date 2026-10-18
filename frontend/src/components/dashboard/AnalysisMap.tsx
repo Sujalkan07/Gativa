@@ -100,7 +100,7 @@ export default function AnalysisMap({
       map.remove()
       mapRef.current = null
     }
-  }, [])
+  }, [TOMTOM_KEY])
 
   // 2. Switch Base Tile Layer (Streets vs Satellite)
   useEffect(() => {
@@ -141,7 +141,7 @@ export default function AnalysisMap({
             },
           ).addTo(map)
     }
-  }, [baseLayerType])
+  }, [baseLayerType, TOMTOM_KEY])
 
   // 2b. TomTom Real-Time Traffic Flow Tile Overlay
   useEffect(() => {
@@ -165,7 +165,7 @@ export default function AnalysisMap({
         },
       ).addTo(map)
     }
-  }, [showTomTomTraffic])
+  }, [showTomTomTraffic, TOMTOM_KEY])
 
   // 3. Render Polygon Boundary & Fit Bounds
   useEffect(() => {

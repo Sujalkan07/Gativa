@@ -147,11 +147,19 @@ async def run_analysis(polygon: GeoJSONPolygon) -> AnalysisResult:
 
         async def fetch_one(seg):
             async with sem:
-                # Use segment midpoint from geometry if available
-                if seg.geometry and seg.geometry.coordinates:
+                # Use segment true distance midpoint from geometry if available
+                if seg.geometry and seg.geometry.coordinates and len(seg.geometry.coordinates) >= 2:
                     coords = seg.geometry.coordinates
-                    mid_idx = len(coords) // 2
-                    lng_pt, lat_pt = coords[mid_idx][0], coords[mid_idx][1]
+                    try:
+                        from shapely.geometry import LineString
+                        line = LineString([(c[0], c[1]) for c in coords])
+                        mid_pt = line.interpolate(0.5, normalized=True)
+                        lng_pt, lat_pt = mid_pt.x, mid_pt.y
+                    except Exception:
+                        mid_idx = len(coords) // 2
+                        lng_pt, lat_pt = coords[mid_idx][0], coords[mid_idx][1]
+                elif seg.geometry and seg.geometry.coordinates and len(seg.geometry.coordinates) == 1:
+                    lng_pt, lat_pt = seg.geometry.coordinates[0][0], seg.geometry.coordinates[0][1]
                 else:
                     lat_pt, lng_pt = centroid_lat, centroid_lng
                 return await fetch_flow_for_point(lat_pt, lng_pt, seg.segment_id)

@@ -49,19 +49,19 @@ export default function TrafficFlowTab({
   const avgSpeed =
     summary?.avg_observed_speed_kmh != null
       ? summary.avg_observed_speed_kmh.toFixed(1)
-      : '32.4'
+      : '—'
   const freeFlowAvg =
     summary?.avg_free_flow_speed_kmh != null
       ? summary.avg_free_flow_speed_kmh.toFixed(1)
-      : '50.0'
+      : '—'
   const delayIndex =
     summary?.avg_free_flow_speed_kmh && summary?.avg_observed_speed_kmh
       ? (summary.avg_free_flow_speed_kmh / Math.max(1, summary.avg_observed_speed_kmh)).toFixed(2)
-      : '1.54'
+      : '—'
 
   const getLosInfo = (obsSpeed?: number | null, freeFlowSpeed?: number | null) => {
-    if (!obsSpeed || !freeFlowSpeed || freeFlowSpeed <= 0) {
-      return { grade: 'LOS B', color: 'bg-[#138808]/15 text-[#138808]' }
+    if (obsSpeed == null || freeFlowSpeed == null || freeFlowSpeed <= 0) {
+      return { grade: 'Unsampled', color: 'bg-slate-100 text-slate-500' }
     }
     const ratio = obsSpeed / freeFlowSpeed
     if (ratio >= 0.85) return { grade: 'LOS A', color: 'bg-[#138808]/20 text-[#138808]' }
@@ -100,7 +100,9 @@ export default function TrafficFlowTab({
             <span className="font-mono text-xl font-bold text-[var(--color-on-surface)]">
               {avgSpeed}
             </span>
-            <span className="font-mono text-xs text-[var(--color-secondary)]">km/h</span>
+            {avgSpeed !== '—' && (
+              <span className="font-mono text-xs text-[var(--color-secondary)]">km/h</span>
+            )}
           </div>
 
           <div className="flex items-baseline gap-1.5">
@@ -110,7 +112,9 @@ export default function TrafficFlowTab({
             <span className="font-mono text-xl font-bold text-[var(--color-secondary)]">
               {freeFlowAvg}
             </span>
-            <span className="font-mono text-xs text-[var(--color-secondary)]">km/h</span>
+            {freeFlowAvg !== '—' && (
+              <span className="font-mono text-xs text-[var(--color-secondary)]">km/h</span>
+            )}
           </div>
 
           <div className="flex items-baseline gap-1.5">
@@ -118,7 +122,7 @@ export default function TrafficFlowTab({
               Network Delay Index:
             </span>
             <span className="font-mono text-xl font-bold text-[var(--color-primary-container)]">
-              {delayIndex}x
+              {delayIndex !== '—' ? `${delayIndex}x` : '—'}
             </span>
           </div>
         </div>
@@ -202,11 +206,15 @@ export default function TrafficFlowTab({
                         </td>
                         <td className="py-2 px-2 text-right font-mono font-bold text-[var(--color-on-surface)]">
                           {obs}
-                          <span className="text-[9px] text-[var(--color-secondary)] font-normal ml-0.5">km/h</span>
+                          {obs !== '—' && (
+                            <span className="text-[9px] text-[var(--color-secondary)] font-normal ml-0.5">km/h</span>
+                          )}
                         </td>
                         <td className="py-2 px-2 text-right font-mono text-[var(--color-secondary)]">
                           {ff}
-                          <span className="text-[9px] font-normal ml-0.5">km/h</span>
+                          {ff !== '—' && (
+                            <span className="text-[9px] font-normal ml-0.5">km/h</span>
+                          )}
                         </td>
                         <td className="py-2 px-3 text-right">
                           <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold uppercase font-mono ${los.color}`}>

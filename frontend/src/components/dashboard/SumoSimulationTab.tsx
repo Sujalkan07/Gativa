@@ -1,4 +1,6 @@
-import { useEffect, useRef, useState, useCallback } from 'react'
+import { useEffect, useRef, useState, useCallback, useMemo } from 'react'
+import L from 'leaflet'
+import 'leaflet/dist/leaflet.css'
 import { api, GativaApiError } from '../../api/client'
 import type {
   AnalysisResult,
@@ -21,6 +23,13 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
   const [error, setError] = useState<string | null>(null)
 
   const timerRef = useRef<number | null>(null)
+  const mapContainerRef = useRef<HTMLDivElement>(null)
+  const mapRef = useRef<L.Map | null>(null)
+  const segmentsGroupRef = useRef<L.LayerGroup | null>(null)
+  const vehiclesGroupRef = useRef<L.LayerGroup | null>(null)
+  const signalsGroupRef = useRef<L.LayerGroup | null>(null)
+
+  const TOMTOM_KEY = import.meta.env.VITE_TOMTOM_API_KEY
 
   // 1. Prepare Simulation on Mount or when analysisId changes
   useEffect(() => {
@@ -86,6 +95,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
           setSimStatus(res)
           if (res.state === 'completed') {
             setIsPlaying(false)
+            api.getScenarioComparison(simId).then(setComparison).catch(() => {})
           }
         })
         .catch((err) => {
@@ -108,20 +118,201 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
     if (isPlaying) {
       api.pauseSimulation(simId).catch(() => {})
       setIsPlaying(false)
+      api.getScenarioComparison(simId).then(setComparison).catch(() => {})
     } else {
       api.startSimulation(simId).catch(() => {})
       setIsPlaying(true)
     }
   }, [simId, isPlaying])
 
+  const handleStepOnce = useCallback(() => {
+    if (!simId) return
+    api
+      .stepSimulation(simId, 2)
+      .then((res) => {
+        setSimStatus(res)
+        api.getScenarioComparison(simId).then(setComparison).catch(() => {})
+      })
+      .catch((err) => console.error('Step error:', err))
+  }, [simId])
+
   const handleReset = useCallback(() => {
     if (!simId) return
     setIsPlaying(false)
     api
       .resetSimulation(simId)
-      .then((res) => setSimStatus(res))
+      .then((res) => {
+        setSimStatus(res)
+        api.getScenarioComparison(simId).then(setComparison).catch(() => {})
+      })
       .catch(() => {})
   }, [simId])
+
+  // 4. Initialize Leaflet Map in Simulation Viewport
+  useEffect(() => {
+    if (!mapContainerRef.current) return
+    if (mapRef.current) return
+
+    const map = L.map(mapContainerRef.current, {
+      zoomControl: false,
+      attributionControl: true,
+    })
+
+    L.control.zoom({ position: 'bottomright' }).addTo(map)
+
+    const baseTile = TOMTOM_KEY
+      ? L.tileLayer(
+          `https://{s}.api.tomtom.com/map/1/tile/basic/main/{z}/{x}/{y}.png?key=${TOMTOM_KEY}`,
+          {
+            maxZoom: 19,
+            subdomains: ['a', 'b', 'c', 'd'],
+            attribution: '&copy; TomTom, &copy; OpenStreetMap',
+          },
+        )
+      : L.tileLayer('https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png', {
+          maxZoom: 19,
+          attribution: '&copy; OpenStreetMap contributors',
+        })
+
+    baseTile.addTo(map)
+
+    const segGroup = L.layerGroup().addTo(map)
+    const vehGroup = L.layerGroup().addTo(map)
+    const sigGroup = L.layerGroup().addTo(map)
+
+    segmentsGroupRef.current = segGroup
+    vehiclesGroupRef.current = vehGroup
+    signalsGroupRef.current = sigGroup
+    mapRef.current = map
+
+    // Render polygon boundary and road network
+    if (analysis.polygon?.coordinates?.[0]?.length) {
+      const ring = analysis.polygon.coordinates[0]
+      const latLngs: L.LatLngExpression[] = ring.map((c) => [c[1], c[0]])
+      L.polygon(latLngs, {
+        color: '#2d3b8f',
+        weight: 1.5,
+        fillColor: '#eff4ff',
+        fillOpacity: 0.15,
+        dashArray: '4 4',
+      }).addTo(segGroup)
+
+      const bounds = L.latLngBounds(latLngs)
+      map.fitBounds(bounds, { padding: [30, 30] })
+    }
+
+    // Render road network segments
+    if (analysis.segments?.length) {
+      analysis.segments.forEach((seg) => {
+        if (!seg.geometry?.coordinates || seg.geometry.coordinates.length < 2) return
+        const pts: L.LatLngExpression[] = seg.geometry.coordinates.map((c) => [c[1], c[0]])
+        const color =
+          seg.road_type === 'highway'
+            ? '#ff9933'
+            : seg.road_type === 'arterial'
+              ? '#2d3b8f'
+              : '#64748b'
+        const weight = seg.road_type === 'highway' ? 4 : seg.road_type === 'arterial' ? 3 : 2
+
+        const line = L.polyline(pts, {
+          color,
+          weight,
+          opacity: 0.8,
+          lineCap: 'round',
+          lineJoin: 'round',
+        })
+
+        line.bindTooltip(
+          `<div class="text-xs font-sans"><b>${seg.name || 'Road Segment'}</b><br/>${seg.road_type} • ${seg.length_m.toFixed(0)}m</div>`,
+          { sticky: true },
+        )
+        segGroup.addLayer(line)
+      })
+    }
+
+    return () => {
+      map.remove()
+      mapRef.current = null
+    }
+  }, [analysis.polygon, analysis.segments, TOMTOM_KEY])
+
+  // 5. Update vehicle positions and signals dynamically
+  const elapsed = simStatus?.elapsed_seconds ?? 0
+  const duration = simStatus?.duration_seconds ?? 600
+  const progressPct = Math.min(100, (elapsed / duration) * 100)
+  const metrics = simStatus?.current_metrics
+  const vehicles: VehiclePosition[] = useMemo(
+    () => simStatus?.vehicles ?? [],
+    [simStatus?.vehicles],
+  )
+  const isNorthSouthGreen = Math.floor(elapsed / 15) % 2 === 0
+
+  useEffect(() => {
+    const vehGroup = vehiclesGroupRef.current
+    if (!vehGroup) return
+
+    vehGroup.clearLayers()
+
+    vehicles.forEach((veh) => {
+      if (veh.lat && veh.lng && !isNaN(veh.lat) && !isNaN(veh.lng)) {
+        const isBus = veh.type === 'bus'
+        const speedColor =
+          veh.speed_kmh < 18
+            ? '#DC2626'
+            : veh.speed_kmh <= 35
+              ? '#F59E0B'
+              : isBus
+                ? '#0A1145'
+                : '#138808'
+
+        const icon = L.divIcon({
+          className: 'sumo-vehicle-icon',
+          iconSize: [22, 12],
+          iconAnchor: [11, 6],
+          html: `<div style="transform: rotate(${veh.angle}deg); width: ${isBus ? '22px' : '16px'}; height: ${isBus ? '10px' : '8px'}; background-color: ${speedColor}; border: 1.5px solid #ffffff; border-radius: 2px; box-shadow: 0 1px 3px rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center;">
+            ${isBus ? '<span style="font-size: 5px; color: #ffffff; font-weight: bold; font-family: monospace;">B</span>' : ''}
+          </div>`,
+        })
+
+        const marker = L.marker([veh.lat, veh.lng], { icon })
+        marker.bindTooltip(
+          `<div class="text-[11px] font-mono"><b>${veh.id}</b> (${veh.type})<br/>Speed: ${veh.speed_kmh.toFixed(1)} km/h<br/>Wait: ${veh.waiting_time_s.toFixed(1)}s</div>`,
+          { direction: 'top', offset: [0, -6] },
+        )
+        vehGroup.addLayer(marker)
+      }
+    })
+  }, [vehicles])
+
+  // Update signal indicators
+  useEffect(() => {
+    const sigGroup = signalsGroupRef.current
+    if (!sigGroup) return
+
+    sigGroup.clearLayers()
+
+    // Mark key bottleneck or intersection nodes as traffic signals
+    if (analysis.bottlenecks?.length) {
+      analysis.bottlenecks.slice(0, 3).forEach((b, idx) => {
+        if (b.lat && b.lng) {
+          const sigIcon = L.divIcon({
+            className: 'sumo-signal-icon',
+            iconSize: [26, 26],
+            iconAnchor: [13, 13],
+            html: `<div style="width: 26px; height: 26px; border-radius: 50%; background: #0A1145; border: 2px solid #ffffff; box-shadow: 0 2px 5px rgba(0,0,0,0.4); display: flex; align-items: center; justify-content: center; position: relative;">
+              <span style="font-size: 8px; color: #FF9933; font-weight: bold; font-family: monospace;">TL${idx + 1}</span>
+              <span style="position: absolute; top: -2px; right: -2px; width: 8px; height: 8px; border-radius: 50%; background: ${isNorthSouthGreen ? '#138808' : '#DC2626'}; border: 1.5px solid #ffffff;"></span>
+            </div>`,
+          })
+          const sigMarker = L.marker([b.lat, b.lng], { icon: sigIcon })
+          sigMarker.bindTooltip(
+            `<div class="text-[11px] font-sans"><b>Traffic Signal TL${idx + 1}</b><br/>Phase: ${isNorthSouthGreen ? 'North-South Green' : 'East-West Green'}</div>`,
+          )
+          sigGroup.addLayer(sigMarker)
+        }
+      })
+    }
+  }, [analysis.bottlenecks, isNorthSouthGreen])
 
   // Format MM:SS
   const formatTime = (secs: number) => {
@@ -129,16 +320,6 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
     const s = Math.floor(secs % 60)
     return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
   }
-
-  const elapsed = simStatus?.elapsed_seconds ?? 0
-  const duration = simStatus?.duration_seconds ?? 600
-  const progressPct = Math.min(100, (elapsed / duration) * 100)
-
-  const metrics = simStatus?.current_metrics
-  const vehicles: VehiclePosition[] = simStatus?.vehicles ?? []
-
-  // Dynamic Signal Phase based on elapsed time (alternates green every 15s)
-  const isNorthSouthGreen = Math.floor(elapsed / 15) % 2 === 0
 
   return (
     <div className="flex flex-col gap-6">
@@ -149,7 +330,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
             SUMO Traffic Simulation
           </h1>
           <p className="text-sm text-slate-500 mt-0.5">
-            Simulate microscopic traffic flow and evaluate alternative traffic-control strategies.
+            Microscopic traffic simulation powered by Eclipse SUMO &amp; TraCI with live telemetry.
           </p>
         </div>
         <div className="flex items-center gap-3">
@@ -201,7 +382,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
         </div>
       )}
 
-      {/* Secondary Configuration Bar (Subtle & Compact) */}
+      {/* Secondary Configuration Bar */}
       <div className="bg-white border border-[#cbdbf5] rounded-xl px-5 py-3 flex flex-wrap items-center justify-between gap-4 text-xs shadow-xs">
         <div className="flex flex-wrap items-center gap-6">
           <div className="flex items-center gap-2">
@@ -228,159 +409,18 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
         </div>
         <div className="text-[11px] font-mono text-slate-500 flex items-center gap-1.5">
           <span className="w-2 h-2 rounded-full bg-[#138808]"></span>
-          <span>TraCI v1.28.0 • Step: 0.2s</span>
+          <span>TraCI Engine • Step: 0.2s</span>
         </div>
       </div>
 
-      {/* AREA B: MAIN DOMINANT SIMULATION VIEWPORT */}
+      {/* AREA B: MAIN DOMINANT SIMULATION VIEWPORT (Real Geospatial Leaflet Map) */}
       <div className="bg-white rounded-xl border border-[#cbdbf5] shadow-xs overflow-hidden flex flex-col">
-        {/* Viewport Simulation Canvas Area */}
-        <div className="relative w-full h-[460px] bg-[#f8faff] overflow-hidden select-none">
-          {/* Subtle Grid Pattern Background */}
-          <div
-            className="absolute inset-0 opacity-30"
-            style={{
-              backgroundImage:
-                'linear-gradient(to right, #cbd5e1 1px, transparent 1px), linear-gradient(to bottom, #cbd5e1 1px, transparent 1px)',
-              backgroundSize: '32px 32px',
-            }}
-          ></div>
-
-          {/* Crisp Vector Road Network matching Stitch approved screen */}
-          <svg className="absolute inset-0 w-full h-full" viewBox="0 0 1000 480">
-            <defs>
-              <filter id="glow-green" x="-30%" y="-30%" width="160%" height="160%">
-                <feDropShadow dx="0" dy="0" stdDeviation="3" floodColor="#138808" />
-              </filter>
-              <filter id="glow-red" x="-30%" y="-30%" width="160%" height="160%">
-                <feDropShadow dx="0" dy="0" stdDeviation="3" floodColor="#DC2626" />
-              </filter>
-            </defs>
-
-            {/* Outer road curbs / shoulders */}
-            <path d="M 60 240 L 940 240" stroke="#cbd5e1" strokeWidth="36" strokeLinecap="round" />
-            <path d="M 500 40 L 500 440" stroke="#cbd5e1" strokeWidth="32" strokeLinecap="round" />
-            <path d="M 500 240 L 860 380" stroke="#cbd5e1" strokeWidth="24" strokeLinecap="round" />
-            <path d="M 220 100 L 780 100" stroke="#e2e8f0" strokeWidth="18" strokeLinecap="round" />
-            <path d="M 240 100 L 240 380" stroke="#e2e8f0" strokeWidth="16" strokeLinecap="round" />
-
-            {/* Asphalt Roadbeds */}
-            <path d="M 60 240 L 940 240" stroke="#1e293b" strokeWidth="28" />
-            <path d="M 500 40 L 500 440" stroke="#1e293b" strokeWidth="24" />
-            <path d="M 500 240 L 860 380" stroke="#1e293b" strokeWidth="18" />
-            <path d="M 220 100 L 780 100" stroke="#334155" strokeWidth="12" />
-            <path d="M 240 100 L 240 380" stroke="#334155" strokeWidth="10" />
-
-            {/* Centerline Lane Dividers */}
-            <path d="M 60 240 L 940 240" stroke="#ffffff" strokeWidth="1.5" strokeDasharray="8 8" opacity="0.6" />
-            <path d="M 500 40 L 500 440" stroke="#ffffff" strokeWidth="1.5" strokeDasharray="8 8" opacity="0.6" />
-            <path d="M 500 240 L 860 380" stroke="#ffffff" strokeWidth="1.2" strokeDasharray="6 6" opacity="0.5" />
-
-            {/* Flow Condition Indicators */}
-            <path d="M 80 234 L 380 234" stroke="#138808" strokeWidth="4" strokeLinecap="round" />
-            <path d="M 380 234 L 430 234" stroke="#F59E0B" strokeWidth="6" strokeLinecap="round" />
-            <path d="M 430 234 L 485 234" stroke="#DC2626" strokeWidth="6" strokeLinecap="round" />
-            <path d="M 515 234 L 920 234" stroke="#138808" strokeWidth="4" strokeLinecap="round" />
-
-            <path d="M 494 50 L 494 200" stroke="#138808" strokeWidth="4" />
-            <path d="M 494 200 L 494 230" stroke="#F59E0B" strokeWidth="6" />
-            <path d="M 494 250 L 494 430" stroke="#138808" strokeWidth="4" />
-            <path d="M 515 248 L 845 378" stroke="#138808" strokeWidth="4" />
-
-            {/* Signalized Junction 12 */}
-            <g transform="translate(500, 240)">
-              <circle r="20" fill="#0A1145" stroke="#ffffff" strokeWidth="2" />
-              <text x="0" y="3" textAnchor="middle" fill="#FF9933" fontSize="8" fontWeight="bold" fontFamily="monospace">
-                J12
-              </text>
-              {/* Dynamic Signal heads */}
-              <circle
-                cx="-16"
-                cy="-8"
-                r="4.5"
-                fill={isNorthSouthGreen ? '#DC2626' : '#138808'}
-                filter={isNorthSouthGreen ? 'url(#glow-red)' : 'url(#glow-green)'}
-              />
-              <circle
-                cx="16"
-                cy="8"
-                r="4.5"
-                fill={isNorthSouthGreen ? '#DC2626' : '#138808'}
-                filter={isNorthSouthGreen ? 'url(#glow-red)' : 'url(#glow-green)'}
-              />
-              <circle
-                cx="8"
-                cy="-16"
-                r="4"
-                fill={isNorthSouthGreen ? '#138808' : '#DC2626'}
-                filter={isNorthSouthGreen ? 'url(#glow-green)' : 'url(#glow-red)'}
-              />
-              <circle
-                cx="-8"
-                cy="16"
-                r="4"
-                fill={isNorthSouthGreen ? '#138808' : '#DC2626'}
-                filter={isNorthSouthGreen ? 'url(#glow-green)' : 'url(#glow-red)'}
-              />
-            </g>
-
-            {/* Minor Junction 14 */}
-            <g transform="translate(240, 240)">
-              <circle r="14" fill="#1e293b" stroke="#ffffff" strokeWidth="1.5" />
-              <text x="0" y="3" textAnchor="middle" fill="#cbd5e1" fontSize="7" fontWeight="bold">
-                J14
-              </text>
-              <circle cx="-11" cy="0" r="3" fill="#138808" />
-              <circle cx="11" cy="0" r="3" fill="#138808" />
-            </g>
-          </svg>
-
-          {/* Real Simulated Vehicle Markers Rendered Across Viewport */}
-          <div className="absolute inset-0 pointer-events-none">
-            {vehicles.map((veh, i) => {
-              // Map vehicle (lng, lat) offsets into viewport (x: 80..920, y: 60..420)
-              const normX = 120 + ((i * 55 + (elapsed * 25 * speedMultiplier)) % 740)
-              const normY =
-                i % 3 === 0
-                  ? 236
-                  : i % 3 === 1
-                    ? 80 + ((i * 35 + (elapsed * 20 * speedMultiplier)) % 320)
-                    : 234
-
-              const isBus = veh.type === 'bus'
-              const colorBg =
-                veh.speed_kmh < 18
-                  ? 'bg-[#DC2626]'
-                  : veh.speed_kmh <= 35
-                    ? 'bg-[#F59E0B]'
-                    : isBus
-                      ? 'bg-[#0A1145]'
-                      : i % 2 === 0
-                        ? 'bg-[#FF9933]'
-                        : 'bg-[#138808]'
-
-              return (
-                <div
-                  key={veh.id || i}
-                  className="absolute transition-transform duration-200"
-                  style={{
-                    transform: `translate(${normX}px, ${normY}px)`,
-                  }}
-                >
-                  <div
-                    className={`${
-                      isBus ? 'w-5 h-2.5' : 'w-3.5 h-2'
-                    } ${colorBg} rounded-xs shadow-xs border border-white/90 flex items-center justify-center`}
-                  >
-                    {isBus && <span className="text-[5px] text-white font-mono font-bold">B</span>}
-                  </div>
-                </div>
-              )
-            })}
-          </div>
+        {/* Map Canvas */}
+        <div className="relative w-full h-[480px] bg-[#f8faff] overflow-hidden">
+          <div ref={mapContainerRef} className="w-full h-full" />
 
           {/* Clean Corner Legend */}
-          <div className="absolute top-4 right-4 bg-white/95 backdrop-blur-xs border border-[#cbdbf5] rounded-lg p-2.5 shadow-xs text-xs flex flex-col gap-1.5">
+          <div className="absolute top-4 right-4 z-[500] bg-white/95 backdrop-blur-xs border border-[#cbdbf5] rounded-lg p-2.5 shadow-xs text-xs flex flex-col gap-1.5">
             <div className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-0.5">
               Traffic Conditions
             </div>
@@ -396,21 +436,30 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
               <span className="w-2.5 h-2.5 rounded-full bg-[#DC2626]"></span>
               <span>Congested (&lt; 18 km/h)</span>
             </div>
+            <div className="border-t border-slate-200 pt-1 mt-0.5 flex items-center gap-2 text-[11px] text-slate-700">
+              <span className="w-2.5 h-2.5 rounded-xs bg-[#0A1145]"></span>
+              <span>Bus Transit</span>
+            </div>
           </div>
 
-          {/* Subtle Corridor Label in Viewport */}
-          <div className="absolute top-4 left-4 bg-white/95 backdrop-blur-xs border border-[#cbdbf5] rounded-lg px-3 py-1.5 shadow-xs text-xs">
+          {/* Corridor Network Label */}
+          <div className="absolute top-4 left-4 z-[500] bg-white/95 backdrop-blur-xs border border-[#cbdbf5] rounded-lg px-3 py-1.5 shadow-xs text-xs">
             <span className="font-bold text-[#0A1145]">Corridor Network:</span>
             <span className="text-slate-600 font-mono text-[11px] ml-1">
-              {simStatus?.edge_count ?? 142} Edges • {simStatus?.junction_count ?? 38} Junctions • {simStatus?.signal_count ?? 4} Signals
+              {simStatus?.edge_count ?? analysis.segments.length} Edges • {simStatus?.junction_count ?? analysis.road_network?.intersection_count ?? 0} Junctions • {simStatus?.signal_count ?? 1} Signals
             </span>
+          </div>
+
+          {/* Active Vehicles Counter */}
+          <div className="absolute bottom-4 left-4 z-[500] bg-[#0A1145]/90 text-white backdrop-blur-xs rounded-lg px-3 py-1 shadow-xs text-xs font-mono font-semibold">
+            {vehicles.length} Active Vehicles
           </div>
         </div>
 
-        {/* Integrated Compact Bottom Playback Control Bar */}
+        {/* Integrated Bottom Playback Control Bar */}
         <div className="px-5 py-3 bg-white border-t border-[#cbdbf5] flex flex-wrap items-center justify-between gap-4">
-          {/* Controls: Play/Pause & Reset */}
-          <div className="flex items-center gap-2.5">
+          {/* Controls: Play/Pause, Step, & Reset */}
+          <div className="flex items-center gap-2">
             <button
               onClick={handleTogglePlay}
               className={`flex items-center gap-1.5 px-4 py-2 font-bold text-xs rounded-lg shadow-xs transition-all ${
@@ -425,8 +474,19 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
               <span>{isPlaying ? 'Pause' : elapsed > 0 ? 'Resume' : 'Play'}</span>
             </button>
             <button
+              onClick={handleStepOnce}
+              disabled={isPlaying}
+              className="flex items-center gap-1 px-3 py-2 bg-white hover:bg-[#eff4ff] text-slate-700 font-semibold text-xs border border-[#cbdbf5] rounded-lg transition-colors disabled:opacity-50"
+              title="Advance single step (2s)"
+            >
+              <span className="material-symbols-outlined text-[16px] text-slate-500">
+                redo
+              </span>
+              <span>Step</span>
+            </button>
+            <button
               onClick={handleReset}
-              className="flex items-center gap-1.5 px-3 py-2 bg-white hover:bg-[#eff4ff] text-slate-700 font-semibold text-xs border border-[#cbdbf5] rounded-lg transition-colors"
+              className="flex items-center gap-1 px-3 py-2 bg-white hover:bg-[#eff4ff] text-slate-700 font-semibold text-xs border border-[#cbdbf5] rounded-lg transition-colors"
             >
               <span className="material-symbols-outlined text-[16px] text-slate-500">
                 restart_alt
@@ -471,7 +531,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
         </div>
       </div>
 
-      {/* AREA C: COMPACT METRICS AND RESULTS (Exactly 4 KPI cards matching Stitch design) */}
+      {/* AREA C: COMPACT METRICS AND RESULTS (4 KPI Cards) */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         {/* KPI Card 1: Average Speed */}
         <div className="bg-white border border-[#cbdbf5] rounded-xl p-4 shadow-xs flex flex-col justify-between">
@@ -483,12 +543,23 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
           </div>
           <div className="flex items-baseline gap-1.5">
             <span className="text-2xl font-bold font-mono text-[#0A1145]">
-              {metrics ? metrics.avg_speed_kmh.toFixed(1) : '27.4'}
+              {elapsed > 0 && metrics && metrics.avg_speed_kmh > 0
+                ? metrics.avg_speed_kmh.toFixed(1)
+                : '—'}
             </span>
-            <span className="text-xs text-slate-500 font-sans">km/h</span>
+            {elapsed > 0 && metrics && metrics.avg_speed_kmh > 0 && (
+              <span className="text-xs text-slate-500 font-sans">km/h</span>
+            )}
           </div>
           <div className="mt-2 text-[11px] font-semibold text-[#138808] flex items-center gap-1">
-            <span>↑ +50.5% vs baseline</span>
+            {elapsed > 0 && metrics?.variance_speed_pct != null ? (
+              <span>
+                {metrics.variance_speed_pct >= 0 ? '↑ +' : '↓ '}
+                {metrics.variance_speed_pct.toFixed(1)}% vs baseline
+              </span>
+            ) : (
+              <span className="text-slate-400 font-normal">Awaiting simulation step</span>
+            )}
           </div>
         </div>
 
@@ -502,12 +573,23 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
           </div>
           <div className="flex items-baseline gap-1.5">
             <span className="text-2xl font-bold font-mono text-[#0A1145]">
-              {metrics ? metrics.avg_waiting_time_s.toFixed(1) : '42.5'}
+              {elapsed > 0 && metrics && metrics.avg_waiting_time_s > 0
+                ? metrics.avg_waiting_time_s.toFixed(1)
+                : '—'}
             </span>
-            <span className="text-xs text-slate-500 font-sans">s/veh</span>
+            {elapsed > 0 && metrics && metrics.avg_waiting_time_s > 0 && (
+              <span className="text-xs text-slate-500 font-sans">s/veh</span>
+            )}
           </div>
           <div className="mt-2 text-[11px] font-semibold text-[#138808] flex items-center gap-1">
-            <span>↓ -46.7% delay</span>
+            {elapsed > 0 && metrics?.variance_waiting_pct != null ? (
+              <span>
+                {metrics.variance_waiting_pct < 0 ? '↓ ' : '↑ +'}
+                {metrics.variance_waiting_pct.toFixed(1)}% delay
+              </span>
+            ) : (
+              <span className="text-slate-400 font-normal">Awaiting simulation step</span>
+            )}
           </div>
         </div>
 
@@ -521,12 +603,23 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
           </div>
           <div className="flex items-baseline gap-1.5">
             <span className="text-2xl font-bold font-mono text-[#0A1145]">
-              {metrics ? metrics.avg_queue_length_m.toFixed(1) : '58.0'}
+              {elapsed > 0 && metrics && metrics.avg_queue_length_m > 0
+                ? metrics.avg_queue_length_m.toFixed(1)
+                : '—'}
             </span>
-            <span className="text-xs text-slate-500 font-sans">m</span>
+            {elapsed > 0 && metrics && metrics.avg_queue_length_m > 0 && (
+              <span className="text-xs text-slate-500 font-sans">m</span>
+            )}
           </div>
           <div className="mt-2 text-[11px] font-semibold text-[#138808] flex items-center gap-1">
-            <span>↓ -56.8% spillback</span>
+            {elapsed > 0 && metrics?.variance_queue_pct != null ? (
+              <span>
+                {metrics.variance_queue_pct < 0 ? '↓ ' : '↑ +'}
+                {metrics.variance_queue_pct.toFixed(1)}% spillback
+              </span>
+            ) : (
+              <span className="text-slate-400 font-normal">Awaiting simulation step</span>
+            )}
           </div>
         </div>
 
@@ -540,12 +633,21 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
           </div>
           <div className="flex items-baseline gap-1.5">
             <span className="text-2xl font-bold font-mono text-[#0A1145]">
-              {metrics ? metrics.completed_vehicles : '512'}
+              {elapsed > 0 && metrics ? metrics.completed_vehicles : '—'}
             </span>
-            <span className="text-xs text-slate-500 font-sans">vehs</span>
+            {elapsed > 0 && metrics && (
+              <span className="text-xs text-slate-500 font-sans">vehs</span>
+            )}
           </div>
           <div className="mt-2 text-[11px] font-semibold text-[#138808] flex items-center gap-1">
-            <span>↑ +20.9% throughput</span>
+            {elapsed > 0 && metrics?.variance_completed_pct != null ? (
+              <span>
+                {metrics.variance_completed_pct >= 0 ? '↑ +' : '↓ '}
+                {metrics.variance_completed_pct.toFixed(1)}% throughput
+              </span>
+            ) : (
+              <span className="text-slate-400 font-normal">Awaiting simulation step</span>
+            )}
           </div>
         </div>
       </div>
@@ -575,61 +677,37 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
               </tr>
             </thead>
             <tbody className="divide-y divide-[#e2e8f0] font-mono text-xs">
-              {(comparison?.rows ?? [
-                {
-                  metric: 'Average Speed',
-                  baseline: '18.2 km/h',
-                  optimized: '27.4 km/h',
-                  variance: '↑ +50.5%',
-                  is_improvement: true,
-                },
-                {
-                  metric: 'Average Waiting Time',
-                  baseline: '88.5 s/veh',
-                  optimized: '42.5 s/veh',
-                  variance: '↓ -46.7% delay',
-                  is_improvement: true,
-                },
-                {
-                  metric: 'Average Queue Length',
-                  baseline: '148.0 m',
-                  optimized: '58.0 m',
-                  variance: '↓ -56.8% spillback',
-                  is_improvement: true,
-                },
-                {
-                  metric: 'Completed Vehicles',
-                  baseline: '412 vehs',
-                  optimized: '512 vehs',
-                  variance: '↑ +24.3% throughput',
-                  is_improvement: true,
-                },
-              ]).map((row, idx) => (
-                <tr key={idx} className="hover:bg-[#f8f9ff]">
-                  <td className="py-3 px-4 font-sans font-medium text-[#0A1145]">
-                    {row.metric}
-                  </td>
-                  <td className="py-3 px-4 text-slate-600">{row.baseline}</td>
-                  <td className="py-3 px-4 font-bold text-[#0A1145]">{row.optimized}</td>
-                  <td className="py-3 px-4">
-                    <span
-                      className={`inline-flex items-center gap-1 px-2 py-0.5 rounded font-bold ${
-                        row.is_improvement
-                          ? 'text-[#138808] bg-[#e6f4ea]'
-                          : 'text-[#DC2626] bg-[#fde8e8]'
-                      }`}
-                    >
-                      {row.variance}
-                    </span>
-                  </td>
-                </tr>
-              ))}
+              {comparison?.rows?.map((row, idx) => {
+                const isPending = row.variance.toLowerCase().includes('pending')
+                return (
+                  <tr key={idx} className="hover:bg-[#f8f9ff]">
+                    <td className="py-3 px-4 font-sans font-medium text-[#0A1145]">
+                      {row.metric}
+                    </td>
+                    <td className="py-3 px-4 text-slate-600">{row.baseline}</td>
+                    <td className="py-3 px-4 font-bold text-[#0A1145]">{row.optimized}</td>
+                    <td className="py-3 px-4">
+                      <span
+                        className={`inline-flex items-center gap-1 px-2 py-0.5 rounded font-bold ${
+                          isPending
+                            ? 'text-slate-500 bg-slate-100'
+                            : row.is_improvement
+                              ? 'text-[#138808] bg-[#e6f4ea]'
+                              : 'text-[#DC2626] bg-[#fde8e8]'
+                        }`}
+                      >
+                        {row.variance}
+                      </span>
+                    </td>
+                  </tr>
+                )
+              })}
             </tbody>
           </table>
         </div>
         <div className="mt-3 pt-2 text-[11px] text-slate-400 italic">
           {comparison?.methodology_notes ??
-            'Simulation results evaluated over 600s interval using HCM 6th Ed. calibrated demand.'}
+            'Simulation results evaluated over 600s interval using Highway Capacity Manual (HCM 6th Ed.) calibrated demand.'}
         </div>
       </div>
     </div>

@@ -169,74 +169,7 @@ async def _discover_local_street_names(poly: Polygon) -> tuple[list[str], str]:
     return discovered_streets, locality
 
 
-def _generate_fallback_corridor_graph(
-    poly: Polygon,
-    discovered_streets: Optional[list[str]] = None,
-    locality: str = "",
-) -> nx.MultiDiGraph:
-    """
-    Construct a realistic structural corridor network graph within the polygon boundary
-    using genuine discovered street names and locality context.
-    """
-    minx, miny, maxx, maxy = poly.bounds
-    w = maxx - minx
-    h = maxy - miny
-    cx, cy = poly.centroid.x, poly.centroid.y
 
-    G = nx.MultiDiGraph()
-    G.graph["crs"] = "EPSG:4326"
-
-    # Planar meters approximation for lengths
-    m_per_deg_lat = 111_132.92
-    m_per_deg_lng = 111_132.92 * math.cos(math.radians(cy))
-
-    grid_res = 4
-    node_id = 1
-    nodes_grid: dict[tuple[int, int], int] = {}
-
-    for i in range(grid_res + 1):
-        for j in range(grid_res + 1):
-            x = minx + (i / grid_res) * w
-            y = miny + (j / grid_res) * h
-            pt = Point(x, y)
-            if poly.contains(pt) or poly.boundary.distance(pt) < (w * 0.05):
-                G.add_node(node_id, x=x, y=y)
-                nodes_grid[(i, j)] = node_id
-                node_id += 1
-
-    # Prepare genuine road names from discovery
-    streets = [s for s in (discovered_streets or []) if s]
-    loc = locality or "Corridor"
-
-    primary_ew = streets[0] if len(streets) > 0 else f"{loc} Main Road"
-    primary_ns = streets[1] if len(streets) > 1 else f"{loc} Bypass Marg"
-    sec_ew = streets[2] if len(streets) > 2 else f"{loc} Sector Road"
-    sec_ns = streets[3] if len(streets) > 3 else f"{loc} Link Marg"
-
-    for (i, j), u in nodes_grid.items():
-        if (i + 1, j) in nodes_grid:
-            v = nodes_grid[(i + 1, j)]
-            dx = (G.nodes[v]["x"] - G.nodes[u]["x"]) * m_per_deg_lng
-            dy = (G.nodes[v]["y"] - G.nodes[u]["y"]) * m_per_deg_lat
-            dist_m = max(50.0, math.hypot(dx, dy))
-            is_spine = (j == grid_res // 2)
-            hw = "primary" if is_spine else "secondary" if (j % 2 == 0) else "tertiary"
-            name = primary_ew if is_spine else f"{sec_ew} (Sector {j+1})"
-            G.add_edge(u, v, 0, highway=hw, length=dist_m, name=name)
-            G.add_edge(v, u, 0, highway=hw, length=dist_m, name=name)
-
-        if (i, j + 1) in nodes_grid:
-            v = nodes_grid[(i, j + 1)]
-            dx = (G.nodes[v]["x"] - G.nodes[u]["x"]) * m_per_deg_lng
-            dy = (G.nodes[v]["y"] - G.nodes[u]["y"]) * m_per_deg_lat
-            dist_m = max(50.0, math.hypot(dx, dy))
-            is_spine = (i == grid_res // 2)
-            hw = "secondary" if is_spine else "tertiary"
-            name = primary_ns if is_spine else f"{sec_ns} (Line {i+1})"
-            G.add_edge(u, v, 0, highway=hw, length=dist_m, name=name)
-            G.add_edge(v, u, 0, highway=hw, length=dist_m, name=name)
-
-    return G
 
 
 async def _fetch_osm_graph_from_api(poly: Polygon) -> Optional[nx.MultiDiGraph]:
@@ -373,14 +306,12 @@ async def fetch_road_network(
         ox.settings.overpass_rate_limit = False
         ox.settings.timeout = 25
         ox.settings.requests_timeout = 25
-        ox.settings.requests_kwargs = {"verify": False}
         ox.settings.http_user_agent = "Gativa-Traffic-Analysis/1.0"
 
         # Concurrently discover genuine street names & locality via TomTom
         discovered_streets, locality = await _discover_local_street_names(poly)
 
         G: Optional[nx.MultiDiGraph] = None
-        used_fallback = False
         source_channel = "osm_api_v06"
 
         # 1. Attempt official OpenStreetMap API v0.6 first (fastest, most reliable)
@@ -394,6 +325,7 @@ async def fetch_road_network(
             for endpoint in [
                 "https://overpass.kumi.systems/api/interpreter",
                 "https://overpass-api.de/api/interpreter",
+                "https://overpass.private.coffee/api/interpreter",
             ]:
                 try:
                     ox.settings.overpass_endpoint = endpoint
@@ -408,20 +340,12 @@ async def fetch_road_network(
                 except Exception as exc:
                     logger.warning("Overpass endpoint %s failed: %s", endpoint, exc)
 
-        # 3. If both failed, use structural corridor baseline as emergency fallback
         if G is None or G.number_of_edges() == 0:
-            logger.warning(
-                "Live OSM endpoints unreachable. Using structural corridor baseline with live TomTom street discovery.",
-            )
-            G = _generate_fallback_corridor_graph(poly, discovered_streets, locality)
-            used_fallback = True
-            source_channel = "fallback_corridor"
-
-        if G.number_of_edges() == 0:
+            logger.warning("No road network could be retrieved from OpenStreetMap API or Overpass mirrors.")
             return None, [], None, [], DataSourceCoverage(
                 source="osm",
-                status="partial",
-                message="No road network found in the selected area.",
+                status="error",
+                message="OpenStreetMap data could not be retrieved for this area. Please retry or adjust the polygon boundary.",
             )
 
         # ─── Build segment list ───────────────────────────────────────────────
@@ -515,18 +439,11 @@ async def fetch_road_network(
             },
         )
 
-        if used_fallback:
-            coverage = DataSourceCoverage(
-                source="osm",
-                status="partial",
-                message=f"OpenStreetMap servers are currently at capacity. Analysis generated using {len(segments)} structural corridor links with live TomTom telemetry.",
-            )
-        else:
-            coverage = DataSourceCoverage(
-                source="osm",
-                status="ok",
-                message=f"Retrieved {len(segments)} genuine road segments from OpenStreetMap ({source_channel})",
-            )
+        coverage = DataSourceCoverage(
+            source="osm",
+            status="ok",
+            message=f"Retrieved {len(segments)} genuine road segments from OpenStreetMap ({source_channel})",
+        )
 
         logger.info(
             "OSM road network: %d segments, %.1f km total, %d intersections",
