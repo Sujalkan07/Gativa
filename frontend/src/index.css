@@ -1,0 +1,134 @@
+@import "tailwindcss";
+
+@theme {
+  /* Gativa Design System Colors */
+  --color-primary: #8f4e00;
+  --color-primary-container: #ff9933;
+  --color-on-primary: #ffffff;
+  --color-on-primary-container: #693800;
+  --color-primary-fixed: #ffdcc2;
+  --color-primary-fixed-dim: #ffb77a;
+  --color-on-primary-fixed: #2e1500;
+  --color-on-primary-fixed-variant: #6d3a00;
+  --color-inverse-primary: #ffb77a;
+
+  --color-secondary: #545a90;
+  --color-secondary-container: #bcc2ff;
+  --color-on-secondary: #ffffff;
+  --color-on-secondary-container: #484e83;
+  --color-secondary-fixed: #dfe0ff;
+  --color-secondary-fixed-dim: #bcc2ff;
+  --color-on-secondary-fixed: #0f1549;
+  --color-on-secondary-fixed-variant: #3c4377;
+
+  --color-tertiary: #006e05;
+  --color-tertiary-container: #64c755;
+  --color-on-tertiary: #ffffff;
+  --color-on-tertiary-container: #005002;
+  --color-tertiary-fixed: #94fa80;
+  --color-tertiary-fixed-dim: #79dd67;
+  --color-on-tertiary-fixed: #002200;
+  --color-on-tertiary-fixed-variant: #005302;
+
+  --color-surface: #f8f9ff;
+  --color-surface-dim: #cbdbf5;
+  --color-surface-bright: #f8f9ff;
+  --color-surface-container-lowest: #ffffff;
+  --color-surface-container-low: #eff4ff;
+  --color-surface-container: #e5eeff;
+  --color-surface-container-high: #dce9ff;
+  --color-surface-container-highest: #d3e4fe;
+  --color-surface-variant: #d3e4fe;
+  --color-surface-tint: #8f4e00;
+  --color-on-surface: #0b1c30;
+  --color-on-surface-variant: #554336;
+  --color-inverse-surface: #213145;
+  --color-inverse-on-surface: #eaf1ff;
+
+  --color-background: #f8f9ff;
+  --color-on-background: #0b1c30;
+
+  --color-outline: #887364;
+  --color-outline-variant: #dbc2b0;
+
+  --color-error: #ba1a1a;
+  --color-error-container: #ffdad6;
+  --color-on-error: #ffffff;
+  --color-on-error-container: #93000a;
+
+  /* Brand accent colors (not in Material palette but used in design) */
+  --color-brand-navy: #0a1145;
+  --color-brand-saffron: #ff9933;
+  --color-india-green: #138808;
+  --color-congestion-crimson: #dc2626;
+  --color-delay-amber: #f59e0b;
+
+  /* Font families */
+  --font-family-sans: 'Inter', system-ui, sans-serif;
+  --font-family-mono: 'JetBrains Mono', 'Courier New', monospace;
+
+  /* Border radius */
+  --radius-sm: 0.125rem;
+  --radius: 0.25rem;
+  --radius-md: 0.375rem;
+  --radius-lg: 0.5rem;
+  --radius-xl: 0.75rem;
+  --radius-full: 9999px;
+
+  /* Spacing */
+  --spacing-space-xs: 0.25rem;
+  --spacing-space-sm: 0.5rem;
+  --spacing-space-md: 0.75rem;
+  --spacing-space-lg: 1rem;
+  --spacing-space-xl: 1.5rem;
+  --spacing-space-2xl: 2rem;
+  --spacing-gutter: 1rem;
+  --spacing-gutter-dense: 0.5rem;
+  --spacing-margin: 1.5rem;
+  --spacing-margin-mobile: 1rem;
+}
+
+@layer base {
+  html, body {
+    margin: 0;
+    padding: 0;
+  }
+  body {
+    font-family: var(--font-family-sans);
+    background-color: var(--color-background);
+    color: var(--color-on-background);
+    overscroll-behavior: none;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  main > :first-child {
+    margin-top: 0 !important;
+  }
+  main > :last-child {
+    margin-bottom: 0 !important;
+  }
+  /* Hide scrollbar but keep functionality */
+  ::-webkit-scrollbar {
+    display: none;
+  }
+  * {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+}
+
+@layer utilities {
+  .font-mono-data {
+    font-family: var(--font-family-mono);
+  }
+  /* Pulse ring animation for active elements */
+  @keyframes ping-slow {
+    75%, 100% {
+      transform: scale(2);
+      opacity: 0;
+    }
+  }
+  .animate-ping-slow {
+    animation: ping-slow 2s cubic-bezier(0, 0, 0.2, 1) infinite;
+  }
+}
