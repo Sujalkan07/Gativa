@@ -38,17 +38,21 @@ export default function AnalysisMap({
 
   // Layer groups refs
   const baseTileLayerRef = useRef<L.TileLayer | null>(null)
+  const tomtomTrafficTileRef = useRef<L.TileLayer | null>(null)
   const polygonLayerRef = useRef<L.Polygon | null>(null)
   const roadsGroupRef = useRef<L.LayerGroup | null>(null)
   const bottlenecksGroupRef = useRef<L.LayerGroup | null>(null)
   const recommendationsGroupRef = useRef<L.LayerGroup | null>(null)
   const markersMapRef = useRef<Map<string, L.Marker>>(new Map())
 
+  const TOMTOM_KEY = import.meta.env.VITE_TOMTOM_API_KEY
+
   // Controls state
   const [baseLayerType, setBaseLayerType] = useState<'streets' | 'satellite'>('streets')
   const [showRoads, setShowRoads] = useState(true)
   const [showBottlenecks, setShowBottlenecks] = useState(true)
   const [showRecommendations, setShowRecommendations] = useState(true)
+  const [showTomTomTraffic, setShowTomTomTraffic] = useState(true)
 
   // 1. Initialize Leaflet Map
   useEffect(() => {
@@ -58,21 +62,34 @@ export default function AnalysisMap({
     // Create map instance
     const map = L.map(containerRef.current, {
       zoomControl: false,
-      attributionControl: false,
+      attributionControl: true,
     })
 
     // Add zoom control in bottom-right
     L.control.zoom({ position: 'bottomright' }).addTo(map)
 
-    // Base street tile layer (CartoDB Voyager: high contrast, real road & junction names)
-    const streetTile = L.tileLayer(
-      'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
-      {
-        maxZoom: 19,
-        subdomains: 'abcd',
-      },
-    ).addTo(map)
+    // Base street tile layer: TomTom Map Display if key configured, fallback to OSM HOT
+    const streetTile = TOMTOM_KEY
+      ? L.tileLayer(
+          `https://{s}.api.tomtom.com/map/1/tile/basic/main/{z}/{x}/{y}.png?key=${TOMTOM_KEY}`,
+          {
+            maxZoom: 19,
+            subdomains: ['a', 'b', 'c', 'd'],
+            attribution:
+              '&copy; <a href="https://www.tomtom.com" target="_blank" rel="noopener noreferrer">TomTom</a>, &copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap</a>',
+          },
+        )
+      : L.tileLayer(
+          'https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png',
+          {
+            maxZoom: 19,
+            subdomains: 'abc',
+            attribution:
+              '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap</a> contributors, Tiles style by <a href="https://www.hotosm.org/" target="_blank" rel="noopener noreferrer">HOT</a>',
+          },
+        )
 
+    streetTile.addTo(map)
     baseTileLayerRef.current = streetTile
     roadsGroupRef.current = L.layerGroup().addTo(map)
     bottlenecksGroupRef.current = L.layerGroup().addTo(map)
@@ -97,15 +114,58 @@ export default function AnalysisMap({
     if (baseLayerType === 'satellite') {
       baseTileLayerRef.current = L.tileLayer(
         'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-        { maxZoom: 19 },
+        {
+          maxZoom: 19,
+          attribution:
+            'Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community',
+        },
       ).addTo(map)
     } else {
-      baseTileLayerRef.current = L.tileLayer(
-        'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
-        { maxZoom: 19, subdomains: 'abcd' },
-      ).addTo(map)
+      baseTileLayerRef.current = TOMTOM_KEY
+        ? L.tileLayer(
+            `https://{s}.api.tomtom.com/map/1/tile/basic/main/{z}/{x}/{y}.png?key=${TOMTOM_KEY}`,
+            {
+              maxZoom: 19,
+              subdomains: ['a', 'b', 'c', 'd'],
+              attribution:
+                '&copy; <a href="https://www.tomtom.com" target="_blank" rel="noopener noreferrer">TomTom</a>, &copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap</a>',
+            },
+          ).addTo(map)
+        : L.tileLayer(
+            'https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png',
+            {
+              maxZoom: 19,
+              subdomains: 'abc',
+              attribution:
+                '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap</a> contributors, Tiles style by <a href="https://www.hotosm.org/" target="_blank" rel="noopener noreferrer">HOT</a>',
+            },
+          ).addTo(map)
     }
   }, [baseLayerType])
+
+  // 2b. TomTom Real-Time Traffic Flow Tile Overlay
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+
+    if (tomtomTrafficTileRef.current) {
+      map.removeLayer(tomtomTrafficTileRef.current)
+      tomtomTrafficTileRef.current = null
+    }
+
+    if (showTomTomTraffic && TOMTOM_KEY) {
+      tomtomTrafficTileRef.current = L.tileLayer(
+        `https://{s}.api.tomtom.com/traffic/map/4/tile/flow/relative0/{z}/{x}/{y}.png?key=${TOMTOM_KEY}`,
+        {
+          maxZoom: 19,
+          subdomains: ['a', 'b', 'c', 'd'],
+          opacity: 0.82,
+          attribution:
+            '&copy; <a href="https://www.tomtom.com" target="_blank" rel="noopener noreferrer">TomTom Traffic</a>',
+        },
+      ).addTo(map)
+    }
+  }, [showTomTomTraffic])
 
   // 3. Render Polygon Boundary & Fit Bounds
   useEffect(() => {
@@ -227,6 +287,13 @@ export default function AnalysisMap({
         { sticky: true, opacity: 0.95 },
       )
 
+      polyline.on('mouseover', () => {
+        polyline.setStyle({ weight: weight + 2.5, opacity: 1.0 })
+      })
+      polyline.on('mouseout', () => {
+        polyline.setStyle({ weight, opacity })
+      })
+
       roadsGroup.addLayer(polyline)
     })
   }, [segments, showRoads, mode])
@@ -329,6 +396,14 @@ export default function AnalysisMap({
 
       const label = `S#${idx + 1}`
 
+      // Check if there is a bottleneck at the exact same location
+      const hasCoLocatedProblem = bottlenecks.some(
+        (b) => Math.abs(b.lat - rec.lat!) < 0.0001 && Math.abs(b.lng - rec.lng!) < 0.0001
+      )
+      // If co-located, slightly offset solution pin to the northeast so both B# (Problem) and S# (Solution) pins are visible
+      const pinLat = hasCoLocatedProblem ? rec.lat + 0.00018 : rec.lat
+      const pinLng = hasCoLocatedProblem ? rec.lng + 0.00022 : rec.lng
+
       const icon = L.divIcon({
         className: 'custom-solution-pin',
         iconSize: [32, 32],
@@ -344,7 +419,7 @@ export default function AnalysisMap({
         `,
       })
 
-      const marker = L.marker([rec.lat, rec.lng], { icon })
+      const marker = L.marker([pinLat, pinLng], { icon })
 
       const locationLabel = rec.affected_location || 'Corridor Intervention'
 
@@ -386,7 +461,7 @@ export default function AnalysisMap({
       markersMapRef.current.set(`rec_${rec.recommendation_id}`, marker)
       rGroup.addLayer(marker)
     })
-  }, [recommendations, showRecommendations, onSelectRecommendation])
+  }, [recommendations, bottlenecks, showRecommendations, onSelectRecommendation])
 
   // 7. Handle fly-to when selected from side diagnostics
   useEffect(() => {
@@ -441,9 +516,9 @@ export default function AnalysisMap({
         <div className="pointer-events-auto bg-[var(--color-surface-container-lowest)]/95 backdrop-blur-md px-3 py-1.5 rounded-lg shadow-md border border-[var(--color-surface-container-high)] flex items-center gap-3 text-xs">
           <div className="flex items-center gap-1.5 font-bold text-[var(--color-on-surface)]">
             <span className="material-symbols-outlined text-[16px] text-[var(--color-primary-container)]">
-              map
+              traffic
             </span>
-            <span>Real Geographic Analysis</span>
+            <span>{TOMTOM_KEY ? 'TomTom & OSM Traffic Analysis' : 'Real Geographic Analysis'}</span>
           </div>
           <span className="text-[var(--color-surface-container-high)]">|</span>
           <div className="flex items-center gap-2">
@@ -466,6 +541,22 @@ export default function AnalysisMap({
 
         {/* Right: Active Toggles & Style Switcher */}
         <div className="pointer-events-auto bg-[var(--color-surface-container-lowest)]/95 backdrop-blur-md p-1 rounded-lg shadow-md border border-[var(--color-surface-container-high)] flex items-center gap-1 text-xs">
+          {/* TomTom Live Traffic toggle */}
+          {TOMTOM_KEY && (
+            <button
+              onClick={() => setShowTomTomTraffic(!showTomTomTraffic)}
+              title="Toggle Live TomTom Real-Time Traffic Flow Overlay"
+              className={`px-2 py-1 rounded text-xs font-semibold flex items-center gap-1 transition-colors ${
+                showTomTomTraffic
+                  ? 'bg-[#138808]/20 text-[#138808] border border-[#138808]/40'
+                  : 'text-[var(--color-on-surface-variant)] opacity-50'
+              }`}
+            >
+              <span className={`w-2 h-2 rounded-full ${showTomTomTraffic ? 'bg-[#138808] animate-pulse' : 'bg-[#94a3b8]'}`}></span>
+              TomTom Traffic
+            </button>
+          )}
+
           {/* Layer toggles */}
           <button
             onClick={() => setShowRoads(!showRoads)}
@@ -518,7 +609,7 @@ export default function AnalysisMap({
             <span className="material-symbols-outlined text-[14px]">
               {baseLayerType === 'streets' ? 'satellite_alt' : 'streetview'}
             </span>
-            {baseLayerType === 'streets' ? 'Satellite' : 'Streets'}
+            {baseLayerType === 'streets' ? 'Satellite' : TOMTOM_KEY ? 'TomTom Streets' : 'Streets'}
           </button>
 
           <button

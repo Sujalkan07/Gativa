@@ -240,3 +240,80 @@ class RecommendationsResult(BaseModel):
 class ErrorResponse(BaseModel):
     detail: str
     code: Optional[str] = None
+
+
+# ─── SUMO Microscopic Traffic Simulation ──────────────────────────────────────
+
+SimulationState = Literal[
+    "preparing", "ready", "running", "paused", "completed", "failed", "cancelled"
+]
+SignalStrategy = Literal["fixed_time", "actuated_adaptive"]
+
+
+class SimulationPrepareRequest(BaseModel):
+    analysis_id: str
+    duration_seconds: int = Field(default=600, ge=60, le=3600)
+    demand_rate_veh_hr: int = Field(default=2840, ge=100, le=10000)
+    strategy: SignalStrategy = "actuated_adaptive"
+
+
+class VehiclePosition(BaseModel):
+    id: str
+    lat: float
+    lng: float
+    speed_kmh: float
+    angle: float
+    type: str = "passenger"
+    waiting_time_s: float = 0.0
+
+
+class SimulationMetrics(BaseModel):
+    avg_speed_kmh: float = 0.0
+    avg_waiting_time_s: float = 0.0
+    avg_queue_length_m: float = 0.0
+    completed_vehicles: int = 0
+    active_vehicles: int = 0
+    elapsed_seconds: float = 0.0
+    total_duration_seconds: float = 600.0
+    variance_speed_pct: Optional[float] = None
+    variance_waiting_pct: Optional[float] = None
+    variance_queue_pct: Optional[float] = None
+    variance_completed_pct: Optional[float] = None
+
+
+class SimulationStatusResponse(BaseModel):
+    sim_id: str
+    analysis_id: str
+    state: SimulationState
+    duration_seconds: int
+    demand_rate_veh_hr: int
+    strategy: SignalStrategy
+    edge_count: int = 0
+    junction_count: int = 0
+    signal_count: int = 0
+    step: int = 0
+    elapsed_seconds: float = 0.0
+    current_metrics: SimulationMetrics = Field(default_factory=SimulationMetrics)
+    vehicles: list[VehiclePosition] = []
+    error_message: Optional[str] = None
+
+
+class ScenarioMetricRow(BaseModel):
+    metric: str
+    baseline: str
+    optimized: str
+    variance: str
+    is_improvement: bool
+
+
+class ScenarioComparisonResult(BaseModel):
+    sim_id: str
+    analysis_id: str
+    duration_seconds: int
+    baseline_strategy: str = "Baseline (Fixed-Time Signal Control)"
+    optimized_strategy: str = "Optimized (Actuated Adaptive Signal Control)"
+    baseline_metrics: SimulationMetrics
+    optimized_metrics: SimulationMetrics
+    rows: list[ScenarioMetricRow]
+    methodology_notes: str
+

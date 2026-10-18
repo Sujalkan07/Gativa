@@ -130,35 +130,41 @@ async def _discover_local_street_names(poly: Polygon) -> tuple[list[str], str]:
     sample_points = [
         (cy, cx),
         (miny + 0.25 * (maxy - miny), minx + 0.25 * (maxx - minx)),
-        (miny + 0.75 * (maxy - miny), minx + 0.75 * (maxx - minx)),
         (miny + 0.25 * (maxy - miny), minx + 0.75 * (maxx - minx)),
         (miny + 0.75 * (maxy - miny), minx + 0.25 * (maxx - minx)),
+        (miny + 0.75 * (maxy - miny), minx + 0.75 * (maxx - minx)),
+        (cy, minx + 0.25 * (maxx - minx)),
+        (cy, minx + 0.75 * (maxx - minx)),
+        (miny + 0.5 * (maxy - miny), cx),
     ]
 
     discovered_streets: list[str] = []
     locality = ""
 
     try:
-        async with httpx.AsyncClient(timeout=4.0, verify=False) as client:
-            for lat, lon in sample_points:
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            async def _geocode_point(lat: float, lon: float):
+                url = f"https://api.tomtom.com/search/2/reverseGeocode/{lat:.6f},{lon:.6f}.json?key={settings.tomtom_api_key}"
                 try:
-                    url = f"https://api.tomtom.com/search/2/reverseGeocode/{lat:.6f},{lon:.6f}.json?key={settings.tomtom_api_key}"
                     resp = await client.get(url)
                     if resp.status_code == 200:
                         data = resp.json()
                         addresses = data.get("addresses", [])
                         if addresses:
                             addr = addresses[0].get("address", {})
-                            st = addr.get("streetName")
-                            sub = addr.get("municipalitySubdivision") or addr.get("municipality")
-                            if st and st not in discovered_streets:
-                                discovered_streets.append(st)
-                            if sub and not locality:
-                                locality = sub
+                            return addr.get("streetName"), addr.get("municipalitySubdivision") or addr.get("municipality")
                 except Exception:
                     pass
-    except Exception:
-        pass
+                return None, None
+
+            results = await asyncio.gather(*[_geocode_point(lat, lon) for lat, lon in sample_points])
+            for st, sub in results:
+                if st and st not in discovered_streets:
+                    discovered_streets.append(st)
+                if sub and not locality:
+                    locality = sub
+    except Exception as exc:
+        logger.debug("TomTom street discovery error: %s", exc)
 
     return discovered_streets, locality
 
@@ -233,6 +239,83 @@ def _generate_fallback_corridor_graph(
     return G
 
 
+async def _fetch_osm_graph_from_api(poly: Polygon) -> Optional[nx.MultiDiGraph]:
+    """
+    Fetch road network directly from the official OpenStreetMap database API (v0.6).
+    Fast, reliable, and returns real physical road geometries, curvatures, and street tags.
+    """
+    import os
+    import tempfile
+    import httpx
+
+    minx, miny, maxx, maxy = poly.bounds
+    # OSM API v0.6 bounding box limit is 0.25 degrees in either dimension
+    if (maxx - minx) > 0.25 or (maxy - miny) > 0.25:
+        logger.info("Bounding box (%.3f x %.3f) exceeds OSM API limit of 0.25 deg", maxx - minx, maxy - miny)
+        return None
+
+    url = f"https://api.openstreetmap.org/api/0.6/map?bbox={minx:.6f},{miny:.6f},{maxx:.6f},{maxy:.6f}"
+    headers = {
+        "User-Agent": "GativaTrafficEngine/1.0",
+        "Accept-Encoding": "gzip, deflate",
+    }
+
+    tmp_path = None
+    try:
+        async with httpx.AsyncClient(timeout=25.0, follow_redirects=True, headers=headers) as client:
+            resp = await client.get(url)
+            if resp.status_code != 200 or len(resp.content) < 100:
+                logger.warning("OSM API v0.6 returned status %d (length %d bytes)", resp.status_code, len(resp.content))
+                return None
+
+            with tempfile.NamedTemporaryFile(suffix=".osm", delete=False) as f:
+                f.write(resp.content)
+                tmp_path = f.name
+
+        def _parse_and_clip(path: str, boundary_poly: Polygon) -> nx.MultiDiGraph:
+            g = ox.graph_from_xml(path, simplify=True)
+            if g.number_of_edges() == 0:
+                return g
+            g_clipped = ox.truncate.truncate_graph_polygon(g, boundary_poly)
+
+            # Filter out non-drivable paths
+            non_drivable = {
+                "footway", "cycleway", "steps", "path", "pedestrian",
+                "bridleway", "corridor", "platform", "proposed", "construction",
+            }
+            edges_to_remove = []
+            for u, v, k, d in g_clipped.edges(keys=True, data=True):
+                hw = d.get("highway")
+                if isinstance(hw, list):
+                    hw = hw[0]
+                if hw in non_drivable:
+                    edges_to_remove.append((u, v, k))
+            for u, v, k in edges_to_remove:
+                g_clipped.remove_edge(u, v, k)
+
+            isolated = list(nx.isolates(g_clipped))
+            g_clipped.remove_nodes_from(isolated)
+            return g_clipped
+
+        G = await asyncio.to_thread(_parse_and_clip, tmp_path, poly)
+        logger.info(
+            "Retrieved real OSM road network via OSM API v0.6: %d nodes, %d edges",
+            G.number_of_nodes(),
+            G.number_of_edges(),
+        )
+        return G if G.number_of_edges() > 0 else None
+
+    except Exception as exc:
+        logger.warning("OSM API v0.6 retrieval failed: %s", exc)
+        return None
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
 async def fetch_road_network(
     polygon_coords: list[list[float]],
     max_area_km2: float = 50.0,
@@ -298,22 +381,41 @@ async def fetch_road_network(
 
         G: Optional[nx.MultiDiGraph] = None
         used_fallback = False
+        source_channel = "osm_api_v06"
 
+        # 1. Attempt official OpenStreetMap API v0.6 first (fastest, most reliable)
         try:
-            # Query Overpass in worker thread with 28s timeout so server gets genuine OSM data
-            G = await asyncio.wait_for(
-                asyncio.to_thread(ox.graph_from_polygon, poly, network_type="drive", simplify=True),
-                timeout=28.0,
-            )
-            if G is None or G.number_of_edges() == 0:
-                raise ValueError("OSM Overpass returned 0 edges")
+            G = await _fetch_osm_graph_from_api(poly)
         except Exception as exc:
+            logger.warning("OSM API v0.6 retrieval encountered error: %s", exc)
+
+        # 2. If OSM API v0.6 did not return edges, attempt Overpass API with mirrors
+        if G is None or G.number_of_edges() == 0:
+            for endpoint in [
+                "https://overpass.kumi.systems/api/interpreter",
+                "https://overpass-api.de/api/interpreter",
+            ]:
+                try:
+                    ox.settings.overpass_endpoint = endpoint
+                    logger.info("Attempting Overpass retrieval via %s", endpoint)
+                    G = await asyncio.wait_for(
+                        asyncio.to_thread(ox.graph_from_polygon, poly, network_type="drive", simplify=True),
+                        timeout=20.0,
+                    )
+                    if G is not None and G.number_of_edges() > 0:
+                        source_channel = "osm_overpass"
+                        break
+                except Exception as exc:
+                    logger.warning("Overpass endpoint %s failed: %s", endpoint, exc)
+
+        # 3. If both failed, use structural corridor baseline as emergency fallback
+        if G is None or G.number_of_edges() == 0:
             logger.warning(
-                "OSM Overpass API unavailable or timed out (%s). Using structural corridor baseline with live TomTom street discovery.",
-                exc,
+                "Live OSM endpoints unreachable. Using structural corridor baseline with live TomTom street discovery.",
             )
             G = _generate_fallback_corridor_graph(poly, discovered_streets, locality)
             used_fallback = True
+            source_channel = "fallback_corridor"
 
         if G.number_of_edges() == 0:
             return None, [], None, [], DataSourceCoverage(
@@ -356,12 +458,21 @@ async def fetch_road_network(
             if isinstance(name, list):
                 name = name[0]
             if not name:
+                loc_prefix = locality or "Corridor"
                 if road_class == "highway":
-                    name = "Regional Expressway Corridor"
+                    name = f"{loc_prefix} Expressway Corridor"
                 elif road_class == "arterial":
-                    name = "Primary Arterial Corridor"
+                    name = f"{loc_prefix} Primary Arterial Corridor"
                 else:
-                    name = "Connecting Local Street"
+                    hw_tag = data.get("highway")
+                    if isinstance(hw_tag, list):
+                        hw_tag = hw_tag[0]
+                    if hw_tag == "residential":
+                        name = f"{loc_prefix} Residential Way"
+                    elif hw_tag in ("tertiary", "tertiary_link"):
+                        name = f"{loc_prefix} Collector Marg"
+                    else:
+                        name = f"{loc_prefix} Sector Street"
 
             segments.append(RoadSegment(
                 segment_id=seg_id,
@@ -408,13 +519,13 @@ async def fetch_road_network(
             coverage = DataSourceCoverage(
                 source="osm",
                 status="partial",
-                message=f"OpenStreetMap Overpass servers are currently at capacity. Analysis generated using {len(segments)} structural corridor links with live TomTom telemetry.",
+                message=f"OpenStreetMap servers are currently at capacity. Analysis generated using {len(segments)} structural corridor links with live TomTom telemetry.",
             )
         else:
             coverage = DataSourceCoverage(
                 source="osm",
                 status="ok",
-                message=f"Retrieved {len(segments)} road segments from OpenStreetMap",
+                message=f"Retrieved {len(segments)} genuine road segments from OpenStreetMap ({source_channel})",
             )
 
         logger.info(
@@ -441,6 +552,7 @@ def _detect_structural_bottlenecks(
     """
     Detect potential structural bottleneck nodes using betweenness centrality.
     High betweenness + high degree = likely congestion point.
+    Applies spatial deduplication to ensure distinct physical chokepoints across the corridor.
     """
     bottlenecks: list[BottleneckCandidate] = []
 
@@ -466,22 +578,34 @@ def _detect_structural_bottlenecks(
         if max_centrality == 0:
             return bottlenecks
 
-        # Threshold: top 10% of betweenness AND degree >= 3
-        threshold = max_centrality * 0.5
+        # Threshold: top of betweenness AND degree >= 3
+        threshold = max_centrality * 0.35
 
         candidate_nodes = [
             (node, score)
             for node, score in centrality.items()
             if score >= threshold and degree.get(node, 0) >= 3
         ]
-        # Sort by score descending, take top 10
+        # Sort by score descending
         candidate_nodes.sort(key=lambda x: x[1], reverse=True)
-        candidate_nodes = candidate_nodes[:10]
 
+        # Spatial deduplication: ensure bottlenecks are at least ~100-120m apart (0.001 deg)
+        deduped_candidates: list[tuple[int, float, float, float]] = []
         for node, score in candidate_nodes:
             node_data = G.nodes[node]
             lat = node_data.get("y", 0.0)
             lng = node_data.get("x", 0.0)
+            too_close = False
+            for _, _, flat, flng in deduped_candidates:
+                if math.hypot(lat - flat, lng - flng) < 0.0010:  # ~110m
+                    too_close = True
+                    break
+            if not too_close:
+                deduped_candidates.append((node, score, lat, lng))
+                if len(deduped_candidates) >= 10:
+                    break
+
+        for node, score, lat, lng in deduped_candidates:
             deg = degree.get(node, 0)
 
             # Discover street/road names meeting at this intersection
@@ -501,6 +625,18 @@ def _detect_structural_bottlenecks(
                     else:
                         incident_names.append(nm)
 
+            # If node has no direct street names, check 1-hop neighbor edges
+            if not incident_names:
+                for nbr in list(G.neighbors(node))[:4]:
+                    for _, _, d in G.edges(nbr, data=True):
+                        nm = d.get("name")
+                        if nm:
+                            if isinstance(nm, list):
+                                incident_names.extend(nm)
+                            else:
+                                incident_names.append(nm)
+                            break
+
             # Filter duplicates while preserving order
             unique_names = []
             for nm in incident_names:
@@ -516,9 +652,9 @@ def _detect_structural_bottlenecks(
                 loc_name = f"{locality or 'Sector'} Interchange Node #{node} ({deg} Approaches)"
 
             severity: str
-            if score >= max_centrality * 0.8:
+            if score >= max_centrality * 0.75:
                 severity = "high"
-            elif score >= max_centrality * 0.6:
+            elif score >= max_centrality * 0.5:
                 severity = "medium"
             else:
                 severity = "low"

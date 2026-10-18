@@ -31,11 +31,15 @@ export default function LeafletDrawingMap({
 
   // Layers
   const baseTileRef = useRef<L.TileLayer | null>(null)
+  const trafficTileRef = useRef<L.TileLayer | null>(null)
   const draftPolylineRef = useRef<L.Polyline | null>(null)
   const draftMarkersGroupRef = useRef<L.LayerGroup | null>(null)
   const completedPolygonRef = useRef<L.Polygon | null>(null)
 
   const [baseLayerType, setBaseLayerType] = useState<'streets' | 'satellite'>('streets')
+  const [showTraffic, setShowTraffic] = useState(false)
+
+  const TOMTOM_KEY = import.meta.env.VITE_TOMTOM_API_KEY
 
   // 1. Initialize Map
   useEffect(() => {
@@ -46,22 +50,35 @@ export default function LeafletDrawingMap({
       center: [26.900, 80.942], // Lucknow default
       zoom: 13,
       zoomControl: false,
-      attributionControl: false,
+      attributionControl: true,
       doubleClickZoom: false, // disabled so double click can complete polygon
     })
 
     // Custom zoom control
     L.control.zoom({ position: 'bottomright' }).addTo(map)
 
-    // Base Street Layer: CartoDB Voyager
-    const streetTile = L.tileLayer(
-      'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
-      {
-        maxZoom: 19,
-        subdomains: 'abcd',
-      },
-    ).addTo(map)
+    // Base Street Layer: TomTom Map Display if key configured, fallback to OSM HOT
+    const streetTile = TOMTOM_KEY
+      ? L.tileLayer(
+          `https://{s}.api.tomtom.com/map/1/tile/basic/main/{z}/{x}/{y}.png?key=${TOMTOM_KEY}`,
+          {
+            maxZoom: 19,
+            subdomains: ['a', 'b', 'c', 'd'],
+            attribution:
+              '&copy; <a href="https://www.tomtom.com" target="_blank" rel="noopener noreferrer">TomTom</a>, &copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap</a>',
+          },
+        )
+      : L.tileLayer(
+          'https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png',
+          {
+            maxZoom: 19,
+            subdomains: 'abc',
+            attribution:
+              '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap</a> contributors, Tiles style by <a href="https://www.hotosm.org/" target="_blank" rel="noopener noreferrer">HOT</a>',
+          },
+        )
 
+    streetTile.addTo(map)
     baseTileRef.current = streetTile
     draftMarkersGroupRef.current = L.layerGroup().addTo(map)
     mapRef.current = map
@@ -84,15 +101,58 @@ export default function LeafletDrawingMap({
     if (baseLayerType === 'satellite') {
       baseTileRef.current = L.tileLayer(
         'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-        { maxZoom: 19 },
+        {
+          maxZoom: 19,
+          attribution:
+            'Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community',
+        },
       ).addTo(map)
     } else {
-      baseTileRef.current = L.tileLayer(
-        'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
-        { maxZoom: 19, subdomains: 'abcd' },
-      ).addTo(map)
+      baseTileRef.current = TOMTOM_KEY
+        ? L.tileLayer(
+            `https://{s}.api.tomtom.com/map/1/tile/basic/main/{z}/{x}/{y}.png?key=${TOMTOM_KEY}`,
+            {
+              maxZoom: 19,
+              subdomains: ['a', 'b', 'c', 'd'],
+              attribution:
+                '&copy; <a href="https://www.tomtom.com" target="_blank" rel="noopener noreferrer">TomTom</a>, &copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap</a>',
+            },
+          ).addTo(map)
+        : L.tileLayer(
+            'https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png',
+            {
+              maxZoom: 19,
+              subdomains: 'abc',
+              attribution:
+                '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap</a> contributors, Tiles style by <a href="https://www.hotosm.org/" target="_blank" rel="noopener noreferrer">HOT</a>',
+            },
+          ).addTo(map)
     }
   }, [baseLayerType])
+
+  // 2b. TomTom Live Traffic Flow Tile Overlay
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+
+    if (trafficTileRef.current) {
+      map.removeLayer(trafficTileRef.current)
+      trafficTileRef.current = null
+    }
+
+    if (showTraffic && TOMTOM_KEY) {
+      trafficTileRef.current = L.tileLayer(
+        `https://{s}.api.tomtom.com/traffic/map/4/tile/flow/relative0/{z}/{x}/{y}.png?key=${TOMTOM_KEY}`,
+        {
+          maxZoom: 19,
+          subdomains: ['a', 'b', 'c', 'd'],
+          opacity: 0.85,
+          attribution:
+            '&copy; <a href="https://www.tomtom.com" target="_blank" rel="noopener noreferrer">TomTom Traffic</a>',
+        },
+      ).addTo(map)
+    }
+  }, [showTraffic])
 
   // 3. Map Click & Double Click Event Handling for Drawing
   useEffect(() => {
@@ -248,8 +308,26 @@ export default function LeafletDrawingMap({
       {/* Map DOM node */}
       <div ref={containerRef} className={className} />
 
-      {/* Layer Switcher (Streets vs Satellite) */}
-      <div className="absolute top-4 right-16 z-[1000] flex items-center bg-white/95 backdrop-blur-xs rounded-lg shadow-md border border-[#e2e8f0] p-0.5 text-xs font-semibold">
+      {/* Layer Switcher & TomTom Live Traffic */}
+      <div className="absolute top-4 right-16 z-[1000] flex items-center gap-1.5 bg-white/95 backdrop-blur-xs rounded-lg shadow-md border border-[#e2e8f0] p-0.5 text-xs font-semibold">
+        {TOMTOM_KEY && (
+          <>
+            <button
+              onClick={() => setShowTraffic(!showTraffic)}
+              title="Toggle Live TomTom Real-Time Traffic Flow"
+              className={`px-2.5 py-1 rounded transition-colors flex items-center gap-1.5 ${
+                showTraffic
+                  ? 'bg-[#138808] text-white shadow-xs'
+                  : 'text-[#475569] hover:text-[#0b1c30]'
+              }`}
+            >
+              <span className={`w-2 h-2 rounded-full ${showTraffic ? 'bg-white animate-pulse' : 'bg-[#138808]'}`}></span>
+              <span>Live Traffic</span>
+            </button>
+            <div className="w-[1px] h-4 bg-[#cbd5e1]" />
+          </>
+        )}
+
         <button
           onClick={() => setBaseLayerType('streets')}
           className={`px-2.5 py-1 rounded transition-colors flex items-center gap-1 ${
@@ -259,7 +337,7 @@ export default function LeafletDrawingMap({
           }`}
         >
           <span className="material-symbols-outlined text-[14px]">map</span>
-          <span>Streets</span>
+          <span>{TOMTOM_KEY ? 'TomTom Streets' : 'Streets'}</span>
         </button>
         <button
           onClick={() => setBaseLayerType('satellite')}

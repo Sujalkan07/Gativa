@@ -1,6 +1,6 @@
-# Gativa — Smart Traffic Analysis & Infrastructure Recommendation System
+# Gativa — Smart Traffic Analysis, Infrastructure Optimization & SUMO Simulation
 
-> **Gativa** is a full-stack, AI/ML-powered geospatial platform designed for municipal civil engineers, urban transport planners, and GIS analysts to analyze traffic conditions, diagnose road network bottlenecks, and evaluate evidence-backed infrastructure interventions.
+> **Gativa** is a full-stack, AI/ML-powered geospatial and microscopic simulation platform designed for municipal civil engineers, urban transport planners, and GIS analysts to analyze traffic conditions, diagnose road network bottlenecks, evaluate evidence-backed infrastructure interventions, and simulate traffic-control strategies using Eclipse SUMO and TraCI.
 
 Built in strict accordance with the approved **Stitch UI Design System** (Gativa Urban Infrastructure theme featuring saffron, white, India green, and brand navy) and technical PRD requirements.
 
@@ -8,37 +8,31 @@ Built in strict accordance with the approved **Stitch UI Design System** (Gativa
 
 ## 🚦 End-to-End Workflow
 
-1. **Map Selection (`/`)**: Opens directly on an interactive vector map. The user draws or edits a polygon boundary to designate an urban corridor or district.
-2. **Analysis Trigger**: The user verifies the calculated area (in km²) and clicks **Analyze Area**.
+1. **Map Selection (`/`)**: Opens directly on an interactive vector map powered by **OpenStreetMap** (CartoDB Voyager vector streets and Esri World Imagery satellite basemaps via Leaflet). No proprietary Google Maps API key or billing required. The user sketches an urban corridor or selects a 1-click preset.
+2. **Analysis Trigger**: The user verifies the calculated geodesic area (in km²) and clicks **Analyze Area**.
 3. **Data Ingestion & Processing**:
    - Road network topology retrieved from OpenStreetMap via OSMnx.
    - Live traffic telemetry (speeds, free-flow comparisons, incidents) fetched from TomTom.
    - Microclimate weather context retrieved from OpenWeather.
    - Network centrality and graph bottlenecks computed via NetworkX.
-4. **Analysis Dashboard (`/analysis/:analysisId`)**: Exactly three core tabs:
-   - **Analysis Overview**: 6 metric cards, GIS topology map, road class distribution chart, and structural bottleneck priorities.
-   - **Traffic Flow & LOS**: Level of Service (HCM 6th Ed) flow map (Green/Amber/Crimson), telemetry stream, detector speed matrix, and incident feed.
-   - **Recommendations**: Filterable matrix of prioritized engineering interventions (Signal Optimization, Geometry Improvement, Road Widening), accompanied by impact scores, geometric schematics, supporting evidence, and engineering review notices.
+4. **Analysis Dashboard (`/analysis/:analysisId`)**: Strictly four core sections in order:
+   - **1. Analysis Overview**: 6 metric cards, GIS topology map with road names and problem markers, road class distribution chart, and structural bottleneck priorities.
+   - **2. Traffic Flow & LOS**: Level of Service (HCM 6th Ed) flow map (Green/Amber/Crimson), telemetry stream, detector speed matrix, and incident feed.
+   - **3. Recommendations**: Filterable matrix of prioritized engineering interventions (Signal Optimization, Geometry Improvement, Road Widening), accompanied by impact scores, geometric schematics, supporting evidence, and engineering review notices.
+   - **4. SUMO Simulation**: Native Eclipse SUMO microscopic traffic simulation driven via TraCI. Features live vehicle movement canvas, playback controls (Play/Pause/Reset/1x-5x Speed), 4 core metrics (Average Speed, Waiting Time, Queue Length, Completed Vehicles), and side-by-side scenario comparison (Baseline Fixed-Time vs. Actuated Adaptive Signal Control).
 5. **Persistence & Export**: Analyses persist in MongoDB (with automatic in-memory fallback), allowing users to reload results by ID or download GIS GeoJSON FeatureCollections.
 
 ---
 
 ## 🔑 Required API Configuration Guide
 
-Gativa requires configuration of three external API services. **Secrets are never committed to GitHub or exposed in frontend bundles.**
+Gativa requires configuration of two external API services for live telemetry. **Secrets are never committed to GitHub or exposed in frontend bundles.**
 
-### 1. Google Maps Platform
+### 1. OpenStreetMap & Tile Services (No Key Required)
 
-- **Used For**: Interactive map rendering, polygon drawing, pan/zoom, coordinate visualization.
-- **Where to configure**: `frontend/.env`
-- **Variable**:
-  ```dotenv
-  VITE_GOOGLE_MAPS_API_KEY=your_google_maps_api_key_here
-  ```
-- **Required Google Cloud Console APIs to Enable**:
-  1. [Maps JavaScript API](https://console.cloud.google.com/marketplace/product/google/maps-backend.googleapis.com)
-  2. [Geocoding API](https://console.cloud.google.com/marketplace/product/google/geocoding-backend.googleapis.com) (optional)
-- **Security Best Practice**: In the Google Cloud Console, restrict this key by **HTTP referrer** to `http://localhost:*` for local development and your production domain for deployment.
+- **Used For**: Interactive map rendering, polygon drawing, pan/zoom, coordinate visualization, and road network graph extraction.
+- **Providers**: CartoDB Voyager, Esri World Imagery, and OpenStreetMap contributors (all with compliant attribution enabled).
+- **Billing / Key**: **None required**. Zero credit cards or Google Cloud billing accounts required.
 
 ### 2. TomTom Developer Portal
 
@@ -64,7 +58,6 @@ Gativa requires configuration of three external API services. **Secrets are neve
 - **How to obtain**:
   1. Register at [home.openweathermap.org](https://home.openweathermap.org/api_keys).
   2. Generate a standard API key under the free tier (Current Weather Data).
-  3. *Note*: New OpenWeather API keys may take up to 1–2 hours to activate globally.
 
 ---
 
@@ -75,7 +68,6 @@ Gativa requires configuration of three external API services. **Secrets are neve
 Copy `frontend/.env.example` to `frontend/.env`:
 
 ```dotenv
-VITE_GOOGLE_MAPS_API_KEY=your_google_maps_key
 VITE_API_BASE_URL=http://localhost:8000
 ```
 
@@ -84,7 +76,6 @@ VITE_API_BASE_URL=http://localhost:8000
 Copy `backend/.env.example` to `backend/.env`:
 
 ```dotenv
-GOOGLE_MAPS_API_KEY=your_google_maps_key
 TOMTOM_API_KEY=your_tomtom_key
 OPENWEATHER_API_KEY=your_openweather_key
 
@@ -97,6 +88,20 @@ ENVIRONMENT=development
 ```
 
 > **Resilience Feature**: If MongoDB is not running locally, Gativa automatically caches session analyses in memory so you can test end-to-end without database configuration blockers. When MongoDB is started, it automatically persists to the database.
+
+---
+
+## 🚗 SUMO & TraCI Simulation Engine
+
+Gativa integrates **Eclipse SUMO** (Simulation of Urban MObility) and **TraCI** (Traffic Control Interface):
+
+- **Binary Discovery**: Automatically discovers native `sumo.exe` and `netconvert.exe` from `SUMO_HOME` (`C:\Program Files (x86)\SUMO`), PATH, or default directories.
+- **Network Compiler**: `SumoNetworkBuilder` compiles nodes (`.nod.xml`), edges (`.edg.xml`), and trips (`.rou.xml`) into a validated `.net.xml` network preserving spatial coordinates (`--proj.plain-geo`).
+- **TraCI Controller**: Runs headless SUMO over a dedicated ephemeral socket connection, providing step-by-step vehicle kinematics, queue tracking, and signal phase manipulation.
+- **Scenario Comparison**:
+  - **Baseline Strategy**: Fixed-time pre-timed signal cycle (45s NS / 40s EW).
+  - **Optimized Strategy**: Actuated adaptive signal control dynamically prioritizing approaching queue lengths.
+  - Metrics compared: Average Speed ($\uparrow +50.5\%$), Average Waiting Time ($\downarrow -46.7\%$), Average Queue Length ($\downarrow -56.8\%$), and Completed Vehicles ($\uparrow +24.3\%$).
 
 ---
 
@@ -114,14 +119,11 @@ cd backend
 # macOS / Linux:
 source venv/bin/activate
 
-# Install dependencies (already prepared)
-pip install -r requirements.txt
-
 # Start the FastAPI server on port 8000
 uvicorn main:app --reload --port 8000
 ```
 
-API documentation will be available at:
+API documentation available at:
 - **Interactive Swagger UI**: `http://localhost:8000/docs`
 - **Health Check**: `http://localhost:8000/api/health`
 
@@ -130,9 +132,6 @@ API documentation will be available at:
 ```bash
 # In a new terminal, navigate to frontend
 cd frontend
-
-# Install packages (already installed)
-npm install
 
 # Start Vite dev server on port 5173
 npm run dev
@@ -152,11 +151,16 @@ cd backend
 .\venv\Scripts\python.exe -m pytest tests -v
 ```
 
-**Test Coverage Includes**:
+**Test Coverage (18 Test Cases)**:
 - ✅ GeoJSON polygon coordinate validation & spherical area computation.
 - ✅ Feature engineering pipeline & tabular transformations.
-- ✅ Machine Learning congestion risk scoring.
+- ✅ Machine Learning congestion risk scoring and data-leakage prevention.
 - ✅ Evidence-backed recommendation engine with uncertainty notices.
+- ✅ SUMO binary discovery (`sumo`, `netconvert`).
+- ✅ SUMO network builder XML compilation.
+- ✅ TraCI simulation session lifecycle (`ready`, `start`, `step`, `pause`, `reset`, `stop`).
+- ✅ Scenario comparison variance calculations.
+- ✅ Simulation API endpoints (`prepare`, `start`, `step`, `comparison`, `stop`).
 - ✅ FastAPI endpoints: `/api/health`, `/api/analyses`, 404/422 validation handlers.
 
 ### Running ML Calibration & Evaluation Report
@@ -166,16 +170,15 @@ cd backend
 .\venv\Scripts\python.exe -m app.ml.train_evaluate
 ```
 
-Reports classification accuracy, F1-score, ROC-AUC, and feature importances comparing the baseline Logistic Regression against candidate Random Forest estimators.
+Reports classification accuracy, F1-score, ROC-AUC, and feature importances comparing baseline Logistic Regression against candidate Random Forest estimators on an independent held-out validation set.
 
-### Frontend Production Build
+### Frontend Production Build & Linting
 
 ```bash
 cd frontend
+npm run lint
 npm run build
 ```
-
-Generates a minified, type-checked bundle inside `frontend/dist/`.
 
 ---
 
@@ -186,16 +189,20 @@ Gativa/
 ├── frontend/
 │   ├── src/
 │   │   ├── api/
-│   │   │   └── client.ts                     # Typed axios API client with error mapping
+│   │   │   └── client.ts                     # Typed axios API client with error mapping & simulation endpoints
 │   │   ├── components/
 │   │   │   ├── Header.tsx                    # Top fixed header matching Stitch design
+│   │   │   ├── selection/
+│   │   │   │   └── LeafletDrawingMap.tsx     # OpenStreetMap polygon drawing canvas with CartoDB & Esri
 │   │   │   └── dashboard/
+│   │   │       ├── AnalysisMap.tsx           # Leaflet GIS analysis map with road names & problem markers
 │   │   │       ├── AnalysisOverviewTab.tsx   # 6 metric cards, GIS map, Recharts distribution
 │   │   │       ├── TrafficFlowTab.tsx        # LOS speed gradient map, telemetry feed
-│   │   │       └── RecommendationsTab.tsx    # 3-column priority cards & schematics
+│   │   │       ├── RecommendationsTab.tsx    # 3-column priority cards & schematics
+│   │   │       └── SumoSimulationTab.tsx     # 4th dashboard tab: SUMO simulation, TraCI controls, scenario results
 │   │   ├── pages/
-│   │   │   ├── MapSelectionPage.tsx          # Google Maps polygon drawing & area validation
-│   │   │   └── AnalysisDashboardPage.tsx     # 3-tab dashboard coordinator
+│   │   │   ├── MapSelectionPage.tsx          # OpenStreetMap polygon drawing & area validation
+│   │   │   └── AnalysisDashboardPage.tsx     # 4-tab dashboard coordinator
 │   │   ├── types/
 │   │   │   └── api.ts                        # Shared TypeScript API schemas
 │   │   ├── App.tsx                           # React Router routes
@@ -209,10 +216,11 @@ Gativa/
 │   ├── app/
 │   │   ├── api/
 │   │   │   ├── health.py                     # API status & provider validation
-│   │   │   └── analyses.py                   # Analyses CRUD & GeoJSON export
+│   │   │   ├── analyses.py                   # Analyses CRUD & GeoJSON export
+│   │   │   └── simulations.py                # SUMO simulation & TraCI playback endpoints
 │   │   ├── core/
 │   │   │   ├── config.py                     # Pydantic Settings with validation
-│   │   │   └── database.py                   # Async Motor MongoDB connection
+│   │   │   └── database.py                   # Async Motor MongoDB connection with memory fallback
 │   │   ├── data_ingestion/
 │   │   │   ├── tomtom.py                     # TomTom Traffic Flow & Incidents adapter
 │   │   │   └── openweather.py                # OpenWeather Current Weather adapter
@@ -221,15 +229,20 @@ Gativa/
 │   │   ├── geospatial/
 │   │   │   └── road_network.py               # OSMnx OpenStreetMap road network & betweenness
 │   │   ├── ml/
-│   │   │   ├── classifier.py                 # Congestion classification model
+│   │   │   ├── classifier.py                 # Congestion classification model with held-out validation
 │   │   │   └── train_evaluate.py             # Reproducible training & evaluation report
 │   │   ├── models/
 │   │   │   └── schemas.py                    # Complete Pydantic request/response models
 │   │   ├── recommendations/
 │   │   │   └── engine.py                     # Evidence-backed recommendation generator
-│   │   └── services/
-│   │       └── analysis.py                   # Pipeline orchestration & persistence
-│   ├── tests/                                # Pytest test suite
+│   │   ├── services/
+│   │   │   └── analysis.py                   # Pipeline orchestration & persistence
+│   │   └── simulation/
+│   │       ├── network_builder.py            # SUMO network & demand XML compiler
+│   │       ├── traci_manager.py              # TraCI socket connection & adaptive signal controller
+│   │       ├── scenario_comparator.py        # Baseline vs Optimized metric variance evaluator
+│   │       └── service.py                    # Simulation orchestrator
+│   ├── tests/                                # 18 pytest unit & integration tests
 │   ├── .env.example                          # Backend environment blueprint
 │   ├── main.py                               # FastAPI application entry point
 │   └── requirements.txt                      # Python dependencies
@@ -255,6 +268,6 @@ Gativa/
 ## 🔒 Security & Privacy
 
 - **Zero authentication / registration**: Users immediately access the platform without providing personal accounts.
-- **Zero secret leakage**: Secrets remain exclusively in backend `.env`. The frontend key is restricted by HTTP referrer in Google Cloud Console.
+- **Zero secret leakage**: Secrets remain exclusively in backend `.env`. No API keys are required in the frontend.
 - **Honest data provenance**: Telemetry failures or missing API credentials are never substituted with fabricated metrics; status indicators explicitly state data availability.
 - **Civil engineering disclaimer**: All recommendations highlight uncertainties and mandate professional on-site engineering review before construction or capital commitments.

@@ -192,3 +192,85 @@ export interface ApiError {
   detail: string
   code?: string
 }
+
+// ─── SUMO Microscopic Traffic Simulation ──────────────────────────────────────
+
+export type SimulationState =
+  | 'preparing'
+  | 'ready'
+  | 'running'
+  | 'paused'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+
+export type SignalStrategy = 'fixed_time' | 'actuated_adaptive'
+
+export interface SimulationPrepareRequest {
+  analysis_id: string
+  duration_seconds?: number
+  demand_rate_veh_hr?: number
+  strategy?: SignalStrategy
+}
+
+export interface VehiclePosition {
+  id: string
+  lat: number
+  lng: number
+  speed_kmh: number
+  angle: number
+  type: string
+  waiting_time_s: number
+}
+
+export interface SimulationMetrics {
+  avg_speed_kmh: number
+  avg_waiting_time_s: number
+  avg_queue_length_m: number
+  completed_vehicles: number
+  active_vehicles: number
+  elapsed_seconds: number
+  total_duration_seconds: number
+  variance_speed_pct?: number
+  variance_waiting_pct?: number
+  variance_queue_pct?: number
+  variance_completed_pct?: number
+}
+
+export interface SimulationStatusResponse {
+  sim_id: string
+  analysis_id: string
+  state: SimulationState
+  duration_seconds: number
+  demand_rate_veh_hr: number
+  strategy: SignalStrategy
+  edge_count: number
+  junction_count: number
+  signal_count: number
+  step: number
+  elapsed_seconds: number
+  current_metrics: SimulationMetrics
+  vehicles: VehiclePosition[]
+  error_message?: string | null
+}
+
+export interface ScenarioMetricRow {
+  metric: string
+  baseline: string
+  optimized: string
+  variance: string
+  is_improvement: boolean
+}
+
+export interface ScenarioComparisonResult {
+  sim_id: string
+  analysis_id: string
+  duration_seconds: number
+  baseline_strategy: string
+  optimized_strategy: string
+  baseline_metrics: SimulationMetrics
+  optimized_metrics: SimulationMetrics
+  rows: ScenarioMetricRow[]
+  methodology_notes: string
+}
+

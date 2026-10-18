@@ -4,6 +4,7 @@ import Header from '../components/Header'
 import AnalysisOverviewTab from '../components/dashboard/AnalysisOverviewTab'
 import TrafficFlowTab from '../components/dashboard/TrafficFlowTab'
 import RecommendationsTab from '../components/dashboard/RecommendationsTab'
+import SumoSimulationTab from '../components/dashboard/SumoSimulationTab'
 import { api, GativaApiError } from '../api/client'
 import type {
   AnalysisResult,
@@ -11,7 +12,7 @@ import type {
   RecommendationsResult,
 } from '../types/api'
 
-type TabType = 'analysis' | 'flow' | 'recommendations'
+type TabType = 'analysis' | 'flow' | 'recommendations' | 'simulation'
 
 export default function AnalysisDashboardPage() {
   const { analysisId } = useParams<{ analysisId: string }>()
@@ -258,6 +259,28 @@ export default function AnalysisDashboardPage() {
                   <span className="absolute bottom-0 left-0 right-0 h-1 bg-[var(--color-primary-container)] rounded-t"></span>
                 )}
               </button>
+
+              {/* Tab 4: SUMO Simulation */}
+              <button
+                onClick={() => setCurrentTab('simulation')}
+                className={`relative px-6 py-3.5 text-sm font-semibold flex items-center gap-2 transition-colors ${
+                  currentTab === 'simulation'
+                    ? 'text-[var(--color-on-surface)]'
+                    : 'text-[var(--color-secondary)] hover:text-[var(--color-on-surface)]'
+                }`}
+              >
+                <span
+                  className={`material-symbols-outlined text-[18px] ${
+                    currentTab === 'simulation' ? 'text-[var(--color-primary-container)]' : ''
+                  }`}
+                >
+                  alt_route
+                </span>
+                <span>SUMO Simulation</span>
+                {currentTab === 'simulation' && (
+                  <span className="absolute bottom-0 left-0 right-0 h-1 bg-[var(--color-primary-container)] rounded-t"></span>
+                )}
+              </button>
             </div>
 
             <div className="hidden md:flex items-center gap-2 font-mono text-[11px] text-[var(--color-secondary)]">
@@ -318,6 +341,9 @@ export default function AnalysisDashboardPage() {
                   recommendationsData={recommendationsData}
                   isLoading={isLoadingRecs && !recommendationsData}
                 />
+              )}
+              {currentTab === 'simulation' && (
+                <SumoSimulationTab analysis={analysis} />
               )}
             </>
           ) : null}

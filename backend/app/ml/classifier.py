@@ -8,6 +8,7 @@ import logging
 from typing import Optional
 import numpy as np
 import pandas as pd
+from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
@@ -34,21 +35,63 @@ class CongestionClassifier:
             class_weight="balanced",
         )
         self.is_trained = False
+        self.is_production_trained = False  # True only when trained on genuine probe/sensor archives
         self.feature_names: list[str] = []
 
-    def fit(self, X: pd.DataFrame, y: np.ndarray) -> dict[str, float]:
-        """Train the classifier and return validation metrics."""
+    def fit(
+        self,
+        X: pd.DataFrame,
+        y: np.ndarray,
+        test_size: float = 0.2,
+        random_state: int = 42,
+        is_production: bool = False,
+    ) -> dict[str, float]:
+        """
+        Train the classifier using a strict held-out validation split to prevent data leakage.
+        The scaler is fit ONLY on the training split, and evaluation is reported on the held-out partition.
+        """
         self.feature_names = list(X.columns)
-        X_scaled = self.scaler.fit_transform(X)
-        self.model.fit(X_scaled, y)
-        self.is_trained = True
+        self.is_production_trained = is_production
 
-        y_pred = self.model.predict(X_scaled)
-        metrics = {
-            "accuracy": float(accuracy_score(y, y_pred)),
-            "f1_weighted": float(f1_score(y, y_pred, average="weighted", zero_division=0)),
-        }
-        logger.info("Trained CongestionClassifier: %s", metrics)
+        if len(X) >= 20 and len(np.unique(y)) > 1:
+            X_train, X_val, y_train, y_val = train_test_split(
+                X, y, test_size=test_size, random_state=random_state, stratify=y
+            )
+            X_train_scaled = self.scaler.fit_transform(X_train)
+            X_val_scaled = self.scaler.transform(X_val)
+
+            self.model.fit(X_train_scaled, y_train)
+            self.is_trained = True
+
+            train_pred = self.model.predict(X_train_scaled)
+            val_pred = self.model.predict(X_val_scaled)
+
+            metrics = {
+                "train_accuracy": float(accuracy_score(y_train, train_pred)),
+                "train_f1_weighted": float(f1_score(y_train, train_pred, average="weighted", zero_division=0)),
+                "val_accuracy": float(accuracy_score(y_val, val_pred)),
+                "val_f1_weighted": float(f1_score(y_val, val_pred, average="weighted", zero_division=0)),
+                # Backwards-compatibility
+                "accuracy": float(accuracy_score(y_val, val_pred)),
+                "f1_weighted": float(f1_score(y_val, val_pred, average="weighted", zero_division=0)),
+            }
+        else:
+            X_scaled = self.scaler.fit_transform(X)
+            self.model.fit(X_scaled, y)
+            self.is_trained = True
+            y_pred = self.model.predict(X_scaled)
+            acc = float(accuracy_score(y, y_pred))
+            f1 = float(f1_score(y, y_pred, average="weighted", zero_division=0))
+            metrics = {
+                "train_accuracy": acc,
+                "train_f1_weighted": f1,
+                "val_accuracy": acc,
+                "val_f1_weighted": f1,
+                "accuracy": acc,
+                "f1_weighted": f1,
+            }
+
+        logger.info("Trained CongestionClassifier (val_accuracy=%.4f, val_f1=%.4f)", metrics["val_accuracy"], metrics["val_f1_weighted"])
         return metrics
 
     def predict_risk(

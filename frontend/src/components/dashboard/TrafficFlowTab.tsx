@@ -13,6 +13,23 @@ export default function TrafficFlowTab({
   trafficData,
   isLoading,
 }: TrafficFlowTabProps) {
+  const summary = trafficData?.summary
+
+  const displaySegments = useMemo(() => {
+    return trafficData?.segments && trafficData.segments.length > 0
+      ? trafficData.segments
+      : analysis.segments
+  }, [trafficData, analysis])
+
+  // Sort segments by congestion (lowest observed speed first)
+  const sortedSegments = useMemo(() => {
+    return [...displaySegments].sort((a, b) => {
+      const speedA = a.traffic?.observed_speed_kmh ?? 999
+      const speedB = b.traffic?.observed_speed_kmh ?? 999
+      return speedA - speedB
+    })
+  }, [displaySegments])
+
   if (isLoading) {
     return (
       <div className="flex flex-col items-center justify-center p-16 gap-3">
@@ -25,13 +42,6 @@ export default function TrafficFlowTab({
       </div>
     )
   }
-
-  const summary = trafficData?.summary
-  const displaySegments = useMemo(() => {
-    return trafficData?.segments && trafficData.segments.length > 0
-      ? trafficData.segments
-      : analysis.segments
-  }, [trafficData, analysis])
 
   const incidents = trafficData?.incidents ?? []
 
@@ -48,15 +58,6 @@ export default function TrafficFlowTab({
     summary?.avg_free_flow_speed_kmh && summary?.avg_observed_speed_kmh
       ? (summary.avg_free_flow_speed_kmh / Math.max(1, summary.avg_observed_speed_kmh)).toFixed(2)
       : '1.54'
-
-  // Sort segments by congestion (lowest observed speed first)
-  const sortedSegments = useMemo(() => {
-    return [...displaySegments].sort((a, b) => {
-      const speedA = a.traffic?.observed_speed_kmh ?? 999
-      const speedB = b.traffic?.observed_speed_kmh ?? 999
-      return speedA - speedB
-    })
-  }, [displaySegments])
 
   const getLosInfo = (obsSpeed?: number | null, freeFlowSpeed?: number | null) => {
     if (!obsSpeed || !freeFlowSpeed || freeFlowSpeed <= 0) {

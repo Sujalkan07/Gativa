@@ -4,6 +4,9 @@ import type {
   AnalysisResult,
   TrafficFlowResult,
   RecommendationsResult,
+  SimulationPrepareRequest,
+  SimulationStatusResponse,
+  ScenarioComparisonResult,
   ApiError,
 } from '../types/api'
 
@@ -74,4 +77,28 @@ export const api = {
     })
     return response.data
   },
+
+  prepareSimulation: async (request: SimulationPrepareRequest): Promise<SimulationStatusResponse> =>
+    handleRequest(client.post('/api/simulations/prepare', request)),
+
+  startSimulation: async (simId: string): Promise<SimulationStatusResponse> =>
+    handleRequest(client.post(`/api/simulations/${simId}/start`)),
+
+  pauseSimulation: async (simId: string): Promise<SimulationStatusResponse> =>
+    handleRequest(client.post(`/api/simulations/${simId}/pause`)),
+
+  stepSimulation: async (simId: string, steps: number = 2): Promise<SimulationStatusResponse> =>
+    handleRequest(client.post(`/api/simulations/${simId}/step?steps=${steps}`)),
+
+  resetSimulation: async (simId: string): Promise<SimulationStatusResponse> =>
+    handleRequest(client.post(`/api/simulations/${simId}/reset`)),
+
+  stopSimulation: async (simId: string): Promise<SimulationStatusResponse> =>
+    handleRequest(client.post(`/api/simulations/${simId}/stop`)),
+
+  getSimulationStatus: async (simId: string): Promise<SimulationStatusResponse> =>
+    handleRequest(client.get(`/api/simulations/${simId}`)),
+
+  getScenarioComparison: async (simId: string): Promise<ScenarioComparisonResult> =>
+    handleRequest(client.get(`/api/simulations/${simId}/comparison`)),
 }

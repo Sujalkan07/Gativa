@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import get_settings
 from app.core.database import connect_to_mongo, close_mongo_connection
-from app.api import health, analyses
+from app.api import health, analyses, simulations
 
 
 settings = get_settings()
@@ -40,3 +40,4 @@ app.add_middleware(
 # Routers
 app.include_router(health.router, prefix="/api")
 app.include_router(analyses.router, prefix="/api")
+app.include_router(simulations.router, prefix="/api")

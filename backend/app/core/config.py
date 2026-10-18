@@ -52,12 +52,8 @@ class Settings(BaseSettings):
                 "Get a key at https://home.openweathermap.org/api_keys"
             ]
 
-        if not self.google_maps_api_key:
-            warnings["google_maps"] = [
-                "GOOGLE_MAPS_API_KEY is not configured. Some geocoding features will be unavailable. "
-                "Enable Maps JavaScript API in Google Cloud Console."
-            ]
-
+        # Note: Mapping has been migrated to OpenStreetMap / CARTO / Leaflet and OSMnx.
+        # Google Maps is no longer required.
         return warnings
 
 

@@ -30,7 +30,7 @@ from app.models.schemas import (
 
 logger = logging.getLogger(__name__)
 
-MAX_TRAFFIC_SAMPLES = 15  # Max TomTom calls per analysis to stay within rate limits
+MAX_TRAFFIC_SAMPLES = 30  # Max TomTom calls per analysis to stay within rate limits
 
 
 def _centroid(coords: list[list[float]]) -> tuple[float, float]:
@@ -250,6 +250,16 @@ async def run_analysis(polygon: GeoJSONPolygon) -> AnalysisResult:
     except Exception:
         area_name = None
 
+    # Prioritize segments for frontend visualization: highways & arterials first, then named streets, then by length
+    prioritized_segments = sorted(
+        segments,
+        key=lambda s: (
+            0 if s.road_type == "highway" else 1 if s.road_type == "arterial" else 2,
+            0 if s.name and not any(gen in s.name for gen in ["Local", "Connecting", "Sector Street"]) else 1,
+            -s.length_m,
+        ),
+    )
+
     result = AnalysisResult(
         analysis_id=analysis_id,
         status="completed",
@@ -259,7 +269,7 @@ async def run_analysis(polygon: GeoJSONPolygon) -> AnalysisResult:
         created_at=created_at,
         completed_at=completed_at,
         road_network=road_metrics,
-        segments=segments[:500],  # Cap for response size
+        segments=prioritized_segments[:600],  # Cap with priority preserved
         bottlenecks=bottlenecks,
         weather=weather,
         data_sources=data_sources,
@@ -268,7 +278,7 @@ async def run_analysis(polygon: GeoJSONPolygon) -> AnalysisResult:
 
     # Persist
     await _persist_analysis(analysis_id, result)
-    await _persist_traffic_flow(analysis_id, segments, incidents, traffic_by_segment)
+    await _persist_traffic_flow(analysis_id, prioritized_segments[:600], incidents, traffic_by_segment)
     await _persist_recommendations(analysis_id, recs_result)
 
     logger.info(
