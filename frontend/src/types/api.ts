@@ -37,6 +37,8 @@ export interface RoadSegment {
   speed_limit_kmh: number | null
   lanes: number | null
   is_oneway: boolean
+  osm_highway?: string | null
+  osm_id?: string | null
   traffic?: TrafficObservation | null
 }
 
@@ -105,7 +107,7 @@ export interface AnalysisResult {
   data_sources: DataSourceCoverage[]
   warnings: string[]
   error_message: string | null
-  storage_mode?: 'mongodb' | 'in_memory'
+  storage_mode?: 'mongodb' | 'sqlite' | 'in_memory'
   ml_status?: {
     model_name: string
     is_production_trained: boolean
@@ -237,10 +239,25 @@ export interface SimulationMetrics {
   variance_completed_pct?: number
 }
 
+export type SimulationEngineMode = 'native_sumo' | 'fallback' | 'unavailable'
+export type ComparisonStatus = 'pending' | 'insufficient_data' | 'completed' | 'failed'
+
+export interface TrafficLightState {
+  id: string
+  lat: number
+  lng: number
+  state: string
+  is_green: boolean
+  controlled_lanes?: string[]
+  controlled_junctions?: string[]
+}
+
 export interface SimulationStatusResponse {
   sim_id: string
   analysis_id: string
   state: SimulationState
+  engine_mode: SimulationEngineMode
+  engine_message?: string | null
   duration_seconds: number
   demand_rate_veh_hr: number
   strategy: SignalStrategy
@@ -251,6 +268,7 @@ export interface SimulationStatusResponse {
   elapsed_seconds: number
   current_metrics: SimulationMetrics
   vehicles: VehiclePosition[]
+  traffic_lights?: TrafficLightState[]
   error_message?: string | null
 }
 
@@ -266,6 +284,8 @@ export interface ScenarioComparisonResult {
   sim_id: string
   analysis_id: string
   duration_seconds: number
+  engine_mode?: SimulationEngineMode
+  comparison_status?: ComparisonStatus
   baseline_strategy: string
   optimized_strategy: string
   baseline_metrics: SimulationMetrics

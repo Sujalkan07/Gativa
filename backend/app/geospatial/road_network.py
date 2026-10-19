@@ -1,18 +1,26 @@
 """
-OSMnx-based road network retrieval and analysis.
-Uses OpenStreetMap data via the Overpass API — no API key required.
+OSMnx-based road network retrieval, geodesic calculations, and spatial analysis.
+Uses OpenStreetMap data via the OSM API v0.6 and Overpass mirrors — no Google API key required.
+Includes WGS84 geodesic calculations (pyproj), polygon boundary clipping (shapely),
+and physical edge deduplication for accurate road reporting.
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import math
+import os
+import tempfile
 from typing import Optional
 
 import networkx as nx
 import osmnx as ox
-from shapely.geometry import Polygon, Point, mapping
+import pyproj
+from shapely.geometry import Polygon, Point, LineString, MultiLineString, GeometryCollection, mapping
 
+from app.core.config import get_settings
+from app.core.sqlite_store import get_osm_cache_sync, save_osm_cache_sync
 from app.models.schemas import (
     RoadNetworkMetrics,
     RoadSegment,
@@ -23,46 +31,100 @@ from app.models.schemas import (
 
 logger = logging.getLogger(__name__)
 
+# WGS84 Ellipsoid geodetic calculator for exact ellipsoidal GIS metrics
+_GEOD = pyproj.Geod(ellps="WGS84")
+
 # OSMnx road type → Gativa classification
+# Tertiary and tertiary_link are classified as arterials (urban collectors / district spines)
 ROAD_CLASS_MAP = {
-    # Highways
+    # High-speed access-controlled corridors
     "motorway": "highway",
     "motorway_link": "highway",
     "trunk": "highway",
     "trunk_link": "highway",
-    # Arterials
+
+    # Primary, secondary, and tertiary arterial spines & collectors
     "primary": "arterial",
     "primary_link": "arterial",
     "secondary": "arterial",
     "secondary_link": "arterial",
-    # Local
-    "tertiary": "local",
-    "tertiary_link": "local",
+    "tertiary": "arterial",
+    "tertiary_link": "arterial",
+
+    # Local neighborhood streets and access service ways
     "residential": "local",
     "living_street": "local",
     "unclassified": "local",
     "road": "local",
     "service": "local",
-    "pedestrian": "local",
-    "track": "local",
-    "footway": "local",
-    "cycleway": "local",
-    "path": "local",
-    "steps": "local",
 }
 
 
-def _classify_road(highway_tag: str | list[str]) -> str:
+def _classify_road(highway_tag: str | list[str] | None) -> str:
+    """Classify an OSM highway tag into highway, arterial, or local."""
+    if not highway_tag:
+        return "local"
     if isinstance(highway_tag, list):
-        highway_tag = highway_tag[0]
-    return ROAD_CLASS_MAP.get(highway_tag.lower(), "local")
+        classes = [_classify_road(t) for t in highway_tag]
+        if "highway" in classes:
+            return "highway"
+        if "arterial" in classes:
+            return "arterial"
+        return "local"
+    return ROAD_CLASS_MAP.get(str(highway_tag).strip().lower(), "local")
 
 
-def _get_edge_length_m(data: dict) -> float:
-    length = data.get("length", 0)
-    if isinstance(length, list):
-        length = sum(length)
-    return float(length)
+def _compute_geodesic_area_km2(polygon: Polygon) -> float:
+    """Compute polygon area in km² using WGS84 geodesic calculation (pyproj)."""
+    try:
+        area_m2, _ = _GEOD.geometry_area_perimeter(polygon)
+        return abs(area_m2) / 1_000_000.0
+    except Exception as exc:
+        logger.debug("Geodesic area calculation fallback: %s", exc)
+        return 0.0
+
+
+def _compute_geodesic_length_m(geom) -> float:
+    """Compute LineString length in meters using WGS84 geodesic calculation (pyproj)."""
+    if geom is None or geom.is_empty:
+        return 0.0
+    try:
+        return float(_GEOD.geometry_length(geom))
+    except Exception as exc:
+        logger.debug("Geodesic length calculation fallback: %s", exc)
+        return 0.0
+
+
+def _clip_geometry_to_polygon(geom, poly: Polygon):
+    """Clip a Shapely geometry strictly to a boundary polygon."""
+    if geom is None or geom.is_empty:
+        return None
+    if not poly.intersects(geom):
+        return None
+    try:
+        clipped = geom.intersection(poly)
+        if clipped.is_empty:
+            return None
+        if clipped.geom_type == "LineString":
+            return clipped
+        elif clipped.geom_type == "MultiLineString":
+            lines = [l for l in clipped.geoms if l.length > 0]
+            if lines:
+                return max(lines, key=lambda l: l.length)
+        elif clipped.geom_type == "GeometryCollection":
+            lines = [g for g in clipped.geoms if g.geom_type == "LineString" and g.length > 0]
+            if lines:
+                return max(lines, key=lambda l: l.length)
+    except Exception as exc:
+        logger.debug("Geometry clipping fallback: %s", exc)
+    return geom
+
+
+def _get_polygon_cache_key(poly: Polygon) -> str:
+    """Generate deterministic cache key for a spatial bounding box (~11m resolution)."""
+    minx, miny, maxx, maxy = poly.bounds
+    bbox_str = f"{minx:.4f}_{miny:.4f}_{maxx:.4f}_{maxy:.4f}"
+    return hashlib.sha256(bbox_str.encode()).hexdigest()[:16]
 
 
 def _get_speed_limit(data: dict) -> Optional[float]:
@@ -72,12 +134,11 @@ def _get_speed_limit(data: dict) -> Optional[float]:
     if isinstance(maxspeed, list):
         maxspeed = maxspeed[0]
     try:
-        # Handle "50 mph", "50 km/h", "50"
         parts = str(maxspeed).split()
         value = float(parts[0])
         if len(parts) > 1 and "mph" in parts[1].lower():
             value *= 1.60934
-        return value
+        return round(value, 1)
     except (ValueError, IndexError):
         return None
 
@@ -94,35 +155,13 @@ def _get_lanes(data: dict) -> Optional[int]:
         return None
 
 
-def _compute_area_km2(polygon: Polygon) -> float:
-    """Compute polygon area in km² using a local projection approximation."""
-    # Get centroid
-    centroid = polygon.centroid
-    lat = centroid.y
-    # Meters per degree approximation at this latitude
-    m_per_deg_lat = 111_132.92
-    m_per_deg_lng = 111_132.92 * math.cos(math.radians(lat))
-
-    coords = list(polygon.exterior.coords)
-    area = 0.0
-    n = len(coords)
-    for i in range(n):
-        x1 = coords[i][0] * m_per_deg_lng
-        y1 = coords[i][1] * m_per_deg_lat
-        x2 = coords[(i + 1) % n][0] * m_per_deg_lng
-        y2 = coords[(i + 1) % n][1] * m_per_deg_lat
-        area += x1 * y2 - x2 * y1
-    return abs(area) / 2 / 1_000_000  # m² → km²
-
-
 async def _discover_local_street_names(poly: Polygon) -> tuple[list[str], str]:
     """Discover genuine local road names and neighborhood subdivision using TomTom reverse geocode."""
-    from app.core.config import get_settings
-    import httpx
-
     settings = get_settings()
     if not settings.tomtom_api_key:
         return [], ""
+
+    import httpx
 
     minx, miny, maxx, maxy = poly.bounds
     cx, cy = poly.centroid.x, poly.centroid.y
@@ -169,23 +208,44 @@ async def _discover_local_street_names(poly: Polygon) -> tuple[list[str], str]:
     return discovered_streets, locality
 
 
+def _parse_and_clip_xml(path: str, boundary_poly: Polygon) -> nx.MultiDiGraph:
+    """Parse OSM XML file and truncate graph to boundary polygon, filtering non-drivable paths."""
+    g = ox.graph_from_xml(path, simplify=True)
+    if g.number_of_edges() == 0:
+        return g
+    g_clipped = ox.truncate.truncate_graph_polygon(g, boundary_poly)
+
+    non_drivable = {
+        "footway", "cycleway", "steps", "path", "pedestrian",
+        "bridleway", "corridor", "platform", "proposed", "construction",
+    }
+    edges_to_remove = []
+    for u, v, k, d in g_clipped.edges(keys=True, data=True):
+        hw = d.get("highway")
+        if isinstance(hw, list):
+            hw = hw[0]
+        if hw in non_drivable:
+            edges_to_remove.append((u, v, k))
+    for u, v, k in edges_to_remove:
+        g_clipped.remove_edge(u, v, k)
+
+    isolated = list(nx.isolates(g_clipped))
+    g_clipped.remove_nodes_from(isolated)
+    return g_clipped
 
 
-
-async def _fetch_osm_graph_from_api(poly: Polygon) -> Optional[nx.MultiDiGraph]:
+async def _fetch_osm_graph_from_api(poly: Polygon) -> tuple[Optional[nx.MultiDiGraph], Optional[str]]:
     """
     Fetch road network directly from the official OpenStreetMap database API (v0.6).
-    Fast, reliable, and returns real physical road geometries, curvatures, and street tags.
+    Fast, reliable, and returns real physical road geometries and street tags.
+    Returns (MultiDiGraph, raw_xml_content).
     """
-    import os
-    import tempfile
     import httpx
 
     minx, miny, maxx, maxy = poly.bounds
-    # OSM API v0.6 bounding box limit is 0.25 degrees in either dimension
     if (maxx - minx) > 0.25 or (maxy - miny) > 0.25:
         logger.info("Bounding box (%.3f x %.3f) exceeds OSM API limit of 0.25 deg", maxx - minx, maxy - miny)
-        return None
+        return None, None
 
     url = f"https://api.openstreetmap.org/api/0.6/map?bbox={minx:.6f},{miny:.6f},{maxx:.6f},{maxy:.6f}"
     headers = {
@@ -199,48 +259,24 @@ async def _fetch_osm_graph_from_api(poly: Polygon) -> Optional[nx.MultiDiGraph]:
             resp = await client.get(url)
             if resp.status_code != 200 or len(resp.content) < 100:
                 logger.warning("OSM API v0.6 returned status %d (length %d bytes)", resp.status_code, len(resp.content))
-                return None
+                return None, None
 
-            with tempfile.NamedTemporaryFile(suffix=".osm", delete=False) as f:
-                f.write(resp.content)
+            xml_content = resp.text
+            with tempfile.NamedTemporaryFile(suffix=".osm", delete=False, mode="w", encoding="utf-8") as f:
+                f.write(xml_content)
                 tmp_path = f.name
 
-        def _parse_and_clip(path: str, boundary_poly: Polygon) -> nx.MultiDiGraph:
-            g = ox.graph_from_xml(path, simplify=True)
-            if g.number_of_edges() == 0:
-                return g
-            g_clipped = ox.truncate.truncate_graph_polygon(g, boundary_poly)
-
-            # Filter out non-drivable paths
-            non_drivable = {
-                "footway", "cycleway", "steps", "path", "pedestrian",
-                "bridleway", "corridor", "platform", "proposed", "construction",
-            }
-            edges_to_remove = []
-            for u, v, k, d in g_clipped.edges(keys=True, data=True):
-                hw = d.get("highway")
-                if isinstance(hw, list):
-                    hw = hw[0]
-                if hw in non_drivable:
-                    edges_to_remove.append((u, v, k))
-            for u, v, k in edges_to_remove:
-                g_clipped.remove_edge(u, v, k)
-
-            isolated = list(nx.isolates(g_clipped))
-            g_clipped.remove_nodes_from(isolated)
-            return g_clipped
-
-        G = await asyncio.to_thread(_parse_and_clip, tmp_path, poly)
+        G = await asyncio.to_thread(_parse_and_clip_xml, tmp_path, poly)
         logger.info(
             "Retrieved real OSM road network via OSM API v0.6: %d nodes, %d edges",
             G.number_of_nodes(),
             G.number_of_edges(),
         )
-        return G if G.number_of_edges() > 0 else None
+        return (G if G.number_of_edges() > 0 else None), xml_content
 
     except Exception as exc:
         logger.warning("OSM API v0.6 retrieval failed: %s", exc)
-        return None
+        return None, None
     finally:
         if tmp_path and os.path.exists(tmp_path):
             try:
@@ -261,6 +297,7 @@ async def fetch_road_network(
 ]:
     """
     Retrieve the road network for a polygon from OpenStreetMap via OSMnx.
+    Performs boundary clipping, geodesic metrics calculations, and physical segment deduplication.
 
     Args:
         polygon_coords: GeoJSON coordinates [[lng, lat], ...] (outer ring).
@@ -282,8 +319,8 @@ async def fetch_road_network(
                     message="Selected polygon has self-intersecting or invalid boundary topology. Please redraw without crossing lines.",
                 )
 
-        area_km2 = _compute_area_km2(poly)
-        logger.info("Road network request: area=%.2f km²", area_km2)
+        area_km2 = _compute_geodesic_area_km2(poly)
+        logger.info("Road network request: area=%.2f km² (WGS84 geodesic)", area_km2)
 
         if area_km2 < 0.005:
             return None, [], None, [], DataSourceCoverage(
@@ -296,8 +333,7 @@ async def fetch_road_network(
             return None, [], None, [], DataSourceCoverage(
                 source="osm",
                 status="error",
-                message=f"Area {area_km2:.1f} km² exceeds maximum {max_area_km2} km². "
-                "Draw a smaller polygon.",
+                message=f"Area {area_km2:.1f} km² exceeds maximum {max_area_km2} km². Draw a smaller polygon.",
             )
 
         # Configure OSMnx
@@ -313,14 +349,44 @@ async def fetch_road_network(
 
         G: Optional[nx.MultiDiGraph] = None
         source_channel = "osm_api_v06"
+        cache_key = _get_polygon_cache_key(poly)
 
-        # 1. Attempt official OpenStreetMap API v0.6 first (fastest, most reliable)
+        # 1. Check local persistent SQLite cache
         try:
-            G = await _fetch_osm_graph_from_api(poly)
+            cached_entry = await asyncio.to_thread(get_osm_cache_sync, cache_key)
+            if cached_entry:
+                cached_xml, meta = cached_entry
+                with tempfile.NamedTemporaryFile(suffix=".osm", delete=False, mode="w", encoding="utf-8") as f:
+                    f.write(cached_xml)
+                    tmp_cache_path = f.name
+                try:
+                    G = await asyncio.to_thread(_parse_and_clip_xml, tmp_cache_path, poly)
+                    if G is not None and G.number_of_edges() > 0:
+                        source_channel = "osm_spatial_cache"
+                        logger.info("Loaded road network from local spatial cache (%d edges)", G.number_of_edges())
+                finally:
+                    if os.path.exists(tmp_cache_path):
+                        os.remove(tmp_cache_path)
         except Exception as exc:
-            logger.warning("OSM API v0.6 retrieval encountered error: %s", exc)
+            logger.debug("Spatial cache lookup encountered: %s", exc)
 
-        # 2. If OSM API v0.6 did not return edges, attempt Overpass API with mirrors
+        # 2. Attempt official OpenStreetMap API v0.6 if not loaded from cache
+        if G is None or G.number_of_edges() == 0:
+            try:
+                G, raw_xml = await _fetch_osm_graph_from_api(poly)
+                if G is not None and G.number_of_edges() > 0 and raw_xml:
+                    source_channel = "osm_api_v06"
+                    meta = {
+                        "area_km2": round(area_km2, 4),
+                        "edges": G.number_of_edges(),
+                        "nodes": G.number_of_nodes(),
+                        "retrieval_method": "osm_api_v06",
+                    }
+                    await asyncio.to_thread(save_osm_cache_sync, cache_key, raw_xml, meta)
+            except Exception as exc:
+                logger.warning("OSM API v0.6 retrieval encountered error: %s", exc)
+
+        # 3. If OSM API v0.6 did not return edges, attempt Overpass API with mirrors
         if G is None or G.number_of_edges() == 0:
             for endpoint in [
                 "https://overpass.kumi.systems/api/interpreter",
@@ -340,44 +406,60 @@ async def fetch_road_network(
                 except Exception as exc:
                     logger.warning("Overpass endpoint %s failed: %s", endpoint, exc)
 
+        # 4. Strictly reject synthetic fallback in production
         if G is None or G.number_of_edges() == 0:
             logger.warning("No road network could be retrieved from OpenStreetMap API or Overpass mirrors.")
             return None, [], None, [], DataSourceCoverage(
                 source="osm",
                 status="error",
-                message="OpenStreetMap data could not be retrieved for this area. Please retry or adjust the polygon boundary.",
+                message="OpenStreetMap data could not be retrieved for this area. Please verify network connectivity or adjust the polygon boundary.",
             )
 
-        # ─── Build segment list ───────────────────────────────────────────────
+        # ─── Build physical road segments list with canonical deduplication ───
+        # In a directed MultiDiGraph, bidirectional streets have pairs (u, v) and (v, u).
+        # We deduplicate into unique physical centerline segments so metrics, lengths, and visualizations reflect real roadways.
+        seen_canonical_edges: set[tuple] = set()
         segments: list[RoadSegment] = []
         class_counts: dict[str, int] = {"highway": 0, "arterial": 0, "local": 0}
         total_length_m = 0.0
 
         for u, v, key, data in G.edges(keys=True, data=True):
-            seg_id = f"{u}_{v}_{key}"
-            highway = data.get("highway", "unclassified")
-            road_class = _classify_road(highway)
-            length_m = _get_edge_length_m(data)
+            canonical_key = (min(u, v), max(u, v), key)
+            if canonical_key in seen_canonical_edges:
+                continue
+            seen_canonical_edges.add(canonical_key)
 
-            # Geometry
+            # Determine physical one-way status:
+            # If oneway tag is True AND there is no reciprocal edge (v, u), it is one-way.
+            is_oneway = bool(data.get("oneway", False)) and not G.has_edge(v, u)
+
+            # Geometry extraction
             geom = data.get("geometry")
-            geojson_line: Optional[GeoJSONLineString] = None
-            if geom is not None:
-                coords_list = [[c[0], c[1]] for c in geom.coords]
-                geojson_line = GeoJSONLineString(coordinates=coords_list)
-            else:
-                # Fall back to straight line between nodes
+            if geom is None:
                 u_data = G.nodes[u]
                 v_data = G.nodes[v]
                 if "x" in u_data and "y" in u_data and "x" in v_data and "y" in v_data:
-                    geojson_line = GeoJSONLineString(
-                        coordinates=[
-                            [u_data["x"], u_data["y"]],
-                            [v_data["x"], v_data["y"]],
-                        ]
-                    )
+                    geom = LineString([[u_data["x"], u_data["y"]], [v_data["x"], v_data["y"]]])
 
-            # Name
+            # Clip geometry strictly to polygon boundary
+            clipped_geom = _clip_geometry_to_polygon(geom, poly)
+            if clipped_geom is None or clipped_geom.is_empty:
+                continue
+
+            length_m = _compute_geodesic_length_m(clipped_geom)
+            if length_m < 1.0:
+                continue
+
+            coords_list = [[round(c[0], 6), round(c[1], 6)] for c in clipped_geom.coords]
+            geojson_line = GeoJSONLineString(coordinates=coords_list)
+
+            highway = data.get("highway", "unclassified")
+            road_class = _classify_road(highway)
+            osm_highway_str = highway[0] if isinstance(highway, list) else str(highway)
+            osm_id_val = data.get("osmid")
+            osm_id_str = str(osm_id_val[0]) if isinstance(osm_id_val, list) else str(osm_id_val or "")
+
+            # Street Name
             name = data.get("name")
             if isinstance(name, list):
                 name = name[0]
@@ -399,27 +481,25 @@ async def fetch_road_network(
                         name = f"{loc_prefix} Sector Street"
 
             segments.append(RoadSegment(
-                segment_id=seg_id,
+                segment_id=f"{u}_{v}_{key}",
                 name=name,
                 road_type=road_class,
                 length_m=round(length_m, 1),
                 geometry=geojson_line,
                 speed_limit_kmh=_get_speed_limit(data),
                 lanes=_get_lanes(data),
-                is_oneway=bool(data.get("oneway", False)),
+                is_oneway=is_oneway,
+                osm_highway=osm_highway_str,
+                osm_id=osm_id_str,
             ))
 
             class_counts[road_class] = class_counts.get(road_class, 0) + 1
             total_length_m += length_m
 
-        total_length_km = total_length_m / 1000
+        total_length_km = round(total_length_m / 1000.0, 2)
 
-        # ─── Network metrics ──────────────────────────────────────────────────
-        intersection_count = sum(
-            1 for n in G.nodes if G.degree(n) >= 3
-        )
-
-        # ─── Structural bottleneck detection using NetworkX ───────────────────
+        # ─── Network metrics (Mathematically consistent) ─────────────────────
+        intersection_count = sum(1 for n in G.nodes if G.degree(n) >= 3)
         bottlenecks = _detect_structural_bottlenecks(G, locality=locality)
 
         metrics = RoadNetworkMetrics(
@@ -427,8 +507,8 @@ async def fetch_road_network(
             highway_count=class_counts.get("highway", 0),
             arterial_count=class_counts.get("arterial", 0),
             local_count=class_counts.get("local", 0),
-            total_length_km=round(total_length_km, 2),
-            road_density_km_per_km2=round(total_length_km / area_km2, 2) if area_km2 > 0 else 0,
+            total_length_km=total_length_km,
+            road_density_km_per_km2=round(total_length_km / area_km2, 2) if area_km2 > 0 else 0.0,
             intersection_count=intersection_count,
             potential_bottleneck_count=len(bottlenecks),
             area_km2=round(area_km2, 3),
@@ -442,14 +522,18 @@ async def fetch_road_network(
         coverage = DataSourceCoverage(
             source="osm",
             status="ok",
-            message=f"Retrieved {len(segments)} genuine road segments from OpenStreetMap ({source_channel})",
+            message=f"Retrieved {len(segments)} genuine physical road segments from OpenStreetMap ({source_channel})",
         )
 
         logger.info(
-            "OSM road network: %d segments, %.1f km total, %d intersections",
+            "OSM road network: %d physical segments (Highways: %d, Arterials: %d, Local: %d), %.2f km total, area: %.2f km², density: %.2f km/km²",
             len(segments),
+            class_counts.get("highway", 0),
+            class_counts.get("arterial", 0),
+            class_counts.get("local", 0),
             total_length_km,
-            intersection_count,
+            area_km2,
+            metrics.road_density_km_per_km2,
         )
         return G, segments, metrics, bottlenecks, coverage
 
@@ -468,7 +552,7 @@ def _detect_structural_bottlenecks(
 ) -> list[BottleneckCandidate]:
     """
     Detect potential structural bottleneck nodes using betweenness centrality.
-    High betweenness + high degree = likely congestion point.
+    Calculates correct statistical percentile ranks (e.g. 'Top 1% of network nodes').
     Applies spatial deduplication to ensure distinct physical chokepoints across the corridor.
     """
     bottlenecks: list[BottleneckCandidate] = []
@@ -477,17 +561,13 @@ def _detect_structural_bottlenecks(
         return bottlenecks
 
     try:
-        # Use undirected view for centrality (faster)
         UG = G.to_undirected()
 
         # Sample nodes for large networks to bound computation time
         k = min(500, G.number_of_nodes())
         centrality = nx.betweenness_centrality(UG, k=k, normalized=True, seed=42)
-
-        # Degree centrality
         degree = dict(G.degree())
 
-        # Identify high-centrality nodes
         if not centrality:
             return bottlenecks
 
@@ -503,7 +583,6 @@ def _detect_structural_bottlenecks(
             for node, score in centrality.items()
             if score >= threshold and degree.get(node, 0) >= 3
         ]
-        # Sort by score descending
         candidate_nodes.sort(key=lambda x: x[1], reverse=True)
 
         # Spatial deduplication: ensure bottlenecks are at least ~100-120m apart (0.001 deg)
@@ -522,6 +601,7 @@ def _detect_structural_bottlenecks(
                 if len(deduped_candidates) >= 10:
                     break
 
+        total_nodes = len(centrality)
         for node, score, lat, lng in deduped_candidates:
             deg = degree.get(node, 0)
 
@@ -542,7 +622,7 @@ def _detect_structural_bottlenecks(
                     else:
                         incident_names.append(nm)
 
-            # If node has no direct street names, check 1-hop neighbor edges
+            # Check 1-hop neighbor edges if no direct names
             if not incident_names:
                 for nbr in list(G.neighbors(node))[:4]:
                     for _, _, d in G.edges(nbr, data=True):
@@ -554,7 +634,6 @@ def _detect_structural_bottlenecks(
                                 incident_names.append(nm)
                             break
 
-            # Filter duplicates while preserving order
             unique_names = []
             for nm in incident_names:
                 clean_nm = str(nm).strip()
@@ -576,11 +655,15 @@ def _detect_structural_bottlenecks(
             else:
                 severity = "low"
 
+            # Compute rank percentile (Top X% of network nodes)
+            nodes_higher_or_equal = sum(1 for val in centrality.values() if val >= score)
+            pct_rank = max(1, round((nodes_higher_or_equal / total_nodes) * 100))
+
             evidence_items = []
             if unique_names:
                 evidence_items.append(f"Major crossroads: {', '.join(unique_names[:3])}")
             evidence_items.extend([
-                f"Betweenness centrality score: {score:.3f} (top {(score / max_centrality * 100):.0f}% of network)",
+                f"Betweenness centrality score: {score:.3f} (Top {pct_rank}% of network nodes)",
                 f"Intersection degree: {deg} connecting roads",
                 "High network centrality indicates severe traffic convergence",
             ])

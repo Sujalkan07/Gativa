@@ -13,7 +13,15 @@ from typing import Optional
 import httpx
 
 from app.core.config import get_settings
-from app.core.database import get_database
+from app.core.database import get_database, is_mongodb_connected, get_persistence_mode
+from app.core.sqlite_store import (
+    save_analysis_sync,
+    get_analysis_sync,
+    save_traffic_flow_sync,
+    get_traffic_flow_sync,
+    save_recommendations_sync,
+    get_recommendations_sync,
+)
 from app.data_ingestion.tomtom import fetch_flow_for_point, fetch_incidents_for_bbox
 from app.data_ingestion.openweather import fetch_weather
 from app.geospatial.road_network import fetch_road_network
@@ -308,17 +316,34 @@ _in_memory_recommendations: dict[str, dict] = {}
 async def _persist_analysis(analysis_id: str, result: AnalysisResult) -> None:
     doc = result.model_dump()
     doc["_id"] = analysis_id
-    doc["storage_mode"] = "in_memory"
-    _in_memory_analyses[analysis_id] = doc
+    
+    # 1. Determine storage mode and attempt MongoDB if connected
+    mongo_saved = False
+    if is_mongodb_connected():
+        try:
+            db = get_database()
+            doc["storage_mode"] = "mongodb"
+            await db["analyses"].replace_one({"_id": analysis_id}, doc, upsert=True)
+            result.storage_mode = "mongodb"
+            mongo_saved = True
+        except Exception as exc:
+            logger.warning("MongoDB write failed for analysis %s: %s", analysis_id, exc)
+
+    if not mongo_saved:
+        doc["storage_mode"] = "sqlite"
+        result.storage_mode = "sqlite"
+
+    # 2. Always persist locally to durable SQLite store (backend/data/gativa.db)
     try:
-        db = get_database()
-        doc["storage_mode"] = "mongodb"
-        await db["analyses"].replace_one({"_id": analysis_id}, doc, upsert=True)
-        result.storage_mode = "mongodb"
+        await asyncio.to_thread(save_analysis_sync, analysis_id, doc)
     except Exception as exc:
-        doc["storage_mode"] = "in_memory"
-        result.storage_mode = "in_memory"
-        logger.warning("MongoDB unavailable for analysis %s, cached in-memory: %s", analysis_id, exc)
+        logger.error("SQLite write failed for analysis %s: %s", analysis_id, exc)
+        if not mongo_saved:
+            doc["storage_mode"] = "in_memory"
+            result.storage_mode = "in_memory"
+
+    # 3. Cache in memory for fastest lookups
+    _in_memory_analyses[analysis_id] = doc
 
 
 async def _persist_traffic_flow(
@@ -335,11 +360,18 @@ async def _persist_traffic_flow(
         "traffic_map": {k: v.model_dump() for k, v in traffic_by_segment.items()},
     }
     _in_memory_traffic[analysis_id] = doc
+
+    if is_mongodb_connected():
+        try:
+            db = get_database()
+            await db["traffic_flow"].replace_one({"_id": analysis_id}, doc, upsert=True)
+        except Exception as exc:
+            logger.warning("MongoDB write failed for traffic flow %s: %s", analysis_id, exc)
+
     try:
-        db = get_database()
-        await db["traffic_flow"].replace_one({"_id": analysis_id}, doc, upsert=True)
+        await asyncio.to_thread(save_traffic_flow_sync, analysis_id, doc)
     except Exception as exc:
-        logger.warning("MongoDB unavailable for traffic flow %s, cached in-memory: %s", analysis_id, exc)
+        logger.error("SQLite write failed for traffic flow %s: %s", analysis_id, exc)
 
 
 async def _persist_recommendations(
@@ -349,41 +381,68 @@ async def _persist_recommendations(
     doc = recs.model_dump()
     doc["_id"] = analysis_id
     _in_memory_recommendations[analysis_id] = doc
+
+    if is_mongodb_connected():
+        try:
+            db = get_database()
+            await db["recommendations"].replace_one({"_id": analysis_id}, doc, upsert=True)
+        except Exception as exc:
+            logger.warning("MongoDB write failed for recommendations %s: %s", analysis_id, exc)
+
     try:
-        db = get_database()
-        await db["recommendations"].replace_one({"_id": analysis_id}, doc, upsert=True)
+        await asyncio.to_thread(save_recommendations_sync, analysis_id, doc)
     except Exception as exc:
-        logger.warning("MongoDB unavailable for recommendations %s, cached in-memory: %s", analysis_id, exc)
+        logger.error("SQLite write failed for recommendations %s: %s", analysis_id, exc)
 
 
 async def get_analysis_by_id(analysis_id: str) -> Optional[AnalysisResult]:
-    try:
-        db = get_database()
-        doc = await db["analyses"].find_one({"_id": analysis_id})
-        if doc:
-            doc.pop("_id", None)
-            return AnalysisResult(**doc)
-    except Exception as exc:
-        logger.warning("MongoDB read failed for analysis %s: %s", analysis_id, exc)
-
+    # 1. Check in-memory cache first
     if analysis_id in _in_memory_analyses:
         data = dict(_in_memory_analyses[analysis_id])
         data.pop("_id", None)
         return AnalysisResult(**data)
+
+    # 2. Try MongoDB if active
+    if is_mongodb_connected():
+        try:
+            db = get_database()
+            doc = await db["analyses"].find_one({"_id": analysis_id})
+            if doc:
+                doc.pop("_id", None)
+                _in_memory_analyses[analysis_id] = dict(doc)
+                return AnalysisResult(**doc)
+        except Exception as exc:
+            logger.warning("MongoDB read failed for analysis %s: %s", analysis_id, exc)
+
+    # 3. Try SQLite durable local store
+    try:
+        doc = await asyncio.to_thread(get_analysis_sync, analysis_id)
+        if doc:
+            doc.pop("_id", None)
+            _in_memory_analyses[analysis_id] = dict(doc)
+            return AnalysisResult(**doc)
+    except Exception as exc:
+        logger.warning("SQLite read failed for analysis %s: %s", analysis_id, exc)
+
     return None
 
 
 async def get_traffic_flow_by_id(analysis_id: str) -> Optional[TrafficFlowResult]:
-    """Retrieve traffic flow data from MongoDB with in-memory fallback."""
-    doc = None
-    try:
-        db = get_database()
-        doc = await db["traffic_flow"].find_one({"_id": analysis_id})
-    except Exception as exc:
-        logger.warning("MongoDB read failed for traffic flow %s: %s", analysis_id, exc)
+    """Retrieve traffic flow data from MongoDB, SQLite, or in-memory fallback."""
+    doc = _in_memory_traffic.get(analysis_id)
 
-    if not doc and analysis_id in _in_memory_traffic:
-        doc = _in_memory_traffic[analysis_id]
+    if not doc and is_mongodb_connected():
+        try:
+            db = get_database()
+            doc = await db["traffic_flow"].find_one({"_id": analysis_id})
+        except Exception as exc:
+            logger.warning("MongoDB read failed for traffic flow %s: %s", analysis_id, exc)
+
+    if not doc:
+        try:
+            doc = await asyncio.to_thread(get_traffic_flow_sync, analysis_id)
+        except Exception as exc:
+            logger.warning("SQLite read failed for traffic flow %s: %s", analysis_id, exc)
 
     if not doc:
         return None
@@ -433,18 +492,25 @@ async def get_traffic_flow_by_id(analysis_id: str) -> Optional[TrafficFlowResult
 
 
 async def get_recommendations_by_id(analysis_id: str) -> Optional[RecommendationsResult]:
-    try:
-        db = get_database()
-        doc = await db["recommendations"].find_one({"_id": analysis_id})
-        if doc:
-            doc.pop("_id", None)
-            return RecommendationsResult(**doc)
-    except Exception as exc:
-        logger.warning("MongoDB read failed for recommendations %s: %s", analysis_id, exc)
+    doc = _in_memory_recommendations.get(analysis_id)
 
-    if analysis_id in _in_memory_recommendations:
-        data = dict(_in_memory_recommendations[analysis_id])
-        data.pop("_id", None)
-        return RecommendationsResult(**data)
-    return None
+    if not doc and is_mongodb_connected():
+        try:
+            db = get_database()
+            doc = await db["recommendations"].find_one({"_id": analysis_id})
+        except Exception as exc:
+            logger.warning("MongoDB read failed for recommendations %s: %s", analysis_id, exc)
+
+    if not doc:
+        try:
+            doc = await asyncio.to_thread(get_recommendations_sync, analysis_id)
+        except Exception as exc:
+            logger.warning("SQLite read failed for recommendations %s: %s", analysis_id, exc)
+
+    if not doc:
+        return None
+
+    data = dict(doc)
+    data.pop("_id", None)
+    return RecommendationsResult(**data)
 

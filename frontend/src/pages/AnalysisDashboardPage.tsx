@@ -140,17 +140,37 @@ export default function AnalysisDashboardPage() {
                   <span className="text-[11px] font-semibold uppercase tracking-wider text-[var(--color-secondary)]">
                     Selected Spatial Boundary
                   </span>
-                  <span
-                    className={`px-2 py-0.5 rounded-full font-mono text-[10px] font-bold ${
-                      analysis?.storage_mode === 'mongodb'
-                        ? 'bg-[var(--color-tertiary-fixed)] text-[var(--color-on-tertiary-fixed)]'
-                        : 'bg-[var(--color-primary-fixed)] text-[var(--color-on-primary-fixed)]'
-                    }`}
-                  >
-                    {analysis?.storage_mode === 'mongodb'
-                      ? 'MongoDB Persistent'
-                      : 'Session Cache (In-Memory Fallback)'}
-                  </span>
+                  <div className="relative flex items-center gap-1.5">
+                    <span
+                      title={
+                        analysis?.storage_mode === 'mongodb'
+                          ? 'Durable multi-node database active (MongoDB)'
+                          : analysis?.storage_mode === 'sqlite'
+                          ? 'Durable local database active (SQLite: backend/data/gativa.db - survives server restarts)'
+                          : 'Transient in-memory cache (results reset on server restart)'
+                      }
+                      className={`px-2.5 py-0.5 rounded-full font-mono text-[10px] font-bold flex items-center gap-1 cursor-help border ${
+                        analysis?.storage_mode === 'mongodb'
+                          ? 'bg-emerald-100 text-emerald-900 border-emerald-300 dark:bg-emerald-950/70 dark:text-emerald-200 dark:border-emerald-700'
+                          : analysis?.storage_mode === 'sqlite'
+                          ? 'bg-blue-100 text-blue-900 border-blue-300 dark:bg-blue-950/70 dark:text-blue-200 dark:border-blue-700'
+                          : 'bg-amber-100 text-amber-900 border-amber-300 dark:bg-amber-950/70 dark:text-amber-200 dark:border-amber-700'
+                      }`}
+                    >
+                      <span className={`w-1.5 h-1.5 rounded-full ${
+                        analysis?.storage_mode === 'mongodb'
+                          ? 'bg-emerald-500'
+                          : analysis?.storage_mode === 'sqlite'
+                          ? 'bg-blue-500'
+                          : 'bg-amber-500'
+                      }`} />
+                      {analysis?.storage_mode === 'mongodb'
+                        ? 'MongoDB Persistent'
+                        : analysis?.storage_mode === 'sqlite'
+                        ? 'SQLite Persistent Storage'
+                        : 'Session Cache (In-Memory Fallback)'}
+                    </span>
+                  </div>
                 </div>
                 <div className="flex items-center gap-3 mt-0.5">
                   <h1 className="text-xl font-bold text-[var(--color-on-surface)]">

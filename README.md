@@ -91,17 +91,34 @@ ENVIRONMENT=development
 
 ---
 
-## 🚗 SUMO & TraCI Simulation Engine
+## 🚗 SUMO & TraCI Simulation Subsystem
 
-Gativa integrates **Eclipse SUMO** (Simulation of Urban MObility) and **TraCI** (Traffic Control Interface):
+Gativa provides a microscopic traffic simulation engine powered by **Eclipse SUMO** (Simulation of Urban MObility) and **TraCI** (Traffic Control Interface) with transparent execution modes and honest scenario comparison:
 
-- **Binary Discovery**: Automatically discovers native `sumo.exe` and `netconvert.exe` from `SUMO_HOME` (`C:\Program Files (x86)\SUMO`), PATH, or default directories.
-- **Network Compiler**: `SumoNetworkBuilder` compiles nodes (`.nod.xml`), edges (`.edg.xml`), and trips (`.rou.xml`) into a validated `.net.xml` network preserving spatial coordinates (`--proj.plain-geo`).
-- **TraCI Controller**: Runs headless SUMO over a dedicated ephemeral socket connection, providing step-by-step vehicle kinematics, queue tracking, and signal phase manipulation.
-- **Scenario Comparison**:
-  - **Baseline Strategy**: Fixed-time pre-timed signal cycle (45s NS / 40s EW).
-  - **Optimized Strategy**: Actuated adaptive signal control dynamically prioritizing approaching queue lengths.
-  - Metrics compared: Average Speed ($\uparrow +50.5\%$), Average Waiting Time ($\downarrow -46.7\%$), Average Queue Length ($\downarrow -56.8\%$), and Completed Vehicles ($\uparrow +24.3\%$).
+### 1. Dual Independent Simulation Architecture
+- Rather than synthesizing comparison numbers through scalar multipliers, `SimulationService` coordinates two paired, independent simulation runs built on identical network topology and random seed (`42`):
+  - **Baseline Run**: Pre-timed uncoordinated fixed-time signal control.
+  - **Optimized Run**: Dynamic actuated adaptive signal control responding to real-time detector queue lengths.
+- Stepping advances both sessions simultaneously, gathering empirical telemetry side-by-side.
+
+### 2. Explicit Engine Modes & Transparency
+- **`native_sumo`**: Discovers native `sumo.exe` and `netconvert.exe` from `SUMO_HOME` (`C:\Program Files (x86)\SUMO`), PATH, or default installations. Connects via TraCI on dynamic ephemeral ports with labeled connections (`gativa_<sim_id>`).
+- **`fallback`**: When native SUMO or TraCI is unavailable, executes a deterministic physics and kinematics engine interpolating vehicle trajectories along the actual OSM road segment polylines of the selected corridor. Clearly flagged with a diagnostic badge in the UI explaining the exact fallback reason.
+- **`unavailable`**: Explicit error state when network compilation or runtime fails.
+
+### 3. Spatial Coordinate Systems & Geometry
+- **Network Compiler**: `SumoNetworkBuilder` compiles nodes (`.nod.xml`), edges (`.edg.xml`), and trips (`.rou.xml`) with `netconvert --proj.plain-geo true`, ensuring node and edge coordinates match WGS84 degrees ($x = lon, y = lat$).
+- **Coordinate Transformation**: TraCI `convertGeo(x, y, fromGeo=False)` converts internal coordinates back to WGS84, strictly validated ($[-90, 90]$ latitude, $[-180, 180]$ longitude, non-NaN).
+- **Corridor Mapping**: In fallback kinematics, vehicles are placed along the real polyline vertices of the selected corridor, eliminating hardcoded geographic offsets.
+
+### 4. Honest Scenario Comparison Methodology
+- **Zero Synthetic Multipliers**: Eliminates artificial scaling factors. All variances represent empirical differences calculated directly from runtime metric samples:
+  $$\Delta \% = \frac{\text{Optimized} - \text{Baseline}}{\text{Baseline}} \times 100$$
+- **Comparison States**:
+  - `pending`: Both scenarios have not stepped yet (0 elapsed seconds). Displays pending indicators instead of fabricated constants.
+  - `insufficient_data`: Triggered when metric samples are insufficient.
+  - `completed`: Computed after simulation execution, reporting honest improvements and regressions alike (no inverted or suppressed negative results).
+  - Division by zero is protected, ensuring no `NaN` or `Infinity` values.
 
 ---
 

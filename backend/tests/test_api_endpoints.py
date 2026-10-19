@@ -176,7 +176,7 @@ async def test_full_analysis_lifecycle_and_geojson_export(monkeypatch):
         analysis_id = data["analysis_id"]
         assert analysis_id is not None
         assert data["status"] == "completed"
-        assert data["storage_mode"] in ("mongodb", "in_memory")
+        assert data["storage_mode"] in ("mongodb", "sqlite", "in_memory")
         assert data["road_network"]["total_segments"] == 2
         assert len(data["segments"]) == 2
         assert len(data["bottlenecks"]) >= 1

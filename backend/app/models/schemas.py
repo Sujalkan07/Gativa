@@ -85,6 +85,8 @@ class RoadSegment(BaseModel):
     speed_limit_kmh: Optional[float] = None
     lanes: Optional[int] = None
     is_oneway: bool = False
+    osm_highway: Optional[str] = None
+    osm_id: Optional[str] = None
     traffic: Optional[TrafficObservation] = None
 
 
@@ -248,6 +250,8 @@ SimulationState = Literal[
     "preparing", "ready", "running", "paused", "completed", "failed", "cancelled"
 ]
 SignalStrategy = Literal["fixed_time", "actuated_adaptive"]
+SimulationEngineMode = Literal["native_sumo", "fallback", "unavailable"]
+ComparisonStatus = Literal["pending", "insufficient_data", "completed", "failed"]
 
 
 class SimulationPrepareRequest(BaseModel):
@@ -265,6 +269,16 @@ class VehiclePosition(BaseModel):
     angle: float
     type: str = "passenger"
     waiting_time_s: float = 0.0
+
+
+class TrafficLightState(BaseModel):
+    id: str
+    lat: float
+    lng: float
+    state: str = "GGrr"
+    is_green: bool = True
+    controlled_lanes: list[str] = []
+    controlled_junctions: list[str] = []
 
 
 class SimulationMetrics(BaseModel):
@@ -285,6 +299,8 @@ class SimulationStatusResponse(BaseModel):
     sim_id: str
     analysis_id: str
     state: SimulationState
+    engine_mode: SimulationEngineMode = "unavailable"
+    engine_message: Optional[str] = None
     duration_seconds: int
     demand_rate_veh_hr: int
     strategy: SignalStrategy
@@ -295,6 +311,7 @@ class SimulationStatusResponse(BaseModel):
     elapsed_seconds: float = 0.0
     current_metrics: SimulationMetrics = Field(default_factory=SimulationMetrics)
     vehicles: list[VehiclePosition] = []
+    traffic_lights: list[TrafficLightState] = []
     error_message: Optional[str] = None
 
 
@@ -310,6 +327,8 @@ class ScenarioComparisonResult(BaseModel):
     sim_id: str
     analysis_id: str
     duration_seconds: int
+    engine_mode: SimulationEngineMode = "unavailable"
+    comparison_status: ComparisonStatus = "pending"
     baseline_strategy: str = "Baseline (Fixed-Time Signal Control)"
     optimized_strategy: str = "Optimized (Actuated Adaptive Signal Control)"
     baseline_metrics: SimulationMetrics

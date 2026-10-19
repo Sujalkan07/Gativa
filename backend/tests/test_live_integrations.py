@@ -54,14 +54,18 @@ async def test_live_osmnx_network():
         (77.215, 28.630),
     ])
 
+    import asyncio
     ox.settings.log_console = False
     ox.settings.use_cache = True
-    ox.settings.timeout = 10
+    ox.settings.timeout = 5
     if hasattr(ox.settings, "requests_timeout"):
-        ox.settings.requests_timeout = 10
+        ox.settings.requests_timeout = 5
 
     try:
-        G = ox.graph_from_polygon(poly, network_type="drive", simplify=True)
+        G = await asyncio.wait_for(
+            asyncio.to_thread(ox.graph_from_polygon, poly, network_type="drive", simplify=True),
+            timeout=8.0,
+        )
         assert G is not None
         assert G.number_of_nodes() > 0
     except Exception as exc:

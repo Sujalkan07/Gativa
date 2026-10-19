@@ -69,25 +69,29 @@ async def get_recommendations(analysis_id: str):
 
 @router.get("/{analysis_id}/export/geojson")
 async def export_geojson(analysis_id: str):
-    """Export analysis road segments, bottlenecks, and polygon as a GeoJSON FeatureCollection."""
+    """Export analysis road segments, bottlenecks, and polygon as a standardized GeoJSON FeatureCollection."""
     analysis = await get_analysis_by_id(analysis_id)
     if not analysis:
         raise HTTPException(status_code=404, detail="Analysis not found")
 
     features = []
 
-    # 1. Selected area polygon
+    # 1. Selected area polygon boundary
     features.append({
         "type": "Feature",
         "geometry": analysis.polygon.model_dump(),
         "properties": {
             "feature_type": "boundary",
             "analysis_id": analysis.analysis_id,
-            "area_km2": analysis.area_km2,
+            "area_km2": round(analysis.area_km2, 4),
+            "area_unit": "km²",
+            "datum": "WGS84 (EPSG:4326)",
+            "area_name": analysis.area_name or "Selected Corridor",
+            "created_at": analysis.created_at,
         },
     })
 
-    # 2. Road segments
+    # 2. Road segments with genuine OSM tags and units
     for seg in analysis.segments:
         if seg.geometry:
             features.append({
@@ -98,13 +102,21 @@ async def export_geojson(analysis_id: str):
                     "segment_id": seg.segment_id,
                     "name": seg.name,
                     "road_type": seg.road_type,
+                    "osm_highway": seg.osm_highway or seg.road_type,
+                    "osm_id": seg.osm_id,
                     "length_m": seg.length_m,
+                    "length_unit": "meters",
+                    "speed_limit_kmh": seg.speed_limit_kmh,
+                    "speed_unit": "km/h",
+                    "lanes": seg.lanes,
+                    "is_oneway": seg.is_oneway,
                     "observed_speed_kmh": seg.traffic.observed_speed_kmh if seg.traffic else None,
+                    "free_flow_speed_kmh": seg.traffic.free_flow_speed_kmh if seg.traffic else None,
                     "congestion_level": seg.traffic.congestion_level if seg.traffic else "unknown",
                 },
             })
 
-    # 3. Bottleneck candidates
+    # 3. Structural & observed bottleneck candidates
     for b in analysis.bottlenecks:
         features.append({
             "type": "Feature",
@@ -120,11 +132,24 @@ async def export_geojson(analysis_id: str):
                 "severity": b.severity,
                 "centrality_score": b.centrality_score,
                 "speed_reduction": b.speed_reduction,
+                "evidence": "; ".join(b.evidence),
             },
         })
 
     collection = {
         "type": "FeatureCollection",
+        "metadata": {
+            "system": "Gativa Smart Traffic Analysis Engine",
+            "analysis_id": analysis.analysis_id,
+            "area_name": analysis.area_name,
+            "created_at": analysis.created_at,
+            "completed_at": analysis.completed_at,
+            "storage_mode": analysis.storage_mode,
+            "geodesic_datum": "WGS84 Ellipsoid (pyproj)",
+            "data_sources": [ds.model_dump() for ds in analysis.data_sources],
+            "total_segments": len(analysis.segments),
+            "total_bottlenecks": len(analysis.bottlenecks),
+        },
         "features": features,
     }
 

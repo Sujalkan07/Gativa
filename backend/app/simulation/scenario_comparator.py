@@ -1,44 +1,63 @@
 """
 Scenario Comparator: Evaluates Baseline (Fixed-Time) vs Optimized (Adaptive Actuated) strategies.
-Calculates absolute and percentage variance across core metrics.
+Calculates honest absolute and percentage variance across core metrics with zero synthetic multipliers.
 """
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Optional
 
-from app.models.schemas import ScenarioComparisonResult, ScenarioMetricRow, SimulationMetrics
+from app.models.schemas import (
+    ComparisonStatus,
+    ScenarioComparisonResult,
+    ScenarioMetricRow,
+    SimulationEngineMode,
+    SimulationMetrics,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class ScenarioComparator:
-    """Executes or compiles comparison between Baseline and Optimized signal control."""
+    """Executes or compiles honest comparison between Baseline and Optimized signal control."""
 
     @staticmethod
     def compare(
         sim_id: str,
         analysis_id: str,
         duration_seconds: int = 600,
-        baseline_metrics: SimulationMetrics | None = None,
-        optimized_metrics: SimulationMetrics | None = None,
+        engine_mode: SimulationEngineMode = "unavailable",
+        baseline_metrics: Optional[SimulationMetrics] = None,
+        optimized_metrics: Optional[SimulationMetrics] = None,
+        baseline_strategy: str = "Baseline (Fixed-Time Signal Control)",
+        optimized_strategy: str = "Optimized (Actuated Adaptive Signal Control)",
+        step_count: int = 0,
     ) -> ScenarioComparisonResult:
         """
-        Produce side-by-side scenario comparison table with exact variance.
+        Produce side-by-side scenario comparison table with genuine empirical variance.
+        Never synthesizes numbers or applies artificial scaling multipliers.
         """
-        # If simulation has not stepped yet, return explicit pending state without hardcoded constants
-        if (baseline_metrics is None or baseline_metrics.avg_speed_kmh <= 0.0) and (
-            optimized_metrics is None or optimized_metrics.avg_speed_kmh <= 0.0
-        ):
-            empty_metrics = SimulationMetrics(
-                avg_speed_kmh=0.0,
-                avg_waiting_time_s=0.0,
-                avg_queue_length_m=0.0,
-                completed_vehicles=0,
-                active_vehicles=0,
-                elapsed_seconds=0.0,
-                total_duration_seconds=float(duration_seconds),
-            )
+        empty_metrics = SimulationMetrics(
+            avg_speed_kmh=0.0,
+            avg_waiting_time_s=0.0,
+            avg_queue_length_m=0.0,
+            completed_vehicles=0,
+            active_vehicles=0,
+            elapsed_seconds=0.0,
+            total_duration_seconds=float(duration_seconds),
+        )
+
+        has_baseline = (
+            baseline_metrics is not None
+            and (baseline_metrics.elapsed_seconds > 0.0 or baseline_metrics.avg_speed_kmh > 0.0 or baseline_metrics.completed_vehicles > 0)
+        )
+        has_optimized = (
+            optimized_metrics is not None
+            and (optimized_metrics.elapsed_seconds > 0.0 or optimized_metrics.avg_speed_kmh > 0.0 or optimized_metrics.completed_vehicles > 0)
+        )
+
+        # 1. Check for Pending state (simulation has not stepped yet)
+        if not has_baseline and not has_optimized and step_count == 0:
             rows = [
                 ScenarioMetricRow(
                     metric="Average Speed",
@@ -73,53 +92,93 @@ class ScenarioComparator:
                 sim_id=sim_id,
                 analysis_id=analysis_id,
                 duration_seconds=duration_seconds,
+                engine_mode=engine_mode,
+                comparison_status="pending",
+                baseline_strategy=baseline_strategy,
+                optimized_strategy=optimized_strategy,
                 baseline_metrics=empty_metrics,
                 optimized_metrics=empty_metrics,
                 rows=rows,
-                methodology_notes="Awaiting simulation playback to calculate empirical scenario variance between fixed-time and actuated control.",
+                methodology_notes=f"Comparison pending simulation execution ({engine_mode} engine, seed 42, 0 steps). Advance simulation to collect empirical metrics.",
             )
 
-        if optimized_metrics is None:
-            optimized_metrics = SimulationMetrics(
-                avg_speed_kmh=25.0,
-                avg_waiting_time_s=30.0,
-                avg_queue_length_m=40.0,
-                completed_vehicles=50,
-                active_vehicles=10,
-                elapsed_seconds=float(duration_seconds),
-                total_duration_seconds=float(duration_seconds),
+        # 2. Check for Insufficient Data state
+        if baseline_metrics is None or optimized_metrics is None:
+            rows = [
+                ScenarioMetricRow(
+                    metric="Average Speed",
+                    baseline=f"{baseline_metrics.avg_speed_kmh:.1f} km/h" if baseline_metrics else "—",
+                    optimized=f"{optimized_metrics.avg_speed_kmh:.1f} km/h" if optimized_metrics else "—",
+                    variance="Insufficient data",
+                    is_improvement=False,
+                ),
+                ScenarioMetricRow(
+                    metric="Average Waiting Time",
+                    baseline=f"{baseline_metrics.avg_waiting_time_s:.1f} s" if baseline_metrics else "—",
+                    optimized=f"{optimized_metrics.avg_waiting_time_s:.1f} s" if optimized_metrics else "—",
+                    variance="Insufficient data",
+                    is_improvement=False,
+                ),
+                ScenarioMetricRow(
+                    metric="Average Queue Length",
+                    baseline=f"{baseline_metrics.avg_queue_length_m:.1f} m" if baseline_metrics else "—",
+                    optimized=f"{optimized_metrics.avg_queue_length_m:.1f} m" if optimized_metrics else "—",
+                    variance="Insufficient data",
+                    is_improvement=False,
+                ),
+                ScenarioMetricRow(
+                    metric="Completed Vehicles",
+                    baseline=f"{baseline_metrics.completed_vehicles} vehs" if baseline_metrics else "—",
+                    optimized=f"{optimized_metrics.completed_vehicles} vehs" if optimized_metrics else "—",
+                    variance="Insufficient data",
+                    is_improvement=False,
+                ),
+            ]
+            return ScenarioComparisonResult(
+                sim_id=sim_id,
+                analysis_id=analysis_id,
+                duration_seconds=duration_seconds,
+                engine_mode=engine_mode,
+                comparison_status="insufficient_data",
+                baseline_strategy=baseline_strategy,
+                optimized_strategy=optimized_strategy,
+                baseline_metrics=baseline_metrics or empty_metrics,
+                optimized_metrics=optimized_metrics or empty_metrics,
+                rows=rows,
+                methodology_notes=f"Insufficient simulation data collected under {engine_mode} engine to perform dual scenario evaluation.",
             )
 
-        if baseline_metrics is None or baseline_metrics.avg_speed_kmh <= 0.0:
-            # Empirical uncoordinated fixed-time baseline relative to simulated network performance
-            baseline_metrics = SimulationMetrics(
-                avg_speed_kmh=max(5.0, round(optimized_metrics.avg_speed_kmh * 0.68, 1)),
-                avg_waiting_time_s=round(optimized_metrics.avg_waiting_time_s * 1.85, 1),
-                avg_queue_length_m=round(optimized_metrics.avg_queue_length_m * 2.10, 1),
-                completed_vehicles=max(0, int(optimized_metrics.completed_vehicles * 0.82)),
-                active_vehicles=int(optimized_metrics.active_vehicles * 1.4),
-                elapsed_seconds=optimized_metrics.elapsed_seconds,
-                total_duration_seconds=float(duration_seconds),
-            )
-
+        # 3. Calculate genuine empirical variances
         # 1. Average Speed (Higher is better)
         speed_diff = optimized_metrics.avg_speed_kmh - baseline_metrics.avg_speed_kmh
-        speed_pct = (speed_diff / baseline_metrics.avg_speed_kmh) * 100.0 if baseline_metrics.avg_speed_kmh else 0.0
+        if baseline_metrics.avg_speed_kmh > 0:
+            speed_pct = (speed_diff / baseline_metrics.avg_speed_kmh) * 100.0
+        else:
+            speed_pct = 0.0
         optimized_metrics.variance_speed_pct = round(speed_pct, 1)
 
         # 2. Average Waiting Time (Lower is better)
         wait_diff = optimized_metrics.avg_waiting_time_s - baseline_metrics.avg_waiting_time_s
-        wait_pct = (wait_diff / baseline_metrics.avg_waiting_time_s) * 100.0 if baseline_metrics.avg_waiting_time_s else 0.0
+        if baseline_metrics.avg_waiting_time_s > 0:
+            wait_pct = (wait_diff / baseline_metrics.avg_waiting_time_s) * 100.0
+        else:
+            wait_pct = 0.0
         optimized_metrics.variance_waiting_pct = round(wait_pct, 1)
 
         # 3. Average Queue Length (Lower is better)
         queue_diff = optimized_metrics.avg_queue_length_m - baseline_metrics.avg_queue_length_m
-        queue_pct = (queue_diff / baseline_metrics.avg_queue_length_m) * 100.0 if baseline_metrics.avg_queue_length_m else 0.0
+        if baseline_metrics.avg_queue_length_m > 0:
+            queue_pct = (queue_diff / baseline_metrics.avg_queue_length_m) * 100.0
+        else:
+            queue_pct = 0.0
         optimized_metrics.variance_queue_pct = round(queue_pct, 1)
 
         # 4. Completed Vehicles (Higher is better)
         veh_diff = optimized_metrics.completed_vehicles - baseline_metrics.completed_vehicles
-        veh_pct = (veh_diff / baseline_metrics.completed_vehicles) * 100.0 if baseline_metrics.completed_vehicles else 0.0
+        if baseline_metrics.completed_vehicles > 0:
+            veh_pct = (veh_diff / baseline_metrics.completed_vehicles) * 100.0
+        else:
+            veh_pct = 0.0
         optimized_metrics.variance_completed_pct = round(veh_pct, 1)
 
         rows = [
@@ -153,14 +212,22 @@ class ScenarioComparator:
             ),
         ]
 
+        notes = (
+            f"Empirical evaluation under {engine_mode} engine over {optimized_metrics.elapsed_seconds:.1f}s elapsed "
+            f"(seed 42, {step_count} simulation steps). "
+            f"Baseline: Fixed-Time vs Optimized: Actuated Adaptive."
+        )
+
         return ScenarioComparisonResult(
             sim_id=sim_id,
             analysis_id=analysis_id,
             duration_seconds=duration_seconds,
-            baseline_strategy="Baseline (Fixed-Time Signal Control)",
-            optimized_strategy="Optimized (Actuated Adaptive Signal Control)",
+            engine_mode=engine_mode,
+            comparison_status="completed",
+            baseline_strategy=baseline_strategy,
+            optimized_strategy=optimized_strategy,
             baseline_metrics=baseline_metrics,
             optimized_metrics=optimized_metrics,
             rows=rows,
-            methodology_notes=f"Simulation results evaluated over {duration_seconds}s interval using HCM 6th Ed. calibrated demand.",
+            methodology_notes=notes,
         )

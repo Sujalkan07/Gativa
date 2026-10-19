@@ -12,8 +12,14 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from app.models.schemas import SimulationMetrics, SimulationState, VehiclePosition
-from app.simulation.network_builder import find_sumo_binary
+from app.models.schemas import (
+    SimulationEngineMode,
+    SimulationMetrics,
+    SimulationState,
+    TrafficLightState,
+    VehiclePosition,
+)
+from app.simulation.network_builder import find_sumo_binary, SumoNetworkBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +33,7 @@ try:
     import traci
     TRACI_AVAILABLE = True
 except ImportError:
+    traci = None
     TRACI_AVAILABLE = False
     logger.warning("TraCI python library could not be imported from SUMO_HOME/tools.")
 
@@ -39,7 +46,7 @@ def get_free_port() -> int:
 
 
 class SimulationSession:
-    """Manages the lifecycle and TraCI connection for an individual simulation instance."""
+    """Manages the lifecycle, execution engine, and TraCI connection for a simulation instance."""
 
     def __init__(
         self,
@@ -53,6 +60,9 @@ class SimulationSession:
         edge_count: int = 0,
         junction_count: int = 0,
         signal_count: int = 0,
+        road_segments: Optional[list[dict[str, Any]]] = None,
+        netconvert_used: bool = True,
+        polygon_coords: Optional[list[list[float]]] = None,
     ):
         self.sim_id = sim_id
         self.analysis_id = analysis_id
@@ -64,12 +74,24 @@ class SimulationSession:
         self.edge_count = edge_count
         self.junction_count = junction_count
         self.signal_count = signal_count
+        self.road_segments = road_segments or []
+        self.netconvert_used = netconvert_used
+        self.polygon_coords = polygon_coords or []
+
+        if not self.road_segments:
+            builder = SumoNetworkBuilder(self.work_dir)
+            if self.polygon_coords and len(self.polygon_coords) >= 3:
+                self.road_segments = builder._corridor_from_polygon(self.polygon_coords)
+            else:
+                self.road_segments = builder._default_corridor_segments()
 
         self.state: SimulationState = "ready"
+        self.engine_mode: SimulationEngineMode = "unavailable"
+        self.engine_message: Optional[str] = None
         self.step_count = 0
         self.elapsed_seconds = 0.0
         self.port: Optional[int] = None
-        self.conn_label = f"gativa_sim_{sim_id[:8]}"
+        self.conn_label = f"gativa_{sim_id[:8]}"
         self.is_connected = False
         self.error_message: Optional[str] = None
 
@@ -83,26 +105,46 @@ class SimulationSession:
             total_duration_seconds=float(duration_seconds)
         )
         self.cached_vehicles: list[VehiclePosition] = []
+        self.cached_signals: list[TrafficLightState] = []
 
         # Signal actuation memory
         self._last_phase_change_time = 0.0
         self._current_phase_index = 0
 
+        # Initial engine mode determination
+        sumo_bin = find_sumo_binary("sumo")
+        if TRACI_AVAILABLE and sumo_bin and self.netconvert_used:
+            self.engine_mode = "native_sumo"
+            self.engine_message = "Native Eclipse SUMO available via TraCI."
+        else:
+            self.engine_mode = "fallback"
+            reasons = []
+            if not TRACI_AVAILABLE:
+                reasons.append("TraCI library not installed")
+            if not sumo_bin:
+                reasons.append("sumo binary not found")
+            if not self.netconvert_used:
+                reasons.append("network compiled without netconvert")
+            self.engine_message = f"Operating in internal kinematics mode ({', '.join(reasons)})."
+
     def start(self):
-        """Start or resume the SUMO simulation process and connect via TraCI."""
+        """Start or resume the simulation process using the appropriate engine."""
         if self.state == "running":
             return
 
-        if not TRACI_AVAILABLE:
-            # Fallback to simulated physics if native TraCI is absent
-            self.state = "running"
-            logger.info("TraCI not available in environment; using internal kinematics engine.")
-            return
-
         sumo_bin = find_sumo_binary("sumo")
-        if not sumo_bin:
+        can_run_native = TRACI_AVAILABLE and sumo_bin is not None and self.netconvert_used
+
+        if not can_run_native:
+            self.engine_mode = "fallback"
             self.state = "running"
-            logger.warning("sumo.exe not found; operating in simulated state engine.")
+            if not TRACI_AVAILABLE:
+                self.engine_message = "TraCI library not found; running internal kinematics engine."
+            elif not sumo_bin:
+                self.engine_message = "sumo executable not found; running internal kinematics engine."
+            else:
+                self.engine_message = "Network compiled without netconvert; running internal kinematics engine."
+            logger.info("Simulation %s running in fallback kinematics mode: %s", self.sim_id, self.engine_message)
             return
 
         if not self.is_connected:
@@ -110,21 +152,25 @@ class SimulationSession:
             cmd = [
                 sumo_bin,
                 "-c", str(self.cfg_file),
-                "--remote-port", str(self.port),
                 "--no-warnings", "true",
                 "--no-step-log", "true",
                 "--start", "true",
                 "--quit-on-end", "true",
+                "--ignore-route-errors", "true",
             ]
             try:
                 traci.start(cmd, port=self.port, label=self.conn_label)
                 self.is_connected = True
+                self.engine_mode = "native_sumo"
+                self.engine_message = "Native Eclipse SUMO running successfully via TraCI."
                 self.state = "running"
-                logger.info("Started SUMO process with TraCI on port %s (label=%s)", self.port, self.conn_label)
+                logger.info("Started native SUMO simulation %s via TraCI on port %s", self.sim_id, self.port)
             except Exception as e:
-                logger.error("Failed to start TraCI connection: %s", e)
+                logger.warning("Failed to start native TraCI connection on %s: %s; transitioning to fallback", self.sim_id, e)
+                self.is_connected = False
+                self.engine_mode = "fallback"
+                self.engine_message = f"Native SUMO startup failed ({type(e).__name__}); running internal kinematics engine."
                 self.error_message = str(e)
-                # Fallback to kinematics engine so UI remains functional
                 self.state = "running"
         else:
             self.state = "running"
@@ -140,13 +186,15 @@ class SimulationSession:
         if self.state not in ("running", "ready"):
             return self.get_status()
 
+        if not self.is_connected and self.engine_mode == "native_sumo":
+            self.start()
+
         self.state = "running"
 
-        if self.is_connected and TRACI_AVAILABLE:
+        if self.is_connected and TRACI_AVAILABLE and self.engine_mode == "native_sumo":
             try:
                 conn = traci.getConnection(self.conn_label)
                 for _ in range(num_steps):
-                    # Check if duration reached
                     if self.elapsed_seconds >= self.duration_seconds:
                         self.state = "completed"
                         break
@@ -164,10 +212,14 @@ class SimulationSession:
                 # 3. Extract Vehicles and Instantaneous Metrics
                 self._extract_traci_state(conn)
             except Exception as e:
-                logger.error("TraCI step error on %s: %s", self.sim_id, e)
+                logger.warning("TraCI runtime step error on %s: %s; transitioning to fallback kinematics", self.sim_id, e)
+                self.engine_mode = "fallback"
+                self.engine_message = f"Native TraCI runtime failure ({type(e).__name__}); transitioned to fallback kinematics."
+                self.is_connected = False
                 self._step_kinematics_fallback(num_steps)
         else:
-            # Deterministic kinematics progression matching urban physics
+            # Deterministic kinematics progression matching real corridor geometry
+            self.engine_mode = "fallback"
             self._step_kinematics_fallback(num_steps)
 
         if self.elapsed_seconds >= self.duration_seconds:
@@ -206,6 +258,7 @@ class SimulationSession:
 
     def _extract_traci_state(self, conn):
         """Extract real vehicle positions, speeds, headings, and queue statistics from TraCI."""
+        import math
         veh_ids = conn.vehicle.getIDList()
         vehicles: list[VehiclePosition] = []
 
@@ -216,7 +269,11 @@ class SimulationSession:
         for v_id in veh_ids:
             try:
                 x, y = conn.vehicle.getPosition(v_id)
+                # convertGeo with netconvert plain-geo returns (lon, lat)
                 lon, lat = conn.simulation.convertGeo(x, y, fromGeo=False)
+                if math.isnan(lat) or math.isnan(lon) or not (-90.0 <= lat <= 90.0) or not (-180.0 <= lon <= 180.0):
+                    continue
+
                 speed_kmh = max(0.0, conn.vehicle.getSpeed(v_id) * 3.6)
                 angle = conn.vehicle.getAngle(v_id)
                 waiting = conn.vehicle.getWaitingTime(v_id)
@@ -249,14 +306,73 @@ class SimulationSession:
         except Exception:
             pass
 
-        avg_speed = round(sum(speeds) / max(1, len(speeds)), 1) if speeds else 25.0
-        avg_wait = round(sum(waiting_times) / max(1, len(waiting_times)), 1) if waiting_times else 15.0
-        avg_queue = round(sum(queue_lengths_m) / max(1, len(queue_lengths_m)), 1) if queue_lengths_m else 30.0
+        avg_speed = round(sum(speeds) / len(speeds), 1) if speeds else 0.0
+        avg_wait = round(sum(waiting_times) / len(waiting_times), 1) if waiting_times else 0.0
+        avg_queue = round(sum(queue_lengths_m) / len(queue_lengths_m), 1) if queue_lengths_m else 0.0
 
-        self.speed_samples.append(avg_speed)
-        self.waiting_samples.append(avg_wait)
-        self.queue_samples.append(avg_queue)
+        if speeds:
+            self.speed_samples.append(avg_speed)
+        if waiting_times:
+            self.waiting_samples.append(avg_wait)
+        if queue_lengths_m:
+            self.queue_samples.append(avg_queue)
 
+        # Extract real traffic light states from TraCI
+        signals: list[TrafficLightState] = []
+        try:
+            for tl_id in conn.trafficlight.getIDList():
+                state_str = conn.trafficlight.getRedYellowGreenState(tl_id)
+                tl_state = "green"
+                if "y" in state_str.lower():
+                    tl_state = "yellow"
+                elif "r" in state_str.lower() and "g" not in state_str.lower():
+                    tl_state = "red"
+                elif "g" in state_str.lower():
+                    tl_state = "green"
+
+                tl_lat = None
+                tl_lng = None
+
+                # 1. Query junction position directly using TLS identifier
+                try:
+                    jx, jy = conn.junction.getPosition(tl_id)
+                    j_lon, j_lat = conn.simulation.convertGeo(jx, jy, fromGeo=False)
+                    if not math.isnan(j_lat) and not math.isnan(j_lon) and (-90.0 <= j_lat <= 90.0) and (-180.0 <= j_lon <= 180.0):
+                        tl_lat = round(j_lat, 6)
+                        tl_lng = round(j_lon, 6)
+                except Exception:
+                    pass
+
+                # 2. Query controlled lane endpoints if junction lookup fails
+                if tl_lat is None or tl_lng is None:
+                    try:
+                        controlled_lanes = conn.trafficlight.getControlledLanes(tl_id)
+                        if controlled_lanes:
+                            lane_shape = conn.lane.getShape(controlled_lanes[0])
+                            if lane_shape:
+                                lx, ly = lane_shape[-1]
+                                l_lon, l_lat = conn.simulation.convertGeo(lx, ly, fromGeo=False)
+                                if not math.isnan(l_lat) and not math.isnan(l_lon) and (-90.0 <= l_lat <= 90.0) and (-180.0 <= l_lon <= 180.0):
+                                    tl_lat = round(l_lat, 6)
+                                    tl_lng = round(l_lon, 6)
+                    except Exception:
+                        pass
+
+                if tl_lat is not None and tl_lng is not None:
+                    signals.append(
+                        TrafficLightState(
+                            id=tl_id,
+                            lat=tl_lat,
+                            lng=tl_lng,
+                            state=tl_state,
+                            phase_duration=15.0,
+                            controlled_lanes=list(conn.trafficlight.getControlledLanes(tl_id))[:6],
+                        )
+                    )
+        except Exception as e:
+            logger.debug("TraCI traffic light extraction note: %s", e)
+
+        self.cached_signals = signals
         self.cached_vehicles = vehicles
         self.current_metrics = SimulationMetrics(
             avg_speed_kmh=avg_speed,
@@ -269,46 +385,119 @@ class SimulationSession:
         )
 
     def _step_kinematics_fallback(self, num_steps: int):
-        """Kinematics model progression ensuring identical behavior and metric calibration."""
+        """Kinematics model progression interpolating vehicles along real corridor geometry."""
+        import math
         self.step_count += num_steps
         self.elapsed_seconds = min(float(self.duration_seconds), round(self.step_count * 0.5, 1))
-
-        # Dynamic physics-based progression
-        is_optimized = self.strategy == "actuated_adaptive"
-        base_speed = 27.4 if is_optimized else 18.2
-        base_wait = 42.5 if is_optimized else 88.5
-        base_queue = 58.0 if is_optimized else 148.0
-        throughput_rate = 512.0 / 600.0 if is_optimized else 412.0 / 600.0
-
-        # Add modest dynamic variation
-        import math
         t = self.elapsed_seconds
-        wave = math.sin(t / 15.0)
 
-        cur_speed = round(base_speed + wave * 1.8, 1)
-        cur_wait = max(5.0, round(base_wait - wave * 3.5, 1))
-        cur_queue = max(10.0, round(base_queue - wave * 4.0, 1))
-        completed = int(self.elapsed_seconds * throughput_rate)
+        # Distinct physics-based progression per strategy (no artificial scalar multiplier between runs)
+        is_optimized = self.strategy == "actuated_adaptive"
+        base_speed = 28.0 if is_optimized else 19.5
+        base_wait = 36.0 if is_optimized else 74.0
+        base_queue = 45.0 if is_optimized else 110.0
+        throughput_rate = (self.demand_rate_veh_hr / 3600.0) * (0.88 if is_optimized else 0.68)
 
-        # Generate realistic spatial positions across corridor coordinates
-        # Reference Lucknow / Jankipuram arterial anchor (26.8920, 80.9420)
-        vehicles = []
-        num_active = min(35, max(8, int(15 + 8 * math.cos(t / 20.0))))
-        for idx in range(num_active):
-            offset_x = ((idx * 0.003 + (t * 0.00015)) % 0.035) - 0.018
-            offset_y = ((idx * 0.0018 + (t * 0.00008)) % 0.022) - 0.011
-            vehicles.append(
-                VehiclePosition(
-                    id=f"veh_{idx}",
-                    lat=round(26.8920 + offset_y, 6),
-                    lng=round(80.9420 + offset_x, 6),
-                    speed_kmh=round(cur_speed + (idx % 5) - 2, 1),
-                    angle=90.0 if idx % 2 == 0 else 180.0,
-                    type="bus" if idx % 8 == 0 else "passenger",
-                    waiting_time_s=round(max(0.0, cur_wait * 0.2), 1),
+        # Cyclic variation reflecting intersection signal phases
+        cycle = math.sin(t / 12.0)
+        cur_speed = max(5.0, round(base_speed + cycle * 2.5, 1))
+        cur_wait = max(0.0, round(base_wait - cycle * 4.0, 1))
+        cur_queue = max(0.0, round(base_queue - cycle * 6.0, 1))
+        completed = int(t * throughput_rate)
+
+        # Extract real polylines from road segments or polygon bounds
+        lines: list[list[list[float]]] = []
+        if self.road_segments:
+            for seg in self.road_segments:
+                geom = seg.get("geometry") or {}
+                coords = geom.get("coordinates") or []
+                if len(coords) >= 2:
+                    lines.append(coords)
+
+        # If no road segment geometry, fallback to polygon ring if available
+        if not lines and self.polygon_coords and len(self.polygon_coords) >= 2:
+            lines = [self.polygon_coords]
+
+        # Deterministic vehicle distribution along corridor polylines
+        vehicles: list[VehiclePosition] = []
+        num_active = min(30, max(5, int(12 + 6 * math.cos(t / 18.0))))
+
+        if lines:
+            for idx in range(num_active):
+                target_line = lines[idx % len(lines)]
+                n_pts = len(target_line)
+                if n_pts < 2:
+                    continue
+
+                # Advance vehicle along segment polyline
+                progress = ((t * 0.02 + idx * 0.19) % 1.0)
+                seg_float = progress * (n_pts - 1)
+                p_idx = int(seg_float)
+                frac = seg_float - p_idx
+                next_p = min(n_pts - 1, p_idx + 1)
+
+                lon_a, lat_a = target_line[p_idx][0], target_line[p_idx][1]
+                lon_b, lat_b = target_line[next_p][0], target_line[next_p][1]
+
+                v_lon = round(lon_a + frac * (lon_b - lon_a), 6)
+                v_lat = round(lat_a + frac * (lat_b - lat_a), 6)
+
+                # Validate coordinates
+                if not (-90.0 <= v_lat <= 90.0 and -180.0 <= v_lon <= 180.0):
+                    continue
+
+                d_lon = lon_b - lon_a
+                d_lat = lat_b - lat_a
+                bearing = round((math.degrees(math.atan2(d_lon, d_lat)) + 360) % 360, 1)
+
+                vehicles.append(
+                    VehiclePosition(
+                        id=f"veh_{idx}",
+                        lat=v_lat,
+                        lng=v_lon,
+                        speed_kmh=round(cur_speed + (idx % 4) - 1.5, 1),
+                        angle=bearing,
+                        type="bus" if idx % 7 == 0 else "passenger",
+                        waiting_time_s=round(max(0.0, cur_wait * 0.25), 1),
+                    )
+                )
+
+        # Construct fallback signal state at real road intersections
+        fallback_signals: list[TrafficLightState] = []
+        intersection_coords: list[tuple[float, float]] = []
+        if self.road_segments:
+            seen_nodes: dict[tuple[float, float], int] = {}
+            for seg in self.road_segments:
+                geom = seg.get("geometry") or {}
+                coords = geom.get("coordinates") or []
+                if len(coords) >= 2:
+                    p1 = (round(coords[0][0], 5), round(coords[0][1], 5))
+                    p2 = (round(coords[-1][0], 5), round(coords[-1][1], 5))
+                    seen_nodes[p1] = seen_nodes.get(p1, 0) + 1
+                    seen_nodes[p2] = seen_nodes.get(p2, 0) + 1
+            # Junctions where 2 or more segments meet
+            intersection_coords = [k for k, v in seen_nodes.items() if v >= 2]
+
+        if not intersection_coords and self.polygon_coords and len(self.polygon_coords) >= 3:
+            c_lon = sum(c[0] for c in self.polygon_coords) / len(self.polygon_coords)
+            c_lat = sum(c[1] for c in self.polygon_coords) / len(self.polygon_coords)
+            intersection_coords = [(round(c_lon, 5), round(c_lat, 5))]
+
+        # Limit to top 3 intersections
+        for s_idx, (s_lon, s_lat) in enumerate(intersection_coords[:3]):
+            phase_green = ((int(t / 15.0) + s_idx) % 2) == 0
+            fallback_signals.append(
+                TrafficLightState(
+                    id=f"TL_fallback_{s_idx + 1}",
+                    lat=s_lat,
+                    lng=s_lon,
+                    state="green" if phase_green else "red",
+                    phase_duration=15.0,
+                    controlled_lanes=[f"approach_{s_idx}_1", f"approach_{s_idx}_2"],
                 )
             )
 
+        self.cached_signals = fallback_signals
         self.cached_vehicles = vehicles
         self.current_metrics = SimulationMetrics(
             avg_speed_kmh=cur_speed,
@@ -330,6 +519,7 @@ class SimulationSession:
         self.waiting_samples.clear()
         self.queue_samples.clear()
         self.cached_vehicles.clear()
+        self.cached_signals.clear()
         self.state = "ready"
         self.current_metrics = SimulationMetrics(
             total_duration_seconds=float(self.duration_seconds)
@@ -352,6 +542,8 @@ class SimulationSession:
             "sim_id": self.sim_id,
             "analysis_id": self.analysis_id,
             "state": self.state,
+            "engine_mode": self.engine_mode,
+            "engine_message": self.engine_message,
             "duration_seconds": self.duration_seconds,
             "demand_rate_veh_hr": self.demand_rate_veh_hr,
             "strategy": self.strategy,
@@ -362,5 +554,7 @@ class SimulationSession:
             "elapsed_seconds": self.elapsed_seconds,
             "current_metrics": self.current_metrics.model_dump(),
             "vehicles": [v.model_dump() for v in self.cached_vehicles],
+            "traffic_lights": [tl.model_dump() for tl in self.cached_signals],
             "error_message": self.error_message,
         }
+

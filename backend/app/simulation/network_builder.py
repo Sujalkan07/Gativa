@@ -53,13 +53,14 @@ class SumoNetworkBuilder:
         duration_seconds: int = 600,
         demand_rate_veh_hr: int = 2840,
         seed: int = 42,
+        polygon_coords: Optional[list[list[float]]] = None,
     ) -> dict[str, Any]:
         """
         Create complete SUMO simulation directory:
         1. nodes.nod.xml
         2. edges.edg.xml
-        3. netconvert -> network.net.xml
-        4. routes.rou.xml
+        3. netconvert -> network.net.xml (with UTM projection for accurate WGS84 coordinates)
+        4. routes.rou.xml (over routable edge paths)
         5. simulation.sumocfg
         """
         nod_file = self.work_dir / "nodes.nod.xml"
@@ -69,11 +70,11 @@ class SumoNetworkBuilder:
         cfg_file = self.work_dir / "simulation.sumocfg"
 
         # 1. Process Nodes and Edges
-        nodes, edges = self._extract_nodes_and_edges(segments)
+        nodes, edges = self._extract_nodes_and_edges(segments, polygon_coords)
         self._write_nodes_xml(nod_file, nodes)
         self._write_edges_xml(edg_file, edges)
 
-        # 2. Run netconvert
+        # 2. Run netconvert with UTM projection (establishes true CRS for convertGeo)
         netconvert_success = False
         if self.netconvert_bin and Path(self.netconvert_bin).is_file():
             try:
@@ -82,16 +83,29 @@ class SumoNetworkBuilder:
                     "--node-files", str(nod_file),
                     "--edge-files", str(edg_file),
                     "--output-file", str(net_file),
-                    "--proj.plain-geo",
+                    "--proj.utm",
                     "--no-warnings",
                     "--ignore-errors",
                 ]
                 res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
                 if res.returncode == 0 and net_file.is_file():
                     netconvert_success = True
-                    logger.info("netconvert generated network successfully: %s", net_file)
+                    logger.info("netconvert generated UTM network successfully: %s", net_file)
                 else:
-                    logger.warning("netconvert exited with code %s: %s", res.returncode, res.stderr)
+                    logger.warning("netconvert with --proj.utm exited %s: %s; trying plain-geo fallback", res.returncode, res.stderr)
+                    cmd_fallback = [
+                        self.netconvert_bin,
+                        "--node-files", str(nod_file),
+                        "--edge-files", str(edg_file),
+                        "--output-file", str(net_file),
+                        "--proj.plain-geo",
+                        "--no-warnings",
+                        "--ignore-errors",
+                    ]
+                    res2 = subprocess.run(cmd_fallback, capture_output=True, text=True, timeout=30)
+                    if res2.returncode == 0 and net_file.is_file():
+                        netconvert_success = True
+                        logger.info("netconvert generated plain-geo fallback network: %s", net_file)
             except Exception as e:
                 logger.error("Failed to run netconvert: %s", e)
 
@@ -99,9 +113,8 @@ class SumoNetworkBuilder:
         if not netconvert_success or not net_file.is_file():
             self._write_fallback_net_xml(net_file, nodes, edges)
 
-        # 3. Write Vehicle Demand (Routes)
-        valid_edge_ids = [e["id"] for e in edges]
-        self._write_routes_xml(rou_file, valid_edge_ids, duration_seconds, demand_rate_veh_hr, seed)
+        # 3. Write Vehicle Demand (Routes) over routable edge paths
+        self._write_routes_xml(rou_file, edges, duration_seconds, demand_rate_veh_hr, seed)
 
         # 4. Write SUMO Configuration
         self._write_sumocfg(cfg_file, net_file.name, rou_file.name, duration_seconds)
@@ -121,15 +134,21 @@ class SumoNetworkBuilder:
         }
 
     def _extract_nodes_and_edges(
-        self, segments: list[dict[str, Any]]
+        self,
+        segments: list[dict[str, Any]],
+        polygon_coords: Optional[list[list[float]]] = None,
     ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
         """Extract clean node coordinates and directional edges from road segments."""
         nodes: dict[str, dict[str, Any]] = {}
         edges: list[dict[str, Any]] = []
+        coord_to_node: dict[tuple[float, float], str] = {}
 
-        # If empty segments provided, construct default corridor representation
+        # If empty segments provided, construct corridor from polygon centroid or default
         if not segments:
-            segments = self._default_corridor_segments()
+            if polygon_coords and len(polygon_coords) >= 3:
+                segments = self._corridor_from_polygon(polygon_coords)
+            else:
+                segments = self._default_corridor_segments()
 
         # Build node coordinate registry
         for idx, seg in enumerate(segments[:60]):  # Bounded to max 60 segments for responsive simulation
@@ -138,8 +157,17 @@ class SumoNetworkBuilder:
             if len(coords) < 2:
                 continue
 
-            u_id = seg.get("from_node_id") or f"node_{idx}_u"
-            v_id = seg.get("to_node_id") or f"node_{idx}_v"
+            # Deduplicate nodes by coordinate so connected segments share junction nodes
+            u_coord_key = (round(coords[0][0], 5), round(coords[0][1], 5))
+            v_coord_key = (round(coords[-1][0], 5), round(coords[-1][1], 5))
+
+            if u_coord_key not in coord_to_node:
+                coord_to_node[u_coord_key] = f"node_{len(coord_to_node)}"
+            if v_coord_key not in coord_to_node:
+                coord_to_node[v_coord_key] = f"node_{len(coord_to_node)}"
+
+            u_id = coord_to_node[u_coord_key]
+            v_id = coord_to_node[v_coord_key]
 
             # GeoJSON coordinates are [lon, lat]
             u_lon, u_lat = coords[0][0], coords[0][1]
@@ -156,24 +184,31 @@ class SumoNetworkBuilder:
             speed_kmh = float(seg.get("speed_limit_kmh") or 50.0)
             lanes = max(1, min(4, int(seg.get("lanes") or 2)))
             edge_id = str(seg.get("segment_id") or f"edge_{idx}")
+            safe_edge_id = "".join(c if (c.isalnum() or c == "_") else "_" for c in edge_id)
+
+            # Build shape strings for true physical road curvature
+            shape_str = " ".join(f"{c[0]:.6f},{c[1]:.6f}" for c in coords)
+            shape_str_rev = " ".join(f"{c[0]:.6f},{c[1]:.6f}" for c in reversed(coords))
 
             edges.append({
-                "id": edge_id,
+                "id": safe_edge_id,
                 "from": u_id,
                 "to": v_id,
                 "speed": round(speed_kmh / 3.6, 2),  # m/s
                 "numLanes": lanes,
+                "shape": shape_str,
                 "name": seg.get("name") or "Road Segment",
             })
 
             # If bidirectional, add reverse edge
             if not seg.get("is_oneway", False):
                 edges.append({
-                    "id": f"{edge_id}_rev",
+                    "id": f"{safe_edge_id}_rev",
                     "from": v_id,
                     "to": u_id,
                     "speed": round(speed_kmh / 3.6, 2),
                     "numLanes": lanes,
+                    "shape": shape_str_rev,
                     "name": seg.get("name") or "Road Segment",
                 })
 
@@ -207,29 +242,32 @@ class SumoNetworkBuilder:
     def _write_edges_xml(self, file_path: Path, edges: list[dict[str, Any]]):
         root = ET.Element("edges")
         for edge in edges:
-            ET.SubElement(
-                root,
-                "edge",
-                id=str(edge["id"]),
-                **{"from": str(edge["from"])},
-                to=str(edge["to"]),
-                speed=str(edge["speed"]),
-                numLanes=str(edge["numLanes"]),
-                priority="2",
-            )
+            attribs = {
+                "id": str(edge["id"]),
+                "from": str(edge["from"]),
+                "to": str(edge["to"]),
+                "speed": str(edge["speed"]),
+                "numLanes": str(edge["numLanes"]),
+                "priority": "2",
+            }
+            if edge.get("shape"):
+                attribs["shape"] = edge["shape"]
+            ET.SubElement(root, "edge", attribs)
         tree = ET.ElementTree(root)
         tree.write(str(file_path), encoding="utf-8", xml_declaration=True)
 
     def _write_routes_xml(
         self,
         file_path: Path,
-        edge_ids: list[str],
+        edges: list[dict[str, Any]],
         duration_seconds: int,
         demand_rate_veh_hr: int,
         seed: int,
     ):
-        """Generate calibrated trip demand."""
+        """Generate calibrated trip demand over routable edge pairs."""
         import random
+        import networkx as nx
+
         rng = random.Random(seed)
 
         root = ET.Element("routes")
@@ -238,16 +276,34 @@ class SumoNetworkBuilder:
         ET.SubElement(root, "vType", id="bus", accel="1.2", decel="3.5", sigma="0.5", length="12.0", maxSpeed="20.0", color="1,0.6,0")
 
         total_vehicles = max(20, int(demand_rate_veh_hr * (duration_seconds / 3600.0)))
-        edge_count = len(edge_ids)
 
-        if edge_count >= 2:
+        # Build directed graph of edges to ensure connectivity between from and to edges
+        G = nx.DiGraph()
+        for e in edges:
+            G.add_edge(e["from"], e["to"], id=e["id"])
+
+        # Find all routable pairs (from_edge, to_edge) where a directed path exists
+        routable_pairs: list[tuple[str, str]] = []
+        for e1 in edges:
+            for e2 in edges:
+                if e1["id"] == e2["id"]:
+                    continue
+                # Connected either directly at junction or via a path through network
+                if e1["to"] == e2["from"] or nx.has_path(G, e1["to"], e2["from"]):
+                    routable_pairs.append((e1["id"], e2["id"]))
+
+        # If no multi-edge paths exist, allow self-trips on valid edges
+        if not routable_pairs:
+            valid_edge_ids = [e["id"] for e in edges]
+            if valid_edge_ids:
+                routable_pairs = [(eid, eid) for eid in valid_edge_ids]
+
+        if routable_pairs:
             depart_interval = duration_seconds / max(1, total_vehicles)
             for v_idx in range(total_vehicles):
-                depart_time = round(v_idx * depart_interval + rng.uniform(0, 1.5), 1)
-                from_edge = rng.choice(edge_ids)
-                to_edge = rng.choice(edge_ids)
-                while to_edge == from_edge and edge_count > 1:
-                    to_edge = rng.choice(edge_ids)
+                # Ensure vehicles appear immediately at simulation start for immediate visibility
+                depart_time = 0.0 if v_idx < 3 else round(v_idx * depart_interval + rng.uniform(0, 1.0), 1)
+                from_edge, to_edge = rng.choice(routable_pairs)
 
                 v_type = "bus" if rng.random() < 0.12 else "passenger"
                 ET.SubElement(
@@ -273,6 +329,9 @@ class SumoNetworkBuilder:
         ET.SubElement(time_elem, "end", value=str(duration_seconds))
         ET.SubElement(time_elem, "step-length", value="0.2")
 
+        processing_elem = ET.SubElement(root, "processing")
+        ET.SubElement(processing_elem, "ignore-route-errors", value="true")
+
         report_elem = ET.SubElement(root, "report")
         ET.SubElement(report_elem, "no-warnings", value="true")
         ET.SubElement(report_elem, "no-step-log", value="true")
@@ -281,10 +340,23 @@ class SumoNetworkBuilder:
         tree.write(str(file_path), encoding="utf-8", xml_declaration=True)
 
     def _write_fallback_net_xml(self, file_path: Path, nodes: dict, edges: list):
-        """Minimal compliant network XML in case netconvert is bypassed."""
+        """
+        Minimal fallback network XML in case netconvert is bypassed or fails.
+        Explicitly marked as an unvalidated structural fallback, not a native compiled SUMO network.
+        """
         root = ET.Element("net", version="1.20", xmlns="http://sumo.dlr.de/xsd/net_file.xsd")
+        comment = ET.Comment(" UNVALIDATED_STRUCTURAL_FALLBACK: Netconvert not applied. ")
+        root.append(comment)
         for e in edges:
-            edge_elem = ET.SubElement(root, "edge", id=e["id"], **{"from": e["from"]}, to=e["to"], priority="2")
+            attribs = {
+                "id": str(e["id"]),
+                "from": str(e["from"]),
+                "to": str(e["to"]),
+                "priority": "2",
+            }
+            if e.get("shape"):
+                attribs["shape"] = e["shape"]
+            edge_elem = ET.SubElement(root, "edge", attribs)
             for lane_i in range(e["numLanes"]):
                 ET.SubElement(
                     edge_elem,
@@ -296,6 +368,59 @@ class SumoNetworkBuilder:
                 )
         tree = ET.ElementTree(root)
         tree.write(str(file_path), encoding="utf-8", xml_declaration=True)
+
+    def _corridor_from_polygon(self, polygon_coords: list[list[float]]) -> list[dict[str, Any]]:
+        """Construct representative urban arterial corridor centered on the polygon bounds."""
+        center_lon = sum(c[0] for c in polygon_coords) / len(polygon_coords)
+        center_lat = sum(c[1] for c in polygon_coords) / len(polygon_coords)
+        d_lon = 0.004
+        d_lat = 0.004
+        return [
+            {
+                "segment_id": "seg_poly_main_w",
+                "name": "Polygon Arterial West",
+                "from_node_id": "J_west",
+                "to_node_id": "J_center",
+                "geometry": {"coordinates": [[round(center_lon - d_lon, 6), round(center_lat, 6)], [round(center_lon, 6), round(center_lat, 6)]]},
+                "road_type": "arterial",
+                "speed_limit_kmh": 50,
+                "lanes": 2,
+                "is_oneway": False,
+            },
+            {
+                "segment_id": "seg_poly_main_e",
+                "name": "Polygon Arterial East",
+                "from_node_id": "J_center",
+                "to_node_id": "J_east",
+                "geometry": {"coordinates": [[round(center_lon, 6), round(center_lat, 6)], [round(center_lon + d_lon, 6), round(center_lat, 6)]]},
+                "road_type": "arterial",
+                "speed_limit_kmh": 50,
+                "lanes": 2,
+                "is_oneway": False,
+            },
+            {
+                "segment_id": "seg_poly_cross_s",
+                "name": "Polygon Corridor South",
+                "from_node_id": "J_south",
+                "to_node_id": "J_center",
+                "geometry": {"coordinates": [[round(center_lon, 6), round(center_lat - d_lat, 6)], [round(center_lon, 6), round(center_lat, 6)]]},
+                "road_type": "arterial",
+                "speed_limit_kmh": 50,
+                "lanes": 2,
+                "is_oneway": False,
+            },
+            {
+                "segment_id": "seg_poly_cross_n",
+                "name": "Polygon Corridor North",
+                "from_node_id": "J_center",
+                "to_node_id": "J_north",
+                "geometry": {"coordinates": [[round(center_lon, 6), round(center_lat, 6)], [round(center_lon, 6), round(center_lat + d_lat, 6)]]},
+                "road_type": "arterial",
+                "speed_limit_kmh": 50,
+                "lanes": 2,
+                "is_oneway": False,
+            },
+        ]
 
     def _default_corridor_segments(self) -> list[dict[str, Any]]:
         """Default representative urban corridor if no segments are provided."""

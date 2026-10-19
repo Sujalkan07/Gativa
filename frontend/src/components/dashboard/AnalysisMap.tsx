@@ -272,7 +272,7 @@ export default function AnalysisMap({
       polyline.bindTooltip(
         `<div class="font-sans text-xs">
           <p class="font-bold text-[#0b1c30] text-[13px]">${roadTitle}</p>
-          <div class="flex items-center gap-2 mt-1 text-[#554336]">
+          <div class="flex flex-wrap items-center gap-1.5 mt-1 text-[#554336]">
             <span class="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase ${
               seg.road_type === 'highway'
                 ? 'bg-[#ffeedb] text-[#855400]'
@@ -280,7 +280,10 @@ export default function AnalysisMap({
                 ? 'bg-[#e0e0ff] text-[#2d3b8f]'
                 : 'bg-[#f1f5f9] text-[#475569]'
             }">${seg.road_type}</span>
-            <span>${seg.length_m.toFixed(0)}m</span>
+            ${seg.osm_highway ? `<span class="text-[10px] font-mono text-slate-500">osm:${seg.osm_highway}</span>` : ''}
+            <span>• ${seg.length_m.toFixed(0)}m</span>
+            <span>• ${seg.is_oneway ? '1-way' : '2-way'}</span>
+            ${seg.lanes ? `<span>• ${seg.lanes}L</span>` : ''}
             <span>• Speed: ${speedObs}</span>
           </div>
         </div>`,

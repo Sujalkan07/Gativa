@@ -2,6 +2,7 @@
 import logging
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from app.core.config import get_settings
+from app.core.sqlite_store import init_sqlite_db
 
 logger = logging.getLogger(__name__)
 
@@ -11,10 +12,12 @@ _db: AsyncIOMotorDatabase | None = None
 
 async def connect_to_mongo() -> None:
     global _client, _db
+    # Always ensure local durable SQLite store is ready
+    init_sqlite_db()
     settings = get_settings()
     if not settings.mongodb_uri or not settings.mongodb_uri.strip():
         logger.warning(
-            "MONGODB_URI not configured. Operating in in-memory session persistence mode."
+            "MONGODB_URI not configured. Operating in SQLite durable local persistence mode (backend/data/gativa.db)."
         )
         return
 
@@ -38,6 +41,17 @@ async def close_mongo_connection() -> None:
     if _client:
         _client.close()
         logger.info("MongoDB connection closed")
+
+
+
+def is_mongodb_connected() -> bool:
+    return _db is not None
+
+
+def get_persistence_mode() -> str:
+    if is_mongodb_connected():
+        return "mongodb"
+    return "sqlite"
 
 
 def get_database() -> AsyncIOMotorDatabase:

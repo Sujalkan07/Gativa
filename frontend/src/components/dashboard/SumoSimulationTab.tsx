@@ -19,10 +19,12 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
   const [comparison, setComparison] = useState<ScenarioComparisonResult | null>(null)
   const [speedMultiplier, setSpeedMultiplier] = useState<number>(2)
   const [isPlaying, setIsPlaying] = useState<boolean>(false)
-  const [isPreparing, setIsPreparing] = useState<boolean>(false)
+  const [isPreparing, setIsPreparing] = useState<boolean>(true)
   const [error, setError] = useState<string | null>(null)
 
   const timerRef = useRef<number | null>(null)
+  const isSteppingRef = useRef<boolean>(false)
+  const markersMapRef = useRef<Map<string, L.Marker>>(new Map())
   const mapContainerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<L.Map | null>(null)
   const segmentsGroupRef = useRef<L.LayerGroup | null>(null)
@@ -31,11 +33,15 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
 
   const TOMTOM_KEY = import.meta.env.VITE_TOMTOM_API_KEY
 
+  const getErrorMessage = (err: unknown): string => {
+    if (err instanceof GativaApiError) return err.message
+    if (err instanceof Error) return err.message
+    return String(err)
+  }
+
   // 1. Prepare Simulation on Mount or when analysisId changes
   useEffect(() => {
     let isMounted = true
-    setIsPreparing(true)
-    setError(null)
 
     api
       .prepareSimulation({
@@ -53,11 +59,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
       })
       .catch((err) => {
         if (isMounted) {
-          const msg =
-            err instanceof GativaApiError
-              ? err.message
-              : 'Failed to initialize SUMO simulation.'
-          setError(msg)
+          setError(getErrorMessage(err))
           setIsPreparing(false)
         }
       })
@@ -74,7 +76,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
     api
       .getScenarioComparison(simId)
       .then((data) => setComparison(data))
-      .catch((err) => console.warn('Could not fetch scenario comparison:', err))
+      .catch((err) => setError(getErrorMessage(err)))
   }, [simId])
 
   // 3. Step Loop when isPlaying is true
@@ -87,20 +89,29 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
       return
     }
 
-    const intervalMs = Math.max(80, Math.floor(400 / speedMultiplier))
-    timerRef.current = setInterval(() => {
+    const intervalMs = Math.max(100, Math.floor(400 / speedMultiplier))
+    timerRef.current = window.setInterval(() => {
+      if (isSteppingRef.current) return
+      isSteppingRef.current = true
+
       api
         .stepSimulation(simId, speedMultiplier)
         .then((res) => {
           setSimStatus(res)
           if (res.state === 'completed') {
             setIsPlaying(false)
-            api.getScenarioComparison(simId).then(setComparison).catch(() => {})
+            api
+              .getScenarioComparison(simId)
+              .then(setComparison)
+              .catch((err) => setError(getErrorMessage(err)))
           }
         })
         .catch((err) => {
-          console.error('Simulation step error:', err)
+          setError(getErrorMessage(err))
           setIsPlaying(false)
+        })
+        .finally(() => {
+          isSteppingRef.current = false
         })
     }, intervalMs)
 
@@ -116,36 +127,61 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
   const handleTogglePlay = useCallback(() => {
     if (!simId) return
     if (isPlaying) {
-      api.pauseSimulation(simId).catch(() => {})
+      api
+        .pauseSimulation(simId)
+        .then((res) => setSimStatus(res))
+        .catch((err) => setError(getErrorMessage(err)))
       setIsPlaying(false)
-      api.getScenarioComparison(simId).then(setComparison).catch(() => {})
+      api
+        .getScenarioComparison(simId)
+        .then(setComparison)
+        .catch((err) => setError(getErrorMessage(err)))
     } else {
-      api.startSimulation(simId).catch(() => {})
-      setIsPlaying(true)
+      setError(null)
+      api
+        .startSimulation(simId)
+        .then((res) => {
+          setSimStatus(res)
+          setIsPlaying(true)
+        })
+        .catch((err) => {
+          setError(getErrorMessage(err))
+          setIsPlaying(false)
+        })
     }
   }, [simId, isPlaying])
 
   const handleStepOnce = useCallback(() => {
     if (!simId) return
+    setError(null)
     api
       .stepSimulation(simId, 2)
       .then((res) => {
         setSimStatus(res)
-        api.getScenarioComparison(simId).then(setComparison).catch(() => {})
+        api
+          .getScenarioComparison(simId)
+          .then(setComparison)
+          .catch((err) => setError(getErrorMessage(err)))
       })
-      .catch((err) => console.error('Step error:', err))
+      .catch((err) => setError(getErrorMessage(err)))
   }, [simId])
 
   const handleReset = useCallback(() => {
     if (!simId) return
     setIsPlaying(false)
+    setError(null)
+    markersMapRef.current.clear()
+    vehiclesGroupRef.current?.clearLayers()
     api
       .resetSimulation(simId)
       .then((res) => {
         setSimStatus(res)
-        api.getScenarioComparison(simId).then(setComparison).catch(() => {})
+        api
+          .getScenarioComparison(simId)
+          .then(setComparison)
+          .catch((err) => setError(getErrorMessage(err)))
       })
-      .catch(() => {})
+      .catch((err) => setError(getErrorMessage(err)))
   }, [simId])
 
   // 4. Initialize Leaflet Map in Simulation Viewport
@@ -245,16 +281,24 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
     () => simStatus?.vehicles ?? [],
     [simStatus?.vehicles],
   )
-  const isNorthSouthGreen = Math.floor(elapsed / 15) % 2 === 0
-
   useEffect(() => {
     const vehGroup = vehiclesGroupRef.current
     if (!vehGroup) return
 
-    vehGroup.clearLayers()
+    const currentIds = new Set<string>()
 
     vehicles.forEach((veh) => {
-      if (veh.lat && veh.lng && !isNaN(veh.lat) && !isNaN(veh.lng)) {
+      if (
+        veh.lat != null &&
+        veh.lng != null &&
+        !isNaN(veh.lat) &&
+        !isNaN(veh.lng) &&
+        veh.lat >= -90 &&
+        veh.lat <= 90 &&
+        veh.lng >= -180 &&
+        veh.lng <= 180
+      ) {
+        currentIds.add(veh.id)
         const isBus = veh.type === 'bus'
         const speedColor =
           veh.speed_kmh < 18
@@ -265,54 +309,85 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
                 ? '#0A1145'
                 : '#138808'
 
+        const iconHtml = `<div style="transform: rotate(${veh.angle}deg); width: ${isBus ? '22px' : '16px'}; height: ${isBus ? '10px' : '8px'}; background-color: ${speedColor}; border: 1.5px solid #ffffff; border-radius: 2px; box-shadow: 0 1px 3px rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center;">
+          ${isBus ? '<span style="font-size: 5px; color: #ffffff; font-weight: bold; font-family: monospace;">B</span>' : ''}
+        </div>`
+
         const icon = L.divIcon({
           className: 'sumo-vehicle-icon',
           iconSize: [22, 12],
           iconAnchor: [11, 6],
-          html: `<div style="transform: rotate(${veh.angle}deg); width: ${isBus ? '22px' : '16px'}; height: ${isBus ? '10px' : '8px'}; background-color: ${speedColor}; border: 1.5px solid #ffffff; border-radius: 2px; box-shadow: 0 1px 3px rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center;">
-            ${isBus ? '<span style="font-size: 5px; color: #ffffff; font-weight: bold; font-family: monospace;">B</span>' : ''}
-          </div>`,
+          html: iconHtml,
         })
 
-        const marker = L.marker([veh.lat, veh.lng], { icon })
-        marker.bindTooltip(
-          `<div class="text-[11px] font-mono"><b>${veh.id}</b> (${veh.type})<br/>Speed: ${veh.speed_kmh.toFixed(1)} km/h<br/>Wait: ${veh.waiting_time_s.toFixed(1)}s</div>`,
-          { direction: 'top', offset: [0, -6] },
-        )
-        vehGroup.addLayer(marker)
+        const tooltipHtml = `<div class="text-[11px] font-mono"><b>${veh.id}</b> (${veh.type})<br/>Speed: ${veh.speed_kmh.toFixed(1)} km/h<br/>Wait: ${veh.waiting_time_s.toFixed(1)}s</div>`
+
+        const existingMarker = markersMapRef.current.get(veh.id)
+        if (existingMarker) {
+          existingMarker.setLatLng([veh.lat, veh.lng])
+          existingMarker.setIcon(icon)
+          existingMarker.setTooltipContent(tooltipHtml)
+        } else {
+          const newMarker = L.marker([veh.lat, veh.lng], { icon })
+          newMarker.bindTooltip(tooltipHtml, { direction: 'top', offset: [0, -6] })
+          vehGroup.addLayer(newMarker)
+          markersMapRef.current.set(veh.id, newMarker)
+        }
+      }
+    })
+
+    // Remove inactive vehicles from the map
+    markersMapRef.current.forEach((marker, id) => {
+      if (!currentIds.has(id)) {
+        vehGroup.removeLayer(marker)
+        markersMapRef.current.delete(id)
       }
     })
   }, [vehicles])
 
-  // Update signal indicators
+  // Update real SUMO signal indicators
   useEffect(() => {
     const sigGroup = signalsGroupRef.current
     if (!sigGroup) return
 
     sigGroup.clearLayers()
 
-    // Mark key bottleneck or intersection nodes as traffic signals
-    if (analysis.bottlenecks?.length) {
-      analysis.bottlenecks.slice(0, 3).forEach((b, idx) => {
-        if (b.lat && b.lng) {
-          const sigIcon = L.divIcon({
-            className: 'sumo-signal-icon',
-            iconSize: [26, 26],
-            iconAnchor: [13, 13],
-            html: `<div style="width: 26px; height: 26px; border-radius: 50%; background: #0A1145; border: 2px solid #ffffff; box-shadow: 0 2px 5px rgba(0,0,0,0.4); display: flex; align-items: center; justify-content: center; position: relative;">
-              <span style="font-size: 8px; color: #FF9933; font-weight: bold; font-family: monospace;">TL${idx + 1}</span>
-              <span style="position: absolute; top: -2px; right: -2px; width: 8px; height: 8px; border-radius: 50%; background: ${isNorthSouthGreen ? '#138808' : '#DC2626'}; border: 1.5px solid #ffffff;"></span>
-            </div>`,
-          })
-          const sigMarker = L.marker([b.lat, b.lng], { icon: sigIcon })
-          sigMarker.bindTooltip(
-            `<div class="text-[11px] font-sans"><b>Traffic Signal TL${idx + 1}</b><br/>Phase: ${isNorthSouthGreen ? 'North-South Green' : 'East-West Green'}</div>`,
-          )
-          sigGroup.addLayer(sigMarker)
-        }
-      })
-    }
-  }, [analysis.bottlenecks, isNorthSouthGreen])
+    const trafficLights = simStatus?.traffic_lights || []
+    trafficLights.forEach((tl, idx) => {
+      if (
+        tl.lat != null &&
+        tl.lng != null &&
+        !isNaN(tl.lat) &&
+        !isNaN(tl.lng) &&
+        tl.lat >= -90 &&
+        tl.lat <= 90 &&
+        tl.lng >= -180 &&
+        tl.lng <= 180
+      ) {
+        const stateColor =
+          tl.state === 'green'
+            ? '#138808'
+            : tl.state === 'yellow'
+              ? '#F59E0B'
+              : '#DC2626'
+
+        const sigIcon = L.divIcon({
+          className: 'sumo-signal-icon',
+          iconSize: [26, 26],
+          iconAnchor: [13, 13],
+          html: `<div style="width: 26px; height: 26px; border-radius: 50%; background: #0A1145; border: 2px solid #ffffff; box-shadow: 0 2px 5px rgba(0,0,0,0.4); display: flex; align-items: center; justify-content: center; position: relative;">
+            <span style="font-size: 8px; color: #FF9933; font-weight: bold; font-family: monospace;">TL${idx + 1}</span>
+            <span style="position: absolute; top: -2px; right: -2px; width: 9px; height: 9px; border-radius: 50%; background: ${stateColor}; border: 1.5px solid #ffffff; box-shadow: 0 0 6px ${stateColor};"></span>
+          </div>`,
+        })
+        const sigMarker = L.marker([tl.lat, tl.lng], { icon: sigIcon })
+        sigMarker.bindTooltip(
+          `<div class="text-[11px] font-sans"><b>Traffic Signal: ${tl.id}</b><br/>Current Phase: <span style="font-weight:bold;color:${stateColor}">${tl.state.toUpperCase()}</span><br/>Controlled Approaches: ${tl.controlled_lanes?.length ?? 0} lanes</div>`,
+        )
+        sigGroup.addLayer(sigMarker)
+      }
+    })
+  }, [simStatus?.traffic_lights])
 
   // Format MM:SS
   const formatTime = (secs: number) => {
@@ -321,16 +396,39 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
     return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
   }
 
+  const engineMode = simStatus?.engine_mode ?? 'unavailable'
+
   return (
     <div className="flex flex-col gap-6">
       {/* AREA A: PAGE HEADER */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-bold text-[#0A1145] tracking-tight">
-            SUMO Traffic Simulation
-          </h1>
+          <div className="flex items-center gap-3">
+            <h1 className="text-2xl font-bold text-[#0A1145] tracking-tight">
+              SUMO Traffic Simulation
+            </h1>
+            {/* Explicit Engine Mode Badge */}
+            {engineMode === 'native_sumo' && (
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-50 text-emerald-700 border border-emerald-300">
+                <span className="w-2 h-2 rounded-full bg-emerald-600 animate-pulse"></span>
+                Native SUMO (TraCI)
+              </span>
+            )}
+            {engineMode === 'fallback' && (
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-amber-50 text-amber-700 border border-amber-300">
+                <span className="w-2 h-2 rounded-full bg-amber-500"></span>
+                Fallback Simulation (Internal Engine)
+              </span>
+            )}
+            {engineMode === 'unavailable' && (
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-red-50 text-red-700 border border-red-300">
+                <span className="w-2 h-2 rounded-full bg-red-500"></span>
+                Engine Unavailable
+              </span>
+            )}
+          </div>
           <p className="text-sm text-slate-500 mt-0.5">
-            Microscopic traffic simulation powered by Eclipse SUMO &amp; TraCI with live telemetry.
+            Microscopic traffic simulation and empirical comparative telemetry.
           </p>
         </div>
         <div className="flex items-center gap-3">
@@ -375,6 +473,22 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
         </div>
       </div>
 
+      {/* Fallback Mode Diagnostic Banner */}
+      {engineMode === 'fallback' && (
+        <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800 flex items-start gap-2.5">
+          <span className="material-symbols-outlined text-amber-600 text-base shrink-0 mt-0.5">
+            info
+          </span>
+          <div>
+            <span className="font-bold">Operating in Fallback Kinematics Mode: </span>
+            <span>
+              {simStatus?.engine_message ||
+                'Running internal physics engine along selected corridor geometry. Measurements reflect empirical kinematics rather than compiled TraCI telemetry.'}
+            </span>
+          </div>
+        </div>
+      )}
+
       {error && (
         <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-700 flex items-center gap-2">
           <span className="material-symbols-outlined text-sm">warning</span>
@@ -408,8 +522,16 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
           </div>
         </div>
         <div className="text-[11px] font-mono text-slate-500 flex items-center gap-1.5">
-          <span className="w-2 h-2 rounded-full bg-[#138808]"></span>
-          <span>TraCI Engine • Step: 0.2s</span>
+          <span
+            className={`w-2 h-2 rounded-full ${
+              engineMode === 'native_sumo' ? 'bg-[#138808]' : 'bg-amber-500'
+            }`}
+          ></span>
+          <span>
+            {engineMode === 'native_sumo'
+              ? 'TraCI Engine • Step: 0.2s'
+              : 'Kinematics Fallback • Step: 0.5s'}
+          </span>
         </div>
       </div>
 
@@ -440,13 +562,17 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
               <span className="w-2.5 h-2.5 rounded-xs bg-[#0A1145]"></span>
               <span>Bus Transit</span>
             </div>
+            <div className="flex items-center gap-2 text-[11px] text-slate-700">
+              <span className="w-2.5 h-2.5 rounded-full bg-[#138808] border border-white shadow-xs"></span>
+              <span>Actuated Signal (Phase State)</span>
+            </div>
           </div>
 
           {/* Corridor Network Label */}
           <div className="absolute top-4 left-4 z-[500] bg-white/95 backdrop-blur-xs border border-[#cbdbf5] rounded-lg px-3 py-1.5 shadow-xs text-xs">
             <span className="font-bold text-[#0A1145]">Corridor Network:</span>
             <span className="text-slate-600 font-mono text-[11px] ml-1">
-              {simStatus?.edge_count ?? analysis.segments.length} Edges • {simStatus?.junction_count ?? analysis.road_network?.intersection_count ?? 0} Junctions • {simStatus?.signal_count ?? 1} Signals
+              {simStatus?.edge_count ?? analysis.segments.length} Edges • {simStatus?.junction_count ?? analysis.road_network?.intersection_count ?? 0} Junctions • {simStatus?.signal_count ?? simStatus?.traffic_lights?.length ?? 0} Signals
             </span>
           </div>
 
@@ -553,7 +679,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
           </div>
           <div className="mt-2 text-[11px] font-semibold text-[#138808] flex items-center gap-1">
             {elapsed > 0 && metrics?.variance_speed_pct != null ? (
-              <span>
+              <span className={metrics.variance_speed_pct >= 0 ? 'text-[#138808]' : 'text-[#DC2626]'}>
                 {metrics.variance_speed_pct >= 0 ? '↑ +' : '↓ '}
                 {metrics.variance_speed_pct.toFixed(1)}% vs baseline
               </span>
@@ -583,7 +709,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
           </div>
           <div className="mt-2 text-[11px] font-semibold text-[#138808] flex items-center gap-1">
             {elapsed > 0 && metrics?.variance_waiting_pct != null ? (
-              <span>
+              <span className={metrics.variance_waiting_pct <= 0 ? 'text-[#138808]' : 'text-[#DC2626]'}>
                 {metrics.variance_waiting_pct < 0 ? '↓ ' : '↑ +'}
                 {metrics.variance_waiting_pct.toFixed(1)}% delay
               </span>
@@ -613,7 +739,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
           </div>
           <div className="mt-2 text-[11px] font-semibold text-[#138808] flex items-center gap-1">
             {elapsed > 0 && metrics?.variance_queue_pct != null ? (
-              <span>
+              <span className={metrics.variance_queue_pct <= 0 ? 'text-[#138808]' : 'text-[#DC2626]'}>
                 {metrics.variance_queue_pct < 0 ? '↓ ' : '↑ +'}
                 {metrics.variance_queue_pct.toFixed(1)}% spillback
               </span>
@@ -641,7 +767,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
           </div>
           <div className="mt-2 text-[11px] font-semibold text-[#138808] flex items-center gap-1">
             {elapsed > 0 && metrics?.variance_completed_pct != null ? (
-              <span>
+              <span className={metrics.variance_completed_pct >= 0 ? 'text-[#138808]' : 'text-[#DC2626]'}>
                 {metrics.variance_completed_pct >= 0 ? '↑ +' : '↓ '}
                 {metrics.variance_completed_pct.toFixed(1)}% throughput
               </span>
@@ -654,16 +780,34 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
 
       {/* AREA D: SCENARIO RESULTS (BASELINE VS OPTIMIZED) */}
       <div className="bg-white rounded-xl border border-[#cbdbf5] p-5 shadow-xs">
-        <div className="flex items-center justify-between border-b border-[#e2e8f0] pb-3 mb-4">
+        <div className="flex flex-wrap items-center justify-between border-b border-[#e2e8f0] pb-3 mb-4 gap-2">
           <div>
-            <h2 className="text-sm font-bold text-[#0A1145]">Scenario Results</h2>
+            <div className="flex items-center gap-2">
+              <h2 className="text-sm font-bold text-[#0A1145]">Scenario Results</h2>
+              {comparison?.comparison_status && (
+                <span
+                  className={`text-[10px] font-semibold uppercase px-2 py-0.5 rounded border ${
+                    comparison.comparison_status === 'completed'
+                      ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                      : comparison.comparison_status === 'pending'
+                        ? 'bg-slate-100 text-slate-600 border-slate-200'
+                        : 'bg-amber-50 text-amber-700 border-amber-200'
+                  }`}
+                >
+                  {comparison.comparison_status}
+                </span>
+              )}
+            </div>
             <p className="text-xs text-slate-500">
-              Baseline (Fixed-Time) vs. Optimized (Adaptive Actuated) Comparison
+              {comparison?.baseline_strategy || 'Baseline (Fixed-Time)'} vs.{' '}
+              {comparison?.optimized_strategy || 'Optimized (Adaptive Actuated)'}
             </p>
           </div>
-          <span className="text-[11px] font-semibold text-slate-600 bg-[#eff4ff] border border-[#cbdbf5] px-2.5 py-1 rounded">
-            600s Simulation Interval
-          </span>
+          <div className="flex items-center gap-2">
+            <span className="text-[11px] font-mono text-slate-600 bg-[#eff4ff] border border-[#cbdbf5] px-2.5 py-1 rounded">
+              Seed: 42 • {simStatus?.duration_seconds ?? 600}s Interval
+            </span>
+          </div>
         </div>
 
         <div className="overflow-x-auto">
@@ -678,7 +822,9 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
             </thead>
             <tbody className="divide-y divide-[#e2e8f0] font-mono text-xs">
               {comparison?.rows?.map((row, idx) => {
-                const isPending = row.variance.toLowerCase().includes('pending')
+                const isPending =
+                  row.variance.toLowerCase().includes('pending') ||
+                  row.variance.toLowerCase().includes('insufficient')
                 return (
                   <tr key={idx} className="hover:bg-[#f8f9ff]">
                     <td className="py-3 px-4 font-sans font-medium text-[#0A1145]">
@@ -707,7 +853,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
         </div>
         <div className="mt-3 pt-2 text-[11px] text-slate-400 italic">
           {comparison?.methodology_notes ??
-            'Simulation results evaluated over 600s interval using Highway Capacity Manual (HCM 6th Ed.) calibrated demand.'}
+            'Simulation results evaluated using empirical telemetry across identical topology and demand.'}
         </div>
       </div>
     </div>

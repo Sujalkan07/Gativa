@@ -87,7 +87,7 @@ export default function LeafletDrawingMap({
       map.remove()
       mapRef.current = null
     }
-  }, [])
+  }, [TOMTOM_KEY])
 
   // 2. Switch Base Layer (Streets vs Satellite)
   useEffect(() => {
@@ -128,7 +128,7 @@ export default function LeafletDrawingMap({
             },
           ).addTo(map)
     }
-  }, [baseLayerType])
+  }, [baseLayerType, TOMTOM_KEY])
 
   // 2b. TomTom Live Traffic Flow Tile Overlay
   useEffect(() => {
@@ -152,7 +152,7 @@ export default function LeafletDrawingMap({
         },
       ).addTo(map)
     }
-  }, [showTraffic])
+  }, [showTraffic, TOMTOM_KEY])
 
   // 3. Map Click & Double Click Event Handling for Drawing
   useEffect(() => {
