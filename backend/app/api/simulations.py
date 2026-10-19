@@ -7,6 +7,7 @@ import logging
 from fastapi import APIRouter, HTTPException, Query, status
 
 from app.models.schemas import (
+    CongestionSummary,
     ErrorResponse,
     ScenarioComparisonResult,
     SimulationPrepareRequest,
@@ -141,4 +142,32 @@ async def get_scenario_comparison(sim_id: str):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Simulation {sim_id} not found",
+        )
+
+
+@router.get(
+    "/{sim_id}/congestion",
+    response_model=CongestionSummary,
+    summary="Get post-simulation road-level congestion analysis",
+    description=(
+        "Returns per-road congestion scores aggregated from SUMO TraCI edge telemetry. "
+        "Available immediately after simulation starts (partial data). "
+        "Results are persisted to SQLite on simulation completion. "
+        "data_quality='measured' requires native SUMO engine; "
+        "data_quality='estimated' or 'insufficient' indicates fallback/partial data."
+    ),
+)
+async def get_congestion_results(sim_id: str):
+    try:
+        return simulation_service.get_congestion_summary(sim_id)
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Simulation {sim_id} not found or congestion data unavailable",
+        )
+    except Exception as e:
+        logger.error("Failed to compute congestion summary for %s: %s", sim_id, e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to compute congestion analysis: {str(e)}",
         )

@@ -294,3 +294,51 @@ export interface ScenarioComparisonResult {
   methodology_notes: string
 }
 
+
+// ─── Post-Simulation Congestion Analysis ──────────────────────────────────────
+
+export type CongestionSeverity =
+  | 'free_flow'
+  | 'low'
+  | 'moderate'
+  | 'high'
+  | 'severe'
+  | 'insufficient_data'
+
+export type CongestionDataQuality = 'measured' | 'estimated' | 'insufficient'
+
+export interface CongestionRoadResult {
+  segment_id: string
+  sumo_edge_ids: string[]
+  road_name: string
+  road_type: string
+  geometry: GeoJSONLineString | null
+  avg_speed_kmh: number
+  ref_speed_kmh: number
+  min_speed_kmh: number
+  avg_occupancy_pct: number
+  peak_occupancy_pct: number
+  avg_halting: number
+  peak_halting: number
+  avg_waiting_s: number
+  congestion_score: number
+  severity: CongestionSeverity
+  congested_duration_s: number
+  congested_pct: number
+  sample_count: number
+  data_quality: CongestionDataQuality
+  engine_mode: string
+}
+
+export interface CongestionSummary {
+  sim_id: string
+  analysis_id: string
+  engine_mode: string
+  completed_at: string
+  total_roads: number
+  roads_analyzed: number
+  roads_insufficient: number
+  top_congested: CongestionRoadResult[]
+  all_results: CongestionRoadResult[]
+  methodology_notes: string
+}

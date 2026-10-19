@@ -14,6 +14,10 @@ import xml.etree.ElementTree as ET
 
 logger = logging.getLogger(__name__)
 
+# Maximum road segments to compile into a single SUMO network.
+# Supports large corridor selections (e.g. 354+ segments).
+MAX_SEGMENTS = 1000
+
 
 def find_sumo_binary(binary_name: str = "sumo") -> Optional[str]:
     """Locate a SUMO binary (e.g. 'sumo' or 'netconvert') on Windows/Linux."""
@@ -70,7 +74,7 @@ class SumoNetworkBuilder:
         cfg_file = self.work_dir / "simulation.sumocfg"
 
         # 1. Process Nodes and Edges
-        nodes, edges = self._extract_nodes_and_edges(segments, polygon_coords)
+        nodes, edges, segment_edge_map = self._extract_nodes_and_edges(segments, polygon_coords)
         self._write_nodes_xml(nod_file, nodes)
         self._write_edges_xml(edg_file, edges)
 
@@ -131,17 +135,27 @@ class SumoNetworkBuilder:
             "netconvert_used": netconvert_success,
             "duration_seconds": duration_seconds,
             "demand_rate_veh_hr": demand_rate_veh_hr,
+            # segment_id → [sumo_edge_id, ...] map used for congestion telemetry
+            "segment_edge_map": segment_edge_map,
         }
 
     def _extract_nodes_and_edges(
         self,
         segments: list[dict[str, Any]],
         polygon_coords: Optional[list[list[float]]] = None,
-    ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
-        """Extract clean node coordinates and directional edges from road segments."""
+    ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], dict[str, list[str]]]:
+        """
+        Extract clean node coordinates and directional edges from road segments.
+
+        Returns:
+            nodes: node_id → node attributes
+            edges: list of edge attribute dicts
+            segment_edge_map: segment_id → list of SUMO edge IDs for congestion analysis
+        """
         nodes: dict[str, dict[str, Any]] = {}
         edges: list[dict[str, Any]] = []
         coord_to_node: dict[tuple[float, float], str] = {}
+        segment_edge_map: dict[str, list[str]] = {}
 
         # If empty segments provided, construct corridor from polygon centroid or default
         if not segments:
@@ -150,8 +164,19 @@ class SumoNetworkBuilder:
             else:
                 segments = self._default_corridor_segments()
 
+        # Truncate to MAX_SEGMENTS with explicit warning
+        total_segments = len(segments)
+        if total_segments > MAX_SEGMENTS:
+            logger.warning(
+                "Segment count (%d) exceeds MAX_SEGMENTS (%d). "
+                "Truncating to first %d segments for SUMO network compilation. "
+                "Increase MAX_SEGMENTS in network_builder.py to process more roads.",
+                total_segments, MAX_SEGMENTS, MAX_SEGMENTS,
+            )
+            segments = segments[:MAX_SEGMENTS]
+
         # Build node coordinate registry
-        for idx, seg in enumerate(segments[:60]):  # Bounded to max 60 segments for responsive simulation
+        for idx, seg in enumerate(segments):
             geom = seg.get("geometry") or {}
             coords = geom.get("coordinates") or []
             if len(coords) < 2:
@@ -200,6 +225,10 @@ class SumoNetworkBuilder:
                 "name": seg.get("name") or "Road Segment",
             })
 
+            # Track mapping from Gativa segment_id → SUMO edge IDs for congestion analysis
+            seg_id = str(seg.get("segment_id") or f"edge_{idx}")
+            seg_edge_ids = [safe_edge_id]
+
             # If bidirectional, add reverse edge
             if not seg.get("is_oneway", False):
                 edges.append({
@@ -211,6 +240,9 @@ class SumoNetworkBuilder:
                     "shape": shape_str_rev,
                     "name": seg.get("name") or "Road Segment",
                 })
+                seg_edge_ids.append(f"{safe_edge_id}_rev")
+
+            segment_edge_map[seg_id] = seg_edge_ids
 
         # Mark high-degree junctions as traffic lights
         for n in nodes.values():
@@ -223,7 +255,7 @@ class SumoNetworkBuilder:
         if not any(n["type"] == "traffic_light" for n in nodes.values()) and nodes:
             list(nodes.values())[0]["type"] = "traffic_light"
 
-        return nodes, edges
+        return nodes, edges, segment_edge_map
 
     def _write_nodes_xml(self, file_path: Path, nodes: dict[str, dict[str, Any]]):
         root = ET.Element("nodes")

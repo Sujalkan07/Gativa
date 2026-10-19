@@ -66,6 +66,15 @@ def init_sqlite_db() -> None:
                 );
                 """
             )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS congestion_summaries (
+                    sim_id TEXT PRIMARY KEY,
+                    data TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                """
+            )
             conn.commit()
             _db_initialized = True
             logger.info("Initialized SQLite persistent store at %s", DB_PATH)
@@ -194,4 +203,34 @@ def get_osm_cache_sync(cache_key: str) -> Optional[tuple[str, dict[str, Any]]]:
         if row:
             metadata = json.loads(row["metadata"]) if row["metadata"] else {}
             return row["osm_xml"], metadata
+    return None
+
+
+def save_congestion_summary_sync(sim_id: str, data: dict[str, Any]) -> None:
+    """Persist a post-simulation congestion summary keyed by simulation ID."""
+    now = datetime.now(timezone.utc).isoformat()
+    json_data = json.dumps(data)
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO congestion_summaries (sim_id, data, created_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(sim_id) DO UPDATE SET
+                data = excluded.data,
+                created_at = excluded.created_at;
+            """,
+            (sim_id, json_data, now),
+        )
+        conn.commit()
+
+
+def get_congestion_summary_sync(sim_id: str) -> Optional[dict[str, Any]]:
+    """Retrieve a stored congestion summary by simulation ID."""
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT data FROM congestion_summaries WHERE sim_id = ?", (sim_id,))
+        row = cursor.fetchone()
+        if row:
+            return json.loads(row["data"])
     return None

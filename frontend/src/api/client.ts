@@ -7,6 +7,7 @@ import type {
   SimulationPrepareRequest,
   SimulationStatusResponse,
   ScenarioComparisonResult,
+  CongestionSummary,
   ApiError,
 } from '../types/api'
 
@@ -101,4 +102,7 @@ export const api = {
 
   getScenarioComparison: async (simId: string): Promise<ScenarioComparisonResult> =>
     handleRequest(client.get(`/api/simulations/${simId}/comparison`)),
+
+  getCongestionResults: async (simId: string): Promise<CongestionSummary> =>
+    handleRequest(client.get(`/api/simulations/${simId}/congestion`)),
 }

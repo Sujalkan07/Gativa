@@ -277,6 +277,7 @@ class TrafficLightState(BaseModel):
     lng: float
     state: str = "GGrr"
     is_green: bool = True
+    phase_duration: float = 30.0
     controlled_lanes: list[str] = []
     controlled_junctions: list[str] = []
 
@@ -334,5 +335,65 @@ class ScenarioComparisonResult(BaseModel):
     baseline_metrics: SimulationMetrics
     optimized_metrics: SimulationMetrics
     rows: list[ScenarioMetricRow]
+    methodology_notes: str
+
+
+# ─── Post-Simulation Congestion Analysis ──────────────────────────────────────
+
+CongestionSeverity = Literal[
+    "free_flow", "low", "moderate", "high", "severe", "insufficient_data"
+]
+DataQuality = Literal["measured", "estimated", "insufficient"]
+
+
+class EdgeTelemetrySample(BaseModel):
+    """A single telemetry observation snapshot for one SUMO edge at a simulation timestep."""
+    edge_id: str
+    timestamp: float
+    mean_speed_ms: float       # m/s from TraCI
+    vehicle_count: int
+    occupancy_pct: float       # % lane occupancy
+    halting_vehicles: int      # vehicles with speed < 0.1 m/s
+    waiting_time_s: float      # cumulative waiting time on edge (s)
+
+
+class CongestionRoadResult(BaseModel):
+    """Aggregated congestion measurement for one Gativa road segment after simulation."""
+    segment_id: str
+    sumo_edge_ids: list[str]           # SUMO edge IDs that map to this segment
+    road_name: str
+    road_type: str
+    geometry: Optional[dict] = None    # GeoJSON LineString geometry for map rendering
+    # Speed metrics
+    avg_speed_kmh: float
+    ref_speed_kmh: float               # reference from segment speed_limit_kmh
+    min_speed_kmh: float
+    # Occupancy / queue metrics
+    avg_occupancy_pct: float
+    peak_occupancy_pct: float
+    avg_halting: float
+    peak_halting: float
+    avg_waiting_s: float
+    # Congestion score and classification
+    congestion_score: float            # 0.0–1.0 normalized
+    severity: CongestionSeverity
+    congested_duration_s: float        # seconds when score > 0.6
+    congested_pct: float               # % of measurement window spent congested
+    sample_count: int
+    data_quality: DataQuality
+    engine_mode: str
+
+
+class CongestionSummary(BaseModel):
+    """Full congestion analysis summary produced at simulation completion."""
+    sim_id: str
+    analysis_id: str
+    engine_mode: str
+    completed_at: str
+    total_roads: int
+    roads_analyzed: int                # roads with sufficient data
+    roads_insufficient: int            # roads with < MIN_SAMPLES
+    top_congested: list[CongestionRoadResult]   # top-5 by congestion_score
+    all_results: list[CongestionRoadResult]
     methodology_notes: str
 

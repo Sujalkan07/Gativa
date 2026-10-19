@@ -11,7 +11,9 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+from app.core.sqlite_store import get_congestion_summary_sync, save_congestion_summary_sync
 from app.models.schemas import (
+    CongestionSummary,
     ScenarioComparisonResult,
     SimulationPrepareRequest,
     SimulationStatusResponse,
@@ -89,6 +91,8 @@ class SimulationService:
             netconvert_used=build_meta_opt["netconvert_used"],
             polygon_coords=polygon_coords,
         )
+        # Inject segment→edge mapping for congestion telemetry
+        opt_session._segment_edge_map = build_meta_opt.get("segment_edge_map", {})
 
         # 2. Baseline Session (Fixed-time uncoordinated control on identical topology)
         base_session = SimulationSession(
@@ -106,6 +110,7 @@ class SimulationService:
             netconvert_used=build_meta_base["netconvert_used"],
             polygon_coords=polygon_coords,
         )
+        base_session._segment_edge_map = build_meta_base.get("segment_edge_map", {})
 
         self._sessions[sim_id] = opt_session
         self._baseline_sessions[sim_id] = base_session
@@ -209,6 +214,40 @@ class SimulationService:
             ),
             step_count=session.step_count,
         )
+
+    def get_congestion_summary(self, sim_id: str) -> CongestionSummary:
+        """
+        Return the congestion analysis for a completed simulation.
+
+        Priority order:
+        1. Persisted result in SQLite (e.g. if session has been evicted)
+        2. Freshly computed from in-memory session telemetry
+        3. 404-equivalent KeyError if session not found at all
+        """
+        # 1. Try SQLite cache first (supports reload after restart)
+        cached = get_congestion_summary_sync(sim_id)
+        if cached:
+            return CongestionSummary(**cached)
+
+        # 2. Compute from live session
+        session = self._sessions.get(sim_id)
+        if not session:
+            raise KeyError(f"Simulation {sim_id} not found")
+
+        if session.state == "running":
+            # Return partial result (sim still running)
+            logger.info("Congestion summary requested while simulation %s is running; returning partial.", sim_id)
+
+        summary = session.compute_congestion_summary()
+
+        # 3. Persist if simulation is completed
+        if session.state == "completed":
+            try:
+                save_congestion_summary_sync(sim_id, summary.model_dump())
+            except Exception as e:
+                logger.warning("Failed to persist congestion summary for %s: %s", sim_id, e)
+
+        return summary
 
 
 # Global singleton instance
