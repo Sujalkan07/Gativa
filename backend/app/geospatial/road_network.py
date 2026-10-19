@@ -27,6 +27,8 @@ from app.models.schemas import (
     GeoJSONLineString,
     BottleneckCandidate,
     DataSourceCoverage,
+    JunctionControlType,
+    ControlProvenance,
 )
 
 logger = logging.getLogger(__name__)
@@ -153,6 +155,56 @@ def _get_lanes(data: dict) -> Optional[int]:
         return int(lanes)
     except (ValueError, TypeError):
         return None
+
+
+def _inspect_node_control(
+    node_data: dict,
+    incident_edge_data: Optional[dict] = None,
+) -> tuple[JunctionControlType, ControlProvenance]:
+    """
+    Determine junction control type and provenance from OSM node and edge attributes.
+    Preserves strict authenticity: a node is ONLY marked 'traffic_signal' if verified by
+    genuine OSM tags. High-degree junctions default to 'priority' with 'unknown' provenance.
+    """
+    hw = node_data.get("highway")
+    if isinstance(hw, list):
+        hw = hw[0]
+    crossing = node_data.get("crossing")
+    if isinstance(crossing, list):
+        crossing = crossing[0]
+    junction = node_data.get("junction")
+    if isinstance(junction, list):
+        junction = junction[0]
+
+    # 1. Verified traffic signals
+    if (
+        hw == "traffic_signals"
+        or crossing == "traffic_signals"
+        or str(node_data.get("traffic_signals", "")).lower() in ("yes", "signal", "traffic_signals")
+    ):
+        return "traffic_signal", "source_verified"
+
+    # 2. Stop signs
+    if hw == "stop":
+        return "stop", "source_verified"
+
+    # 3. Give way / Yield
+    if hw in ("give_way", "yield"):
+        return "yield", "source_verified"
+
+    # 4. Roundabouts
+    if hw == "mini_roundabout" or junction in ("roundabout", "circular"):
+        return "roundabout", "source_verified"
+
+    if incident_edge_data:
+        edge_junction = incident_edge_data.get("junction")
+        if isinstance(edge_junction, list):
+            edge_junction = edge_junction[0]
+        if edge_junction in ("roundabout", "circular"):
+            return "roundabout", "source_verified"
+
+    # 5. Default priority rules (unsignalized)
+    return "priority", "unknown"
 
 
 async def _discover_local_street_names(poly: Polygon) -> tuple[list[str], str]:
@@ -480,6 +532,9 @@ async def fetch_road_network(
                     else:
                         name = f"{loc_prefix} Sector Street"
 
+            u_ctrl, u_prov = _inspect_node_control(G.nodes[u] if u in G.nodes else {}, data)
+            v_ctrl, v_prov = _inspect_node_control(G.nodes[v] if v in G.nodes else {}, data)
+
             segments.append(RoadSegment(
                 segment_id=f"{u}_{v}_{key}",
                 name=name,
@@ -491,6 +546,10 @@ async def fetch_road_network(
                 is_oneway=is_oneway,
                 osm_highway=osm_highway_str,
                 osm_id=osm_id_str,
+                u_control=u_ctrl,
+                v_control=v_ctrl,
+                u_provenance=u_prov,
+                v_provenance=v_prov,
             ))
 
             class_counts[road_class] = class_counts.get(road_class, 0) + 1
@@ -498,7 +557,19 @@ async def fetch_road_network(
 
         total_length_km = round(total_length_m / 1000.0, 2)
 
-        # ─── Network metrics (Mathematically consistent) ─────────────────────
+        # ─── Network metrics (Authentic junction controls) ───────────────────
+        signalized_nodes = set()
+        unsignalized_nodes = set()
+        for n in G.nodes:
+            if G.degree(n) >= 2:
+                n_ctrl, _ = _inspect_node_control(G.nodes[n])
+                if n_ctrl == "traffic_signal":
+                    signalized_nodes.add(n)
+                else:
+                    unsignalized_nodes.add(n)
+
+        signalized_intersection_count = len(signalized_nodes)
+        unsignalized_intersection_count = len(unsignalized_nodes)
         intersection_count = sum(1 for n in G.nodes if G.degree(n) >= 3)
         bottlenecks = _detect_structural_bottlenecks(G, locality=locality)
 
@@ -517,6 +588,8 @@ async def fetch_road_network(
                 "Arterial": class_counts.get("arterial", 0),
                 "Local": class_counts.get("local", 0),
             },
+            signalized_intersection_count=signalized_intersection_count,
+            unsignalized_intersection_count=unsignalized_intersection_count,
         )
 
         coverage = DataSourceCoverage(

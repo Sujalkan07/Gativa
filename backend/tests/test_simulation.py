@@ -427,3 +427,51 @@ def test_routable_routes_generation():
             assert t.attrib["from"] in valid_ids
             assert t.attrib["to"] in valid_ids
 
+
+def test_step_speed_multipliers():
+    """Verify simulation steps accurately and efficiently across 1x, 2x, and 5x step multipliers."""
+    from fastapi.testclient import TestClient
+    from main import app
+
+    client = TestClient(app)
+    prep_resp = client.post(
+        "/api/simulations/prepare",
+        json={
+            "analysis_id": "test_speed_mult",
+            "duration_seconds": 600,
+            "demand_rate_veh_hr": 2500,
+            "strategy": "actuated_adaptive",
+        },
+    )
+    assert prep_resp.status_code == 201
+    sim_id = prep_resp.json()["sim_id"]
+
+    try:
+        # Start
+        start_resp = client.post(f"/api/simulations/{sim_id}/start")
+        assert start_resp.status_code == 200
+
+        # Step 1x (1 step)
+        s1 = client.post(f"/api/simulations/{sim_id}/step?steps=1").json()
+        assert s1["step"] == 1
+
+        # Step 2x (2 steps)
+        s2 = client.post(f"/api/simulations/{sim_id}/step?steps=2").json()
+        assert s2["step"] == 3
+
+        # Step 5x (5 steps)
+        s5 = client.post(f"/api/simulations/{sim_id}/step?steps=5").json()
+        assert s5["step"] == 8
+        assert s5["elapsed_seconds"] > 0
+        assert s5["state"] == "running"
+        assert len(s5["vehicles"]) > 0
+
+        # Verify post-simulation congestion results are available and valid
+        cong_resp = client.get(f"/api/simulations/{sim_id}/congestion")
+        assert cong_resp.status_code == 200
+        cong_data = cong_resp.json()
+        assert cong_data["total_roads"] >= 0
+        assert "all_results" in cong_data
+    finally:
+        client.post(f"/api/simulations/{sim_id}/stop")
+

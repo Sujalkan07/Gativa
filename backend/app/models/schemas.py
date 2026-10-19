@@ -58,11 +58,19 @@ class RoadNetworkMetrics(BaseModel):
     potential_bottleneck_count: int
     area_km2: float
     road_class_distribution: dict[str, int]
+    signalized_intersection_count: int = 0
+    unsignalized_intersection_count: int = 0
 
 
 # ─── Traffic ──────────────────────────────────────────────────────────────────
 
 CongestionLevel = Literal["free_flow", "moderate", "severe", "unknown"]
+JunctionControlType = Literal[
+    "traffic_signal", "stop", "yield", "priority", "uncontrolled", "roundabout", "unknown"
+]
+ControlProvenance = Literal[
+    "source_verified", "source_inferred", "simulation_assumption", "unknown"
+]
 
 
 class TrafficObservation(BaseModel):
@@ -88,6 +96,10 @@ class RoadSegment(BaseModel):
     osm_highway: Optional[str] = None
     osm_id: Optional[str] = None
     traffic: Optional[TrafficObservation] = None
+    u_control: Optional[JunctionControlType] = None
+    v_control: Optional[JunctionControlType] = None
+    u_provenance: Optional[ControlProvenance] = None
+    v_provenance: Optional[ControlProvenance] = None
 
 
 class TrafficIncident(BaseModel):
@@ -247,11 +259,22 @@ class ErrorResponse(BaseModel):
 # ─── SUMO Microscopic Traffic Simulation ──────────────────────────────────────
 
 SimulationState = Literal[
-    "preparing", "ready", "running", "paused", "completed", "failed", "cancelled"
+    "preparing",
+    "validating_network",
+    "generating_demand",
+    "starting_sumo",
+    "ready",
+    "running",
+    "paused",
+    "completed",
+    "failed",
+    "cancelled",
 ]
 SignalStrategy = Literal["fixed_time", "actuated_adaptive"]
 SimulationEngineMode = Literal["native_sumo", "fallback", "unavailable"]
 ComparisonStatus = Literal["pending", "insufficient_data", "completed", "failed"]
+DemandLevel = Literal["low", "normal", "high", "custom"]
+DemandProfile = Literal["peak", "uniform", "ramp_up", "morning_peak"]
 
 
 class SimulationPrepareRequest(BaseModel):
@@ -259,6 +282,12 @@ class SimulationPrepareRequest(BaseModel):
     duration_seconds: int = Field(default=600, ge=60, le=3600)
     demand_rate_veh_hr: int = Field(default=2840, ge=100, le=10000)
     strategy: SignalStrategy = "actuated_adaptive"
+    demand_level: Optional[DemandLevel] = "normal"
+    demand_profile: Optional[DemandProfile] = "peak"
+    vehicle_types: Optional[dict[str, float]] = None
+    manual_vehicle_count: Optional[int] = None
+    seed: Optional[int] = 42
+    demand_data_source: Optional[str] = None
 
 
 class VehiclePosition(BaseModel):
@@ -280,19 +309,34 @@ class TrafficLightState(BaseModel):
     phase_duration: float = 30.0
     controlled_lanes: list[str] = []
     controlled_junctions: list[str] = []
+    provenance: Optional[ControlProvenance] = "source_verified"
+    control_type: Optional[JunctionControlType] = "traffic_signal"
+    control_strategy: Optional[str] = "actuated_adaptive"
 
 
 class SimulationMetrics(BaseModel):
     avg_speed_kmh: float = 0.0
     avg_waiting_time_s: float = 0.0
     avg_queue_length_m: float = 0.0
+    max_queue_length_m: float = 0.0
+    avg_travel_time_s: float = 0.0
+    throughput_veh_hr: float = 0.0
     completed_vehicles: int = 0
     active_vehicles: int = 0
+    scheduled_vehicles: int = 0
+    inserted_vehicles: int = 0
+    waiting_to_enter_count: int = 0
+    failed_departures_count: int = 0
+    teleported_count: int = 0
+    collision_count: int = 0
     elapsed_seconds: float = 0.0
     total_duration_seconds: float = 600.0
     variance_speed_pct: Optional[float] = None
     variance_waiting_pct: Optional[float] = None
     variance_queue_pct: Optional[float] = None
+    variance_max_queue_pct: Optional[float] = None
+    variance_travel_time_pct: Optional[float] = None
+    variance_throughput_pct: Optional[float] = None
     variance_completed_pct: Optional[float] = None
 
 
@@ -313,6 +357,14 @@ class SimulationStatusResponse(BaseModel):
     current_metrics: SimulationMetrics = Field(default_factory=SimulationMetrics)
     vehicles: list[VehiclePosition] = []
     traffic_lights: list[TrafficLightState] = []
+    demand_level: Optional[str] = "normal"
+    demand_profile: Optional[str] = "peak"
+    demand_data_source: Optional[str] = "road_network_estimation"
+    demand_source_label: Optional[str] = None
+    scheduled_vehicles: int = 0
+    inserted_vehicles: int = 0
+    waiting_to_enter_count: int = 0
+    teleported_count: int = 0
     error_message: Optional[str] = None
 
 
@@ -335,7 +387,55 @@ class ScenarioComparisonResult(BaseModel):
     baseline_metrics: SimulationMetrics
     optimized_metrics: SimulationMetrics
     rows: list[ScenarioMetricRow]
+    extended_rows: list[ScenarioMetricRow] = Field(default_factory=list)
     methodology_notes: str
+
+
+
+# ─── Traffic Signal Inspection & Editing ──────────────────────────────────────
+
+class SignalMovementInfo(BaseModel):
+    link_index: int
+    from_lane: str
+    to_lane: str
+    direction: str
+    current_state: str
+
+
+class SignalDetailInfo(BaseModel):
+    id: str
+    lat: float
+    lng: float
+    junction_id: str
+    control_type: str  # "actuated_adaptive", "fixed_time", "unsignalized"
+    original_type: str
+    is_editable: bool = True
+    can_remove: bool = True
+    safety_assessment: str
+    connected_roads: list[str] = []
+    controlled_lanes: list[str] = []
+    movements: list[SignalMovementInfo] = []
+    provenance: str = "source_verified"
+    cycle_length_s: Optional[int] = 90
+
+
+
+class SignalListResponse(BaseModel):
+    sim_id: str
+    signals: list[SignalDetailInfo]
+    count: int
+
+
+class SignalEditRequest(BaseModel):
+    action: Literal["set_fixed_time", "set_adaptive", "remove_signal", "restore_original"]
+    parameters: Optional[dict[str, Any]] = None
+
+
+class SignalEditResponse(BaseModel):
+    success: bool
+    message: str
+    signal: Optional[SignalDetailInfo] = None
+    requires_recompile: bool = True
 
 
 # ─── Post-Simulation Congestion Analysis ──────────────────────────────────────

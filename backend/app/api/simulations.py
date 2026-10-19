@@ -10,6 +10,10 @@ from app.models.schemas import (
     CongestionSummary,
     ErrorResponse,
     ScenarioComparisonResult,
+    SignalDetailInfo,
+    SignalEditRequest,
+    SignalEditResponse,
+    SignalListResponse,
     SimulationPrepareRequest,
     SimulationStatusResponse,
 )
@@ -171,3 +175,69 @@ async def get_congestion_results(sim_id: str):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to compute congestion analysis: {str(e)}",
         )
+
+
+@router.get(
+    "/{sim_id}/baseline",
+    response_model=SimulationStatusResponse,
+    summary="Get current Baseline (Regular traffic) simulation status and vehicle positions",
+)
+async def get_baseline_status(sim_id: str):
+    try:
+        return simulation_service.get_baseline_status(sim_id)
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Baseline simulation for {sim_id} not found",
+        )
+
+
+@router.get(
+    "/{sim_id}/signals",
+    response_model=SignalListResponse,
+    summary="List all traffic signals and their current status for the simulation",
+)
+async def get_simulation_signals(sim_id: str):
+    try:
+        return simulation_service.get_signals(sim_id)
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Simulation {sim_id} not found",
+        )
+
+
+@router.post(
+    "/{sim_id}/signals/{tl_id}/edit",
+    response_model=SignalEditResponse,
+    summary="Inspect and edit a traffic signal in the Optimized scenario",
+)
+async def edit_simulation_signal(sim_id: str, tl_id: str, req: SignalEditRequest):
+    try:
+        return simulation_service.edit_signal(sim_id, tl_id, req)
+    except KeyError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        )
+
+
+@router.post(
+    "/{sim_id}/signals/reset",
+    response_model=SignalListResponse,
+    summary="Reset all traffic signals back to their original configuration",
+)
+async def reset_simulation_signals(sim_id: str):
+    try:
+        return simulation_service.reset_signals(sim_id)
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Simulation {sim_id} not found",
+        )
+

@@ -8,8 +8,12 @@ import type {
   SimulationStatusResponse,
   ScenarioComparisonResult,
   CongestionSummary,
+  SignalListResponse,
+  SignalEditRequest,
+  SignalEditResponse,
   ApiError,
 } from '../types/api'
+
 
 const BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
 
@@ -105,4 +109,21 @@ export const api = {
 
   getCongestionResults: async (simId: string): Promise<CongestionSummary> =>
     handleRequest(client.get(`/api/simulations/${simId}/congestion`)),
+
+  getBaselineStatus: async (simId: string): Promise<SimulationStatusResponse> =>
+    handleRequest(client.get(`/api/simulations/${simId}/baseline`)),
+
+  getSimulationSignals: async (simId: string): Promise<SignalListResponse> =>
+    handleRequest(client.get(`/api/simulations/${simId}/signals`)),
+
+  editSimulationSignal: async (
+    simId: string,
+    tlId: string,
+    request: SignalEditRequest
+  ): Promise<SignalEditResponse> =>
+    handleRequest(client.post(`/api/simulations/${simId}/signals/${tlId}/edit`, request)),
+
+  resetSimulationSignals: async (simId: string): Promise<SignalListResponse> =>
+    handleRequest(client.post(`/api/simulations/${simId}/signals/reset`)),
 }
+

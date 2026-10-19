@@ -28,6 +28,21 @@ export interface DataSourceCoverage {
   message: string | null
 }
 
+export type JunctionControlType =
+  | 'traffic_signal'
+  | 'stop'
+  | 'yield'
+  | 'priority'
+  | 'uncontrolled'
+  | 'roundabout'
+  | 'unknown'
+
+export type ControlProvenance =
+  | 'source_verified'
+  | 'source_inferred'
+  | 'simulation_assumption'
+  | 'unknown'
+
 export interface RoadSegment {
   segment_id: string
   name: string | null
@@ -40,6 +55,10 @@ export interface RoadSegment {
   osm_highway?: string | null
   osm_id?: string | null
   traffic?: TrafficObservation | null
+  u_control?: JunctionControlType | null
+  v_control?: JunctionControlType | null
+  u_provenance?: ControlProvenance | null
+  v_provenance?: ControlProvenance | null
 }
 
 export interface GeoJSONLineString {
@@ -81,6 +100,8 @@ export interface RoadNetworkMetrics {
   potential_bottleneck_count: number
   area_km2: number
   road_class_distribution: Record<string, number>
+  signalized_intersection_count?: number
+  unsignalized_intersection_count?: number
 }
 
 export interface WeatherContext {
@@ -207,12 +228,20 @@ export type SimulationState =
   | 'cancelled'
 
 export type SignalStrategy = 'fixed_time' | 'actuated_adaptive'
+export type DemandLevel = 'low' | 'normal' | 'high' | 'custom'
+export type DemandProfile = 'peak' | 'uniform' | 'ramp_up' | 'morning_peak'
 
 export interface SimulationPrepareRequest {
   analysis_id: string
   duration_seconds?: number
   demand_rate_veh_hr?: number
   strategy?: SignalStrategy
+  demand_level?: DemandLevel
+  demand_profile?: DemandProfile
+  vehicle_types?: Record<string, number>
+  manual_vehicle_count?: number
+  seed?: number
+  demand_data_source?: string
 }
 
 export interface VehiclePosition {
@@ -233,10 +262,21 @@ export interface SimulationMetrics {
   active_vehicles: number
   elapsed_seconds: number
   total_duration_seconds: number
+  avg_travel_time_s?: number
+  max_queue_length_m?: number
+  throughput_veh_hr?: number
+  scheduled_vehicles?: number
+  inserted_vehicles?: number
+  waiting_to_enter_count?: number
+  failed_departures_count?: number
+  teleported_count?: number
+  collision_count?: number
   variance_speed_pct?: number
   variance_waiting_pct?: number
   variance_queue_pct?: number
   variance_completed_pct?: number
+  variance_travel_time_pct?: number
+  variance_throughput_pct?: number
 }
 
 export type SimulationEngineMode = 'native_sumo' | 'fallback' | 'unavailable'
@@ -250,6 +290,8 @@ export interface TrafficLightState {
   is_green: boolean
   controlled_lanes?: string[]
   controlled_junctions?: string[]
+  provenance?: ControlProvenance
+  control_type?: JunctionControlType
 }
 
 export interface SimulationStatusResponse {
@@ -293,6 +335,54 @@ export interface ScenarioComparisonResult {
   rows: ScenarioMetricRow[]
   methodology_notes: string
 }
+
+// ─── Traffic Signal Inspection & Editing ──────────────────────────────────────
+
+export interface SignalMovementInfo {
+  link_index: number
+  from_lane: string
+  to_lane: string
+  direction: string
+  current_state: string
+}
+
+export interface SignalDetailInfo {
+  id: string
+  lat: number
+  lng: number
+  junction_id: string
+  control_type: string
+  original_type: string
+  is_editable: boolean
+  can_remove: boolean
+  safety_assessment: string
+  connected_roads: string[]
+  controlled_lanes: string[]
+  movements: SignalMovementInfo[]
+  provenance: string
+  cycle_length_s?: number
+}
+
+
+export interface SignalListResponse {
+  sim_id: string
+  signals: SignalDetailInfo[]
+  count: number
+}
+
+export interface SignalEditRequest {
+  action: 'set_fixed_time' | 'set_adaptive' | 'remove_signal' | 'restore_original'
+  parameters?: Record<string, unknown>
+}
+
+export interface SignalEditResponse {
+  success: boolean
+  message: string
+  signal?: SignalDetailInfo | null
+  requires_recompile: boolean
+}
+
+
 
 
 // ─── Post-Simulation Congestion Analysis ──────────────────────────────────────

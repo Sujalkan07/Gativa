@@ -32,11 +32,19 @@ class ScenarioComparator:
         baseline_strategy: str = "Baseline (Fixed-Time Signal Control)",
         optimized_strategy: str = "Optimized (Actuated Adaptive Signal Control)",
         step_count: int = 0,
+        signal_count: Optional[int] = None,
     ) -> ScenarioComparisonResult:
         """
         Produce side-by-side scenario comparison table with genuine empirical variance.
         Never synthesizes numbers or applies artificial scaling multipliers.
+        Accurately discloses unsignalized networks when signal_count == 0.
         """
+        if signal_count == 0:
+            if baseline_strategy == "Baseline (Fixed-Time Signal Control)":
+                baseline_strategy = "Baseline (Unsignalized Priority Control)"
+            if optimized_strategy == "Optimized (Actuated Adaptive Signal Control)":
+                optimized_strategy = "Intervention (Unsignalized Priority Control)"
+
         empty_metrics = SimulationMetrics(
             avg_speed_kmh=0.0,
             avg_waiting_time_s=0.0,
@@ -149,74 +157,114 @@ class ScenarioComparator:
             )
 
         # 3. Calculate genuine empirical variances
+        def calc_pct(opt_val: float, base_val: float) -> tuple[float, float]:
+            diff = opt_val - base_val
+            pct = (diff / base_val * 100.0) if base_val > 0 else 0.0
+            return round(diff, 2), round(pct, 1)
+
         # 1. Average Speed (Higher is better)
-        speed_diff = optimized_metrics.avg_speed_kmh - baseline_metrics.avg_speed_kmh
-        if baseline_metrics.avg_speed_kmh > 0:
-            speed_pct = (speed_diff / baseline_metrics.avg_speed_kmh) * 100.0
-        else:
-            speed_pct = 0.0
-        optimized_metrics.variance_speed_pct = round(speed_pct, 1)
+        speed_diff, speed_pct = calc_pct(optimized_metrics.avg_speed_kmh, baseline_metrics.avg_speed_kmh)
+        optimized_metrics.variance_speed_pct = speed_pct
 
         # 2. Average Waiting Time (Lower is better)
-        wait_diff = optimized_metrics.avg_waiting_time_s - baseline_metrics.avg_waiting_time_s
-        if baseline_metrics.avg_waiting_time_s > 0:
-            wait_pct = (wait_diff / baseline_metrics.avg_waiting_time_s) * 100.0
-        else:
-            wait_pct = 0.0
-        optimized_metrics.variance_waiting_pct = round(wait_pct, 1)
+        wait_diff, wait_pct = calc_pct(optimized_metrics.avg_waiting_time_s, baseline_metrics.avg_waiting_time_s)
+        optimized_metrics.variance_waiting_pct = wait_pct
 
         # 3. Average Queue Length (Lower is better)
-        queue_diff = optimized_metrics.avg_queue_length_m - baseline_metrics.avg_queue_length_m
-        if baseline_metrics.avg_queue_length_m > 0:
-            queue_pct = (queue_diff / baseline_metrics.avg_queue_length_m) * 100.0
-        else:
-            queue_pct = 0.0
-        optimized_metrics.variance_queue_pct = round(queue_pct, 1)
+        queue_diff, queue_pct = calc_pct(optimized_metrics.avg_queue_length_m, baseline_metrics.avg_queue_length_m)
+        optimized_metrics.variance_queue_pct = queue_pct
 
-        # 4. Completed Vehicles (Higher is better)
-        veh_diff = optimized_metrics.completed_vehicles - baseline_metrics.completed_vehicles
-        if baseline_metrics.completed_vehicles > 0:
-            veh_pct = (veh_diff / baseline_metrics.completed_vehicles) * 100.0
-        else:
-            veh_pct = 0.0
-        optimized_metrics.variance_completed_pct = round(veh_pct, 1)
+        # 4. Maximum Queue Length (Lower is better)
+        max_q_diff, max_q_pct = calc_pct(optimized_metrics.max_queue_length_m, baseline_metrics.max_queue_length_m)
+        optimized_metrics.variance_max_queue_pct = max_q_pct
 
-        rows = [
+        # 5. Average Travel Time (Lower is better)
+        tt_diff, tt_pct = calc_pct(optimized_metrics.avg_travel_time_s, baseline_metrics.avg_travel_time_s)
+        optimized_metrics.variance_travel_time_pct = tt_pct
+
+        # 6. Network Throughput (Higher is better)
+        tp_diff, tp_pct = calc_pct(optimized_metrics.throughput_veh_hr, baseline_metrics.throughput_veh_hr)
+        optimized_metrics.variance_throughput_pct = tp_pct
+
+        # 7. Completed Vehicles (Higher is better)
+        veh_diff, veh_pct = calc_pct(float(optimized_metrics.completed_vehicles), float(baseline_metrics.completed_vehicles))
+        optimized_metrics.variance_completed_pct = veh_pct
+
+        primary_rows = [
             ScenarioMetricRow(
                 metric="Average Speed",
                 baseline=f"{baseline_metrics.avg_speed_kmh:.1f} km/h",
                 optimized=f"{optimized_metrics.avg_speed_kmh:.1f} km/h",
-                variance=f"↑ +{speed_pct:.1f}%" if speed_pct >= 0 else f"↓ {speed_pct:.1f}%",
+                variance=f"↑ +{speed_pct:.1f}% ({speed_diff:+.1f} km/h)" if speed_pct >= 0 else f"↓ {speed_pct:.1f}% ({speed_diff:+.1f} km/h)",
                 is_improvement=speed_pct >= 0,
             ),
             ScenarioMetricRow(
                 metric="Average Waiting Time",
                 baseline=f"{baseline_metrics.avg_waiting_time_s:.1f} s/veh",
                 optimized=f"{optimized_metrics.avg_waiting_time_s:.1f} s/veh",
-                variance=f"↓ {wait_pct:.1f}% delay" if wait_pct < 0 else f"↑ +{wait_pct:.1f}% delay",
+                variance=f"↓ {wait_pct:.1f}% delay ({wait_diff:+.1f}s)" if wait_pct <= 0 else f"↑ +{wait_pct:.1f}% delay ({wait_diff:+.1f}s, regression)",
                 is_improvement=wait_pct <= 0,
             ),
             ScenarioMetricRow(
                 metric="Average Queue Length",
                 baseline=f"{baseline_metrics.avg_queue_length_m:.1f} m",
                 optimized=f"{optimized_metrics.avg_queue_length_m:.1f} m",
-                variance=f"↓ {queue_pct:.1f}% spillback" if queue_pct < 0 else f"↑ +{queue_pct:.1f}%",
+                variance=f"↓ {queue_pct:.1f}% queue ({queue_diff:+.1f}m)" if queue_pct <= 0 else f"↑ +{queue_pct:.1f}% queue ({queue_diff:+.1f}m, regression)",
                 is_improvement=queue_pct <= 0,
             ),
             ScenarioMetricRow(
                 metric="Completed Vehicles",
                 baseline=f"{baseline_metrics.completed_vehicles} vehs",
                 optimized=f"{optimized_metrics.completed_vehicles} vehs",
-                variance=f"↑ +{veh_pct:.1f}% throughput" if veh_pct >= 0 else f"↓ {veh_pct:.1f}%",
+                variance=f"↑ +{veh_pct:.1f}% ({int(veh_diff):+d} vehs)" if veh_pct >= 0 else f"↓ {veh_pct:.1f}% ({int(veh_diff):+d} vehs)",
                 is_improvement=veh_pct >= 0,
             ),
         ]
 
-        notes = (
-            f"Empirical evaluation under {engine_mode} engine over {optimized_metrics.elapsed_seconds:.1f}s elapsed "
-            f"(seed 42, {step_count} simulation steps). "
-            f"Baseline: Fixed-Time vs Optimized: Actuated Adaptive."
-        )
+        extended_rows = [
+            ScenarioMetricRow(
+                metric="Maximum Queue Length",
+                baseline=f"{baseline_metrics.max_queue_length_m:.1f} m",
+                optimized=f"{optimized_metrics.max_queue_length_m:.1f} m",
+                variance=f"↓ {abs(max_q_pct):.1f}% peak ({max_q_diff:+.1f}m)" if max_q_pct <= 0 else f"↑ +{max_q_pct:.1f}% peak ({max_q_diff:+.1f}m)",
+                is_improvement=max_q_pct <= 0,
+            ),
+            ScenarioMetricRow(
+                metric="Average Travel Time",
+                baseline=f"{baseline_metrics.avg_travel_time_s:.1f} s",
+                optimized=f"{optimized_metrics.avg_travel_time_s:.1f} s",
+                variance=f"↓ {abs(tt_pct):.1f}% travel ({tt_diff:+.1f}s)" if tt_pct <= 0 else f"↑ +{tt_pct:.1f}% travel ({tt_diff:+.1f}s)",
+                is_improvement=tt_pct <= 0,
+            ),
+            ScenarioMetricRow(
+                metric="Network Throughput",
+                baseline=f"{baseline_metrics.throughput_veh_hr:.0f} veh/h",
+                optimized=f"{optimized_metrics.throughput_veh_hr:.0f} veh/h",
+                variance=f"↑ +{tp_pct:.1f}% flow ({tp_diff:+.0f} veh/h)" if tp_pct >= 0 else f"↓ {tp_pct:.1f}% flow ({tp_diff:+.0f} veh/h)",
+                is_improvement=tp_pct >= 0,
+            ),
+            ScenarioMetricRow(
+                metric="Teleported Vehicles",
+                baseline=f"{baseline_metrics.teleported_count} vehs",
+                optimized=f"{optimized_metrics.teleported_count} vehs",
+                variance="No gridlock" if (baseline_metrics.teleported_count == 0 and optimized_metrics.teleported_count == 0) else f"{optimized_metrics.teleported_count - baseline_metrics.teleported_count:+d} vehs",
+                is_improvement=optimized_metrics.teleported_count <= baseline_metrics.teleported_count,
+            ),
+        ]
+
+        if signal_count == 0:
+            notes = (
+                f"Empirical evaluation under {engine_mode} engine over {optimized_metrics.elapsed_seconds:.1f}s elapsed "
+                f"(seed 42, {step_count} simulation steps). "
+                f"Network contains 0 traffic signal controllers. All junctions operate under standard priority right-of-way rules. "
+                f"Actuated signal timing is not applicable to unsignalized intersections."
+            )
+        else:
+            notes = (
+                f"Empirical evaluation under {engine_mode} engine over {optimized_metrics.elapsed_seconds:.1f}s elapsed "
+                f"(seed 42, {step_count} simulation steps). "
+                f"Baseline: Fixed-Time vs Optimized: Actuated Adaptive."
+            )
 
         return ScenarioComparisonResult(
             sim_id=sim_id,
@@ -228,6 +276,8 @@ class ScenarioComparator:
             optimized_strategy=optimized_strategy,
             baseline_metrics=baseline_metrics,
             optimized_metrics=optimized_metrics,
-            rows=rows,
+            rows=primary_rows,
+            extended_rows=extended_rows,
             methodology_notes=notes,
         )
+
