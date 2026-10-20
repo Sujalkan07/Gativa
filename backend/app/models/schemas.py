@@ -216,6 +216,8 @@ class AnalysisResult(BaseModel):
 
 # ─── Recommendations ──────────────────────────────────────────────────────────
 
+RecommendationCategory = Literal["traffic_optimization", "infrastructure_planning"]
+
 InterventionType = Literal[
     "signal_optimization",
     "roundabout",
@@ -225,6 +227,10 @@ InterventionType = Literal[
     "flyover",
     "underpass",
     "geometry_improvement",
+    "road_median",
+    "signal_installation",
+    "junction_redesign",
+    "dedicated_turning_lane",
     "other",
 ]
 RecommendationPriority = Literal["high", "medium", "low"]
@@ -238,6 +244,7 @@ class Recommendation(BaseModel):
     description: str
     priority: RecommendationPriority
     impact_score: float = Field(ge=0, le=10)
+    category: RecommendationCategory = "traffic_optimization"
     affected_location: Optional[str] = None
     affected_segment_ids: list[str] = []
     lat: Optional[float] = None

@@ -269,6 +269,7 @@ async def run_analysis(polygon: GeoJSONPolygon) -> AnalysisResult:
         traffic_by_segment=traffic_by_segment,
         metrics=road_metrics,
         weather=weather,
+        segments=segments,
     )
 
     # ─── Compose final result ─────────────────────────────────────────────────

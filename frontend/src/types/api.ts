@@ -173,6 +173,7 @@ export interface TrafficIncident {
 
 // ─── Recommendations ──────────────────────────────────────────────────────────
 
+export type RecommendationCategory = 'traffic_optimization' | 'infrastructure_planning'
 export type RecommendationPriority = 'high' | 'medium' | 'low'
 export type InterventionType =
   | 'signal_optimization'
@@ -183,6 +184,10 @@ export type InterventionType =
   | 'flyover'
   | 'underpass'
   | 'geometry_improvement'
+  | 'road_median'
+  | 'signal_installation'
+  | 'junction_redesign'
+  | 'dedicated_turning_lane'
   | 'other'
 
 export interface Recommendation {
@@ -192,6 +197,7 @@ export interface Recommendation {
   description: string
   priority: RecommendationPriority
   impact_score: number
+  category?: RecommendationCategory
   affected_location: string | null
   affected_segment_ids: string[]
   lat: number | null

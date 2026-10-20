@@ -397,7 +397,13 @@ export default function AnalysisMap({
     recommendations.forEach((rec, idx) => {
       if (!rec.lat || !rec.lng) return
 
-      const label = `S#${idx + 1}`
+      const isInfra = rec.category === 'infrastructure_planning'
+      const label = isInfra ? `I#${idx + 1}` : `S#${idx + 1}`
+      const pinBg = isInfra ? '#c2410c' : '#006a6a'
+      const haloColor = isInfra ? 'rgba(194, 65, 12, 0.3)' : 'rgba(0, 106, 106, 0.3)'
+      const categoryBadge = isInfra
+        ? '<span class="px-1.5 py-0.5 rounded text-[9px] font-bold uppercase bg-[#ffedd5] text-[#9a3412]">Infrastructure</span>'
+        : '<span class="px-1.5 py-0.5 rounded text-[9px] font-bold uppercase bg-[#ccfbf1] text-[#115e59]">Traffic Opt</span>'
 
       // Check if there is a bottleneck at the exact same location
       const hasCoLocatedProblem = bottlenecks.some(
@@ -414,8 +420,8 @@ export default function AnalysisMap({
         popupAnchor: [0, -16],
         html: `
           <div class="relative w-8 h-8 flex items-center justify-center cursor-pointer group">
-            <span class="absolute w-7 h-7 rounded-full bg-[#006a6a]/30"></span>
-            <div class="relative w-7 h-7 rounded-full flex items-center justify-center shadow-lg border-2 border-white font-mono text-[10px] font-bold text-white bg-[#006a6a] transition-transform transform group-hover:scale-110">
+            <span class="absolute w-7 h-7 rounded-full" style="background-color: ${haloColor};"></span>
+            <div class="relative w-7 h-7 rounded-full flex items-center justify-center shadow-lg border-2 border-white font-mono text-[10px] font-bold text-white transition-transform transform group-hover:scale-110" style="background-color: ${pinBg};">
               ${label}
             </div>
           </div>
@@ -426,14 +432,22 @@ export default function AnalysisMap({
 
       const locationLabel = rec.affected_location || 'Corridor Intervention'
 
+      const priorityBadgeClass =
+        rec.priority === 'high'
+          ? 'bg-[#fee2e2] text-[#991b1b]'
+          : rec.priority === 'medium'
+          ? 'bg-[#fef3c7] text-[#92400e]'
+          : 'bg-[#f1f5f9] text-[#475569]'
+
       const popupHtml = `
-        <div class="font-sans p-1 text-xs max-w-[280px]">
+        <div class="font-sans p-1 text-xs max-w-[290px]">
           <div class="flex items-center justify-between gap-2 border-b border-[#e2e8f0] pb-1.5 mb-2">
             <div class="flex items-center gap-1.5">
-              <span class="w-2.5 h-2.5 rounded-full bg-[#006a6a]"></span>
-              <span class="font-bold text-[#006a6a] text-xs uppercase tracking-tight">Solution ${label}</span>
+              <span class="w-2.5 h-2.5 rounded-full" style="background-color: ${pinBg};"></span>
+              <span class="font-bold text-xs uppercase tracking-tight" style="color: ${pinBg};">${label}</span>
+              ${categoryBadge}
             </div>
-            <span class="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase bg-[#cce8e8] text-[#004f4f]">${rec.priority} Priority</span>
+            <span class="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase ${priorityBadgeClass}">${rec.priority} Priority</span>
           </div>
 
           <p class="font-bold text-[#0b1c30] text-sm leading-snug mb-1">${rec.title}</p>
@@ -448,7 +462,7 @@ export default function AnalysisMap({
           </div>
 
           <div class="flex items-center justify-between text-[10px] text-[#64748b] bg-[#f8fafc] p-1.5 rounded">
-            <span>Intervention: <strong>${rec.intervention_type.replace('_', ' ')}</strong></span>
+            <span>Intervention: <strong>${rec.intervention_type.replace(/_/g, ' ')}</strong></span>
             <span>Confidence: <strong>${rec.confidence}</strong></span>
           </div>
         </div>
@@ -535,9 +549,23 @@ export default function AnalysisMap({
               <span className="w-2 h-2 rounded-full bg-[#ba1a1a]"></span> Problems ({bottlenecks.length})
             </span>
             {recommendations.length > 0 && (
-              <span className="flex items-center gap-1 text-[11px] text-[#006a6a] font-semibold">
-                <span className="w-2 h-2 rounded-full bg-[#006a6a]"></span> Solutions ({recommendations.length})
-              </span>
+              <>
+                <span className="flex items-center gap-1 text-[11px] text-[#006a6a] font-semibold">
+                  <span className="w-2 h-2 rounded-full bg-[#006a6a]"></span> Operations (
+                  {
+                    recommendations.filter(
+                      (r) => (r.category ?? 'traffic_optimization') === 'traffic_optimization'
+                    ).length
+                  }
+                  )
+                </span>
+                {recommendations.some((r) => r.category === 'infrastructure_planning') && (
+                  <span className="flex items-center gap-1 text-[11px] text-[#c2410c] font-semibold">
+                    <span className="w-2 h-2 rounded-full bg-[#c2410c]"></span> Infrastructure (
+                    {recommendations.filter((r) => r.category === 'infrastructure_planning').length})
+                  </span>
+                )}
+              </>
             )}
           </div>
         </div>
