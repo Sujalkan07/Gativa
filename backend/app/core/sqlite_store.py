@@ -76,6 +76,17 @@ def init_sqlite_db() -> None:
                 );
                 """
             )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS signal_candidates (
+                    analysis_id TEXT NOT NULL,
+                    candidate_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (analysis_id, candidate_id)
+                );
+                """
+            )
             conn.commit()
             _db_initialized = True
             _db_init_error = None
@@ -259,3 +270,47 @@ def get_congestion_summary_sync(sim_id: str) -> Optional[dict[str, Any]]:
         if row:
             return json.loads(row["data"])
     return None
+
+
+def save_candidate_decision_sync(analysis_id: str, candidate_id: str, status: str) -> None:
+    """Save or update user approval decision for a signal placement candidate."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO signal_candidates (analysis_id, candidate_id, status, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(analysis_id, candidate_id) DO UPDATE SET
+                status = excluded.status,
+                updated_at = excluded.updated_at;
+            """,
+            (analysis_id, candidate_id, status, now),
+        )
+        conn.commit()
+
+
+def get_candidate_decisions_sync(analysis_id: str) -> dict[str, str]:
+    """Retrieve all candidate decisions (candidate_id -> status) for an analysis."""
+    decisions: dict[str, str] = {}
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT candidate_id, status FROM signal_candidates WHERE analysis_id = ?",
+            (analysis_id,),
+        )
+        for row in cursor.fetchall():
+            decisions[row["candidate_id"]] = row["status"]
+    return decisions
+
+
+def reset_candidate_decisions_sync(analysis_id: str) -> None:
+    """Reset all candidate decisions for an analysis back to default."""
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM signal_candidates WHERE analysis_id = ?",
+            (analysis_id,),
+        )
+        conn.commit()
+

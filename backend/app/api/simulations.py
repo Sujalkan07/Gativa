@@ -7,9 +7,11 @@ import logging
 from fastapi import APIRouter, HTTPException, Query, status
 
 from app.models.schemas import (
+    CandidateDecisionRequest,
     CongestionSummary,
     ErrorResponse,
     ScenarioComparisonResult,
+    SignalCandidateListResponse,
     SignalDetailInfo,
     SignalEditRequest,
     SignalEditResponse,
@@ -17,7 +19,14 @@ from app.models.schemas import (
     SimulationPrepareRequest,
     SimulationStatusResponse,
 )
+from app.services.analysis import get_analysis_by_id
 from app.simulation.service import simulation_service
+from app.simulation.signal_candidates import (
+    approve_all_eligible_candidates,
+    get_signal_candidates_response,
+    reset_candidates,
+    update_candidate_decision,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -252,4 +261,69 @@ async def reset_simulation_signals(sim_id: str):
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Simulation {sim_id} not found",
         )
+
+
+@router.get(
+    "/{analysis_id}/signal-candidates",
+    response_model=SignalCandidateListResponse,
+    summary="List evidence-backed candidate junctions for traffic signal placement review",
+)
+async def list_signal_candidates(analysis_id: str):
+    analysis = await get_analysis_by_id(analysis_id)
+    if not analysis:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Analysis '{analysis_id}' not found",
+        )
+    return get_signal_candidates_response(analysis)
+
+
+@router.post(
+    "/{analysis_id}/signal-candidates/{candidate_id}/decision",
+    summary="Record user approval or rejection decision for a traffic signal candidate",
+)
+async def record_candidate_decision(
+    analysis_id: str,
+    candidate_id: str,
+    req: CandidateDecisionRequest,
+):
+    analysis = await get_analysis_by_id(analysis_id)
+    if not analysis:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Analysis '{analysis_id}' not found",
+        )
+    dec = req.get_decision()
+    update_candidate_decision(analysis_id, candidate_id, dec)
+    return {"status": "ok", "candidate_id": candidate_id, "decision": dec}
+
+
+@router.post(
+    "/{analysis_id}/signal-candidates/approve-all",
+    summary="Approve all eligible candidate junctions for traffic signal placement",
+)
+async def approve_all_candidates_route(analysis_id: str):
+    analysis = await get_analysis_by_id(analysis_id)
+    if not analysis:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Analysis '{analysis_id}' not found",
+        )
+    count = approve_all_eligible_candidates(analysis)
+    return {"message": f"Approved {count} eligible signal candidates", "approved_count": count}
+
+
+@router.post(
+    "/{analysis_id}/signal-candidates/reset",
+    summary="Reset all candidate signal decisions back to pending",
+)
+async def reset_candidates_route(analysis_id: str):
+    analysis = await get_analysis_by_id(analysis_id)
+    if not analysis:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Analysis '{analysis_id}' not found",
+        )
+    reset_candidates(analysis_id)
+    return {"message": f"Reset candidate decisions for analysis '{analysis_id}'", "approved_count": 0}
 

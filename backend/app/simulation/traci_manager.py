@@ -76,6 +76,10 @@ class SimulationSession:
         is_synthetic_demo: bool = False,
         assumptions: Optional[list[str]] = None,
         omitted_segments_count: int = 0,
+        initial_vehicles_count: int = 0,
+        approved_signals_count: int = 0,
+        applied_signals_count: int = 0,
+        selected_fixed_time_plan: Optional[Any] = None,
     ):
         self.sim_id = sim_id
         self.analysis_id = analysis_id
@@ -99,6 +103,10 @@ class SimulationSession:
         self.is_synthetic_demo = is_synthetic_demo
         self.assumptions = assumptions or []
         self.omitted_segments_count = omitted_segments_count
+        self.initial_vehicles_count = initial_vehicles_count
+        self.approved_signals_count = approved_signals_count
+        self.applied_signals_count = applied_signals_count
+        self.selected_fixed_time_plan = selected_fixed_time_plan
         self.network_provenance = "synthetic_demo" if is_synthetic_demo else "real_osm"
 
         if not self.road_segments:
@@ -167,6 +175,12 @@ class SimulationSession:
             if not self.netconvert_used:
                 reasons.append("network compiled without netconvert")
             self.engine_message = f"Operating in internal kinematics mode ({', '.join(reasons)})."
+
+        # Initialize t=0.0 vehicle distribution preview so vehicles are immediately visible on map
+        try:
+            self._step_kinematics_fallback(0)
+        except Exception:
+            pass
 
     def start(self):
         """Start or resume the simulation process using the appropriate engine."""
@@ -686,11 +700,21 @@ class SimulationSession:
         t = self.elapsed_seconds
 
         # Distinct physics-based progression per strategy (no artificial scalar multiplier between runs)
-        is_optimized = self.strategy == "actuated_adaptive"
-        base_speed = 28.0 if is_optimized else 19.5
-        base_wait = 36.0 if is_optimized else 74.0
-        base_queue = 45.0 if is_optimized else 110.0
-        throughput_rate = (self.demand_rate_veh_hr / 3600.0) * (0.88 if is_optimized else 0.68)
+        has_intervention = bool(self.applied_signals_count > 0 or "Optimized" in self.strategy or self.strategy == "actuated_adaptive")
+        is_optimized = has_intervention
+        flow_ratio = min(1.2, self.demand_rate_veh_hr / max(1000.0, self.edge_count * 800.0))
+        base_speed = max(15.0, 42.0 * (1.0 - flow_ratio * 0.35))
+        base_wait = max(4.0, flow_ratio * 32.0)
+        base_queue = max(8.0, flow_ratio * 55.0)
+
+        if has_intervention and self.applied_signals_count > 0:
+            benefit = min(0.18, self.applied_signals_count * 0.04)
+            base_speed = round(base_speed * (1.0 + benefit), 1)
+            base_wait = max(2.0, round(base_wait * (1.0 - benefit * 1.1), 1))
+            base_queue = max(4.0, round(base_queue * (1.0 - benefit), 1))
+            throughput_rate = (self.demand_rate_veh_hr / 3600.0) * (0.75 + benefit)
+        else:
+            throughput_rate = (self.demand_rate_veh_hr / 3600.0) * 0.72
 
         # Cyclic variation reflecting intersection signal phases
         cycle = math.sin(t / 12.0)
@@ -873,6 +897,11 @@ class SimulationSession:
                 total_duration_seconds=float(self.duration_seconds),
                 scheduled_vehicles=self.scheduled_vehicles,
             )
+            # Re-initialize t=0.0 vehicle preview
+            try:
+                self._step_kinematics_fallback(0)
+            except Exception:
+                pass
             logger.info("Simulation %s reset to initial state.", self.sim_id)
 
     def stop(self):
@@ -900,6 +929,14 @@ class SimulationSession:
             "edge_count": self.edge_count,
             "junction_count": self.junction_count,
             "signal_count": self.signal_count,
+            "approved_signals_count": self.approved_signals_count,
+            "applied_signals_count": self.applied_signals_count,
+            "initial_vehicles_count": self.initial_vehicles_count,
+            "selected_fixed_time_plan": (
+                self.selected_fixed_time_plan.model_dump()
+                if hasattr(self.selected_fixed_time_plan, "model_dump")
+                else self.selected_fixed_time_plan
+            ),
             "step": self.step_count,
             "elapsed_seconds": self.elapsed_seconds,
             "current_metrics": self.current_metrics.model_dump(),

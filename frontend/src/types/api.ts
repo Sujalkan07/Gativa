@@ -250,6 +250,8 @@ export interface SimulationPrepareRequest {
   manual_vehicle_count?: number
   seed?: number
   demand_data_source?: string
+  approved_candidate_ids?: string[]
+  initial_population?: number
 }
 
 export interface VehiclePosition {
@@ -310,7 +312,7 @@ export interface SimulationStatusResponse {
   engine_message?: string | null
   duration_seconds: number
   demand_rate_veh_hr: number
-  strategy: SignalStrategy
+  strategy: SignalStrategy | string
   edge_count: number
   junction_count: number
   signal_count: number
@@ -324,6 +326,10 @@ export interface SimulationStatusResponse {
   assumptions?: string[]
   segments_simulated?: number
   omitted_segments_count?: number
+  approved_signals_count?: number
+  applied_signals_count?: number
+  initial_vehicles_count?: number
+  selected_fixed_time_plan?: TimingPlanEvaluation | null
 }
 
 export interface ScenarioMetricRow {
@@ -347,6 +353,73 @@ export interface ScenarioComparisonResult {
   rows: ScenarioMetricRow[]
   extended_rows?: ScenarioMetricRow[]
   methodology_notes: string
+  approved_signals_count?: number
+  applied_signals_count?: number
+  initial_vehicles_count?: number
+  fixed_time_plan_summary?: string | null
+  selected_fixed_time_plan?: TimingPlanEvaluation | null
+}
+
+// ─── Traffic Signal Candidates & User Approval ────────────────────────────────
+
+export type CandidateStatus = 'pending' | 'approved' | 'rejected' | 'ineligible' | 'applied' | 'failed'
+
+export interface SignalCandidate {
+  candidate_id: string
+  analysis_id: string
+  junction_id: string
+  lat: number
+  lng: number
+  name: string
+  degree: number
+  approach_roads: string[]
+  current_control: string
+  is_eligible: boolean
+  priority_score: number
+  reason: string
+  evidence: string[]
+  evidence_source: string
+  confidence: 'high' | 'medium' | 'low'
+  uncertainty_notes?: string | null
+  status: CandidateStatus
+  validation_error?: string | null
+}
+
+export interface SignalCandidateListResponse {
+  analysis_id: string
+  candidates: SignalCandidate[]
+  total_candidates: number
+  approved_count: number
+  rejected_count: number
+  pending_count: number
+  eligible_count: number
+}
+
+export interface CandidateDecisionRequest {
+  status?: 'approved' | 'rejected' | 'pending'
+  decision?: 'approved' | 'rejected' | 'pending'
+}
+
+export interface TimingPlanEvaluation {
+  plan_id: string
+  cycle_length_s: number
+  name: string
+  description: string
+  objective_score: number
+  avg_waiting_time_s: number
+  avg_speed_kmh: number
+  throughput_veh_hr: number
+  is_selected: boolean
+  validation_passed: boolean
+}
+
+export interface FixedTimeOptimizationResult {
+  signal_id: string
+  evaluated_plans: TimingPlanEvaluation[]
+  selected_plan_id?: string | null
+  selected_cycle_length_s?: number | null
+  validation_passed: boolean
+  notes: string
 }
 
 // ─── Traffic Signal Inspection & Editing ──────────────────────────────────────

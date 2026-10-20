@@ -66,6 +66,8 @@ class SumoNetworkBuilder:
         manual_vehicle_count: Optional[int] = None,
         live_observations: Optional[list[dict[str, Any]]] = None,
         allow_synthetic: bool = False,
+        approved_signal_junctions: Optional[set[str]] = None,
+        initial_population: Optional[int] = None,
     ) -> dict[str, Any]:
         """
         Create complete SUMO simulation directory:
@@ -83,7 +85,10 @@ class SumoNetworkBuilder:
 
         # 1. Process Nodes and Edges
         nodes, edges, segment_edge_map, edge_segment_map, assumptions = self._extract_nodes_and_edges(
-            segments, polygon_coords, allow_synthetic=allow_synthetic
+            segments,
+            polygon_coords,
+            allow_synthetic=allow_synthetic,
+            approved_signal_junctions=approved_signal_junctions,
         )
         self._write_nodes_xml(nod_file, nodes)
         self._write_edges_xml(edg_file, edges)
@@ -139,7 +144,7 @@ class SumoNetworkBuilder:
         )
 
         # 4. Write Vehicle Demand (Routes) using boundary entry/exit through-trips
-        scheduled_count = self._write_routes_xml(
+        scheduled_count, init_count = self._write_routes_xml(
             file_path=rou_file,
             nodes=nodes,
             edges=edges,
@@ -150,6 +155,7 @@ class SumoNetworkBuilder:
             demand_profile=demand_profile or "peak",
             vehicle_types=vehicle_types,
             target_vehicle_count=total_veh_target,
+            initial_population=initial_population,
         )
 
         # 5. Write SUMO Configuration with dynamic rerouting support
@@ -172,6 +178,7 @@ class SumoNetworkBuilder:
             "demand_data_source": demand_source,
             "demand_source_label": demand_label,
             "scheduled_vehicles": scheduled_count,
+            "initial_vehicles_count": init_count,
             "nodes": nodes,
             "edges": edges,
             # segment_id → [sumo_edge_id, ...] map used for congestion telemetry
@@ -190,6 +197,7 @@ class SumoNetworkBuilder:
         segments: list[dict[str, Any]],
         polygon_coords: Optional[list[list[float]]] = None,
         allow_synthetic: bool = False,
+        approved_signal_junctions: Optional[set[str]] = None,
     ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], dict[str, list[str]], dict[str, str], list[str]]:
         """
         Extract clean node coordinates and directional edges from road segments.
@@ -394,6 +402,28 @@ class SumoNetworkBuilder:
 
             segment_edge_map[raw_seg_id] = seg_edge_ids
 
+        # Apply user-approved candidate signals if supplied (Optimized Scenario)
+        if approved_signal_junctions:
+            applied_count = 0
+            for n_id, n_data in nodes.items():
+                # Match by exact node_id, cand_node_id, or OSM ID variations
+                is_match = (
+                    n_id in approved_signal_junctions
+                    or f"cand_{n_id}" in approved_signal_junctions
+                )
+                if not is_match and n_id.startswith("node_"):
+                    raw_id = n_id[5:]
+                    if raw_id in approved_signal_junctions or f"cand_{raw_id}" in approved_signal_junctions:
+                        is_match = True
+
+                if is_match:
+                    n_data["type"] = "traffic_light"
+                    n_data["control"] = "traffic_signal"
+                    n_data["provenance"] = "user_approved_candidate"
+                    applied_count += 1
+            if applied_count > 0:
+                assumptions.append(f"user_approved_{applied_count}_signals_applied")
+
         # Authenticity rule: Never classify junctions based on degree >= 3 or force a traffic light.
         # Zero-signal networks compile cleanly with priority rules.
         return nodes, edges, segment_edge_map, edge_segment_map, assumptions
@@ -578,14 +608,16 @@ class SumoNetworkBuilder:
         demand_profile: str = "peak",
         vehicle_types: Optional[dict[str, float]] = None,
         target_vehicle_count: Optional[int] = None,
-    ) -> int:
+        initial_population: Optional[int] = None,
+    ) -> tuple[int, int]:
         """
-        Generate trip demand with realistic through-routing:
-        - Boundary entry to boundary exit through-trips prioritized
-        - Internal origin/destination trips included for realistic balance
-        - Immediate departures for initial vehicles so simulation has traffic from step 1
-        - Gradual departure scheduling following configured profile (no simultaneous bursts)
-        - Vehicle type mix (passenger cars, buses)
+        Generate realistic trip demand with spatially distributed initial vehicle population:
+        - Initial population placed across distinct interior/approach road segments at depart="0.0"
+          with departPos="random", departSpeed="avg", departLane="best" (natural network distribution).
+        - Scheduled demand departures distributed across simulation duration according to profile
+          with minimum headway enforcement (>= 2.5s) per entry edge to prevent entry pileups.
+        - Boundary entry to exit through-trips prioritized (75%) with internal trips (25%).
+        - Calibrated vehicle type mix (passenger cars, buses).
         """
         import random
         import networkx as nx
@@ -641,7 +673,6 @@ class SumoNetworkBuilder:
         entry_edges, exit_edges, internal_edges = self._identify_boundary_edges(actual_nodes, actual_edges, polygon_coords)
 
         # Precompute reachable descendants for each node (single BFS per node, takes ~0.03s total)
-        # Avoids O(E^2) individual nx.has_path calls which caused the 120s timeout on large networks.
         reachable_map: dict[str, set[str]] = {}
         for n in G.nodes():
             reachable_map[n] = nx.descendants(G, n)
@@ -682,36 +713,62 @@ class SumoNetworkBuilder:
         if not internal_pairs:
             internal_pairs = through_pairs
 
-        # 3. Schedule Departures according to profile
-        scheduled_trips: list[tuple[float, str, str, str, str]] = []
         bus_fraction = (vehicle_types or {}).get("bus", 0.12)
+
+        # 3. Spatially Distributed Initial Vehicle Population (at t=0.0)
+        # Distributes initial vehicles across DISTINCT interior/approach edges rather than piling up at one entrance
+        if initial_population is not None and initial_population >= 0:
+            target_initial = initial_population
+        else:
+            # Natural baseline population: ~20-30% of total demand, capped by edge count
+            target_initial = max(4, min(len(actual_edges), int(total_vehicles * 0.25)))
+
+        # Find candidate edges that have valid downstream progression paths
+        candidate_initial_edges = [
+            e for e in actual_edges
+            if e["to"] in reachable_map and len(reachable_map[e["to"]]) > 0
+        ]
+        if not candidate_initial_edges:
+            candidate_initial_edges = actual_edges
+
+        # Sample distinct edges so each initial vehicle begins on a separate road segment
+        rng_edges = list(candidate_initial_edges)
+        rng.shuffle(rng_edges)
+        selected_initial_edges = rng_edges[:target_initial]
+
+        initial_trips: list[tuple[float, str, str, str, str, bool]] = []
+        for i, init_edge in enumerate(selected_initial_edges):
+            reachable_nodes = reachable_map.get(init_edge["to"], set())
+            valid_dests = [
+                ex["id"] for ex in exit_edges
+                if ex["id"] != init_edge["id"] and (ex["from"] in reachable_nodes or ex["from"] == init_edge["to"])
+            ]
+            if not valid_dests:
+                valid_dests = [
+                    e["id"] for e in actual_edges
+                    if e["id"] != init_edge["id"] and (e["from"] in reachable_nodes or e["from"] == init_edge["to"])
+                ]
+            dest_edge = rng.choice(valid_dests) if valid_dests else actual_edges[-1]["id"]
+            v_type = "bus" if rng.random() < bus_fraction else "passenger"
+            initial_trips.append((0.0, f"init_veh_{i}", v_type, init_edge["id"], dest_edge, True))
+
+        # 4. Schedule Remaining Departures According to Profile (t >= 1.0)
+        remaining_count = max(0, total_vehicles - len(initial_trips))
+        scheduled_trips: list[tuple[float, str, str, str, str, bool]] = []
         headway_per_edge: dict[str, float] = {}
 
-        for v_idx in range(total_vehicles):
-            # Guarantee initial vehicles depart immediately at t=0.0, 0.5, 1.0, 1.5...
-            # so the simulation has vehicles active right from the first steps
-            if v_idx < min(6, total_vehicles):
-                dep_time = float(v_idx * 0.5)
-                if through_pairs:
-                    from_edge, to_edge = through_pairs[v_idx % len(through_pairs)]
-                else:
-                    from_edge, to_edge = internal_pairs[v_idx % len(internal_pairs)]
-                v_type = "bus" if rng.random() < bus_fraction else "passenger"
-                scheduled_trips.append((round(dep_time, 1), f"veh_{v_idx}", v_type, from_edge, to_edge))
-                continue
-
-            # Select profile departure time
+        for v_idx in range(remaining_count):
             if demand_profile == "peak":
                 raw_t = rng.gauss(0.42 * duration_seconds, 0.22 * duration_seconds)
-                dep_time = max(0.0, min(float(duration_seconds - 5), raw_t))
+                dep_time = max(1.0, min(float(duration_seconds - 5), raw_t))
             elif demand_profile == "ramp_up":
-                raw_t = rng.triangular(0.0, duration_seconds - 5, duration_seconds - 5)
-                dep_time = max(0.0, min(float(duration_seconds - 5), raw_t))
+                raw_t = rng.triangular(1.0, duration_seconds - 5, duration_seconds - 5)
+                dep_time = max(1.0, min(float(duration_seconds - 5), raw_t))
             elif demand_profile == "morning_peak":
                 raw_t = rng.gauss(0.25 * duration_seconds, 0.18 * duration_seconds)
-                dep_time = max(0.0, min(float(duration_seconds - 5), raw_t))
+                dep_time = max(1.0, min(float(duration_seconds - 5), raw_t))
             else:  # uniform
-                dep_time = (v_idx / max(1, total_vehicles)) * (duration_seconds - 10) + rng.uniform(0.0, 1.5)
+                dep_time = 1.0 + (v_idx / max(1, remaining_count)) * (duration_seconds - 10) + rng.uniform(0.0, 1.5)
 
             # 75% Through-Trips, 25% Internal
             if rng.random() < 0.75 and through_pairs:
@@ -719,32 +776,42 @@ class SumoNetworkBuilder:
             else:
                 from_edge, to_edge = rng.choice(internal_pairs if internal_pairs else through_pairs)
 
-            # Prevent simultaneous collision/jamming on same entry edge with min 2.0s headway
+            # Enforce headway per entry edge (min 2.5s) to avoid bottleneck jams at entry point
             last_dep = headway_per_edge.get(from_edge, -10.0)
-            if dep_time < last_dep + 2.0:
-                dep_time = last_dep + 2.0
+            if dep_time < last_dep + 2.5:
+                dep_time = last_dep + 2.5
             headway_per_edge[from_edge] = dep_time
 
             v_type = "bus" if rng.random() < bus_fraction else "passenger"
-            scheduled_trips.append((round(dep_time, 1), f"veh_{v_idx}", v_type, from_edge, to_edge))
+            scheduled_trips.append((round(dep_time, 1), f"sched_veh_{v_idx}", v_type, from_edge, to_edge, False))
 
-        # Sort strictly by departure time for SUMO requirements
-        scheduled_trips.sort(key=lambda x: x[0])
+        # Combine and sort strictly by departure time
+        all_trips = initial_trips + scheduled_trips
+        all_trips.sort(key=lambda x: (x[0], x[1]))
 
+        for dep_time, v_id, v_type, f_edge, t_edge, is_initial in all_trips:
+            trip_attribs = {
+                "id": v_id,
+                "type": v_type,
+                "depart": f"{dep_time:.1f}",
+                "from": f_edge,
+                "to": t_edge,
+            }
+            if is_initial:
+                # Distribute on-network at time zero across distinct edges with average speed
+                trip_attribs["departPos"] = "random"
+                trip_attribs["departSpeed"] = "avg"
+                trip_attribs["departLane"] = "best"
+            else:
+                trip_attribs["departPos"] = "base"
+                trip_attribs["departSpeed"] = "max"
+                trip_attribs["departLane"] = "best"
 
-        for dep_time, v_id, v_type, f_edge, t_edge in scheduled_trips:
-            ET.SubElement(
-                root,
-                "trip",
-                id=v_id,
-                type=v_type,
-                depart=f"{dep_time:.1f}",
-                **{"from": f_edge, "to": t_edge},
-            )
+            ET.SubElement(root, "trip", **trip_attribs)
 
         tree = ET.ElementTree(root)
         tree.write(str(file_path), encoding="utf-8", xml_declaration=True)
-        return len(scheduled_trips)
+        return len(all_trips), len(initial_trips)
 
     def _write_sumocfg(self, file_path: Path, net_name: str, rou_name: str, duration_seconds: int):
         root = ET.Element("configuration")

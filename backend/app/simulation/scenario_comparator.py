@@ -33,6 +33,10 @@ class ScenarioComparator:
         optimized_strategy: str = "Optimized (Actuated Adaptive Signal Control)",
         step_count: int = 0,
         signal_count: Optional[int] = None,
+        approved_signals_count: Optional[int] = None,
+        applied_signals_count: Optional[int] = None,
+        initial_vehicles_count: Optional[int] = None,
+        selected_fixed_time_plan: Optional[Any] = None,
     ) -> ScenarioComparisonResult:
         """
         Produce side-by-side scenario comparison table with genuine empirical variance.
@@ -44,6 +48,10 @@ class ScenarioComparator:
                 baseline_strategy = "Baseline (Unsignalized Priority Control)"
             if optimized_strategy == "Optimized (Actuated Adaptive Signal Control)":
                 optimized_strategy = "Intervention (Unsignalized Priority Control)"
+
+        approved_signals_count = approved_signals_count if approved_signals_count is not None else 0
+        applied_signals_count = applied_signals_count if applied_signals_count is not None else 0
+        initial_vehicles_count = initial_vehicles_count if initial_vehicles_count is not None else 0
 
         empty_metrics = SimulationMetrics(
             avg_speed_kmh=0.0,
@@ -108,6 +116,11 @@ class ScenarioComparator:
                 optimized_metrics=empty_metrics,
                 rows=rows,
                 methodology_notes=f"Comparison pending simulation execution ({engine_mode} engine, seed 42, 0 steps). Advance simulation to collect empirical metrics.",
+                signal_count=signal_count,
+                approved_signals_count=approved_signals_count,
+                applied_signals_count=applied_signals_count,
+                initial_vehicles_count=initial_vehicles_count,
+                selected_fixed_time_plan=selected_fixed_time_plan,
             )
 
         # 2. Check for Insufficient Data state
@@ -154,6 +167,11 @@ class ScenarioComparator:
                 optimized_metrics=optimized_metrics or empty_metrics,
                 rows=rows,
                 methodology_notes=f"Insufficient simulation data collected under {engine_mode} engine to perform dual scenario evaluation.",
+                signal_count=signal_count,
+                approved_signals_count=approved_signals_count,
+                applied_signals_count=applied_signals_count,
+                initial_vehicles_count=initial_vehicles_count,
+                selected_fixed_time_plan=selected_fixed_time_plan,
             )
 
         # 3. Calculate genuine empirical variances with honest zero-baseline handling
@@ -337,5 +355,10 @@ class ScenarioComparator:
             rows=primary_rows,
             extended_rows=extended_rows,
             methodology_notes=notes,
+            signal_count=signal_count,
+            approved_signals_count=approved_signals_count,
+            applied_signals_count=applied_signals_count,
+            initial_vehicles_count=initial_vehicles_count,
+            selected_fixed_time_plan=selected_fixed_time_plan,
         )
 

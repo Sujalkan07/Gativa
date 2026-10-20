@@ -296,7 +296,7 @@ class SimulationPrepareRequest(BaseModel):
     analysis_id: str
     duration_seconds: int = Field(default=600, ge=60, le=3600)
     demand_rate_veh_hr: int = Field(default=2840, ge=100, le=10000)
-    strategy: SignalStrategy = "actuated_adaptive"
+    strategy: str = "actuated_adaptive"
     demand_level: Optional[DemandLevel] = "normal"
     demand_profile: Optional[DemandProfile] = "peak"
     vehicle_types: Optional[dict[str, float]] = None
@@ -304,6 +304,8 @@ class SimulationPrepareRequest(BaseModel):
     seed: Optional[int] = 42
     demand_data_source: Optional[str] = None
     is_synthetic_demo: bool = False
+    approved_candidate_ids: Optional[list[str]] = None
+    initial_population: Optional[int] = None
 
 
 class VehiclePosition(BaseModel):
@@ -364,7 +366,7 @@ class SimulationStatusResponse(BaseModel):
     engine_message: Optional[str] = None
     duration_seconds: int
     demand_rate_veh_hr: int
-    strategy: SignalStrategy
+    strategy: str = "fixed_time"
     edge_count: int = 0
     junction_count: int = 0
     signal_count: int = 0
@@ -386,6 +388,10 @@ class SimulationStatusResponse(BaseModel):
     assumptions: list[str] = Field(default_factory=list)
     segments_simulated: int = 0
     omitted_segments_count: int = 0
+    approved_signals_count: Optional[int] = 0
+    applied_signals_count: Optional[int] = 0
+    initial_vehicles_count: Optional[int] = 0
+    selected_fixed_time_plan: Optional[Any] = None
 
 
 class ScenarioMetricRow(BaseModel):
@@ -409,6 +415,78 @@ class ScenarioComparisonResult(BaseModel):
     rows: list[ScenarioMetricRow]
     extended_rows: list[ScenarioMetricRow] = Field(default_factory=list)
     methodology_notes: str
+    signal_count: Optional[int] = None
+    approved_signals_count: Optional[int] = 0
+    applied_signals_count: Optional[int] = 0
+    initial_vehicles_count: Optional[int] = 0
+    fixed_time_plan_summary: Optional[str] = None
+    selected_fixed_time_plan: Optional[Any] = None
+
+
+# ─── Traffic Signal Candidates & User Approval ────────────────────────────────
+
+CandidateStatus = Literal["pending", "approved", "rejected", "ineligible", "applied", "failed"]
+
+
+class SignalCandidate(BaseModel):
+    candidate_id: str
+    analysis_id: str
+    junction_id: str
+    lat: float
+    lng: float
+    name: str
+    degree: int
+    approach_roads: list[str] = []
+    current_control: str = "priority"
+    is_eligible: bool = True
+    priority_score: float = 0.0
+    reason: str
+    evidence: list[str] = []
+    evidence_source: str = "network_geometry_centrality"
+    confidence: str = "medium"
+    uncertainty_notes: Optional[str] = None
+    status: CandidateStatus = "pending"
+    validation_error: Optional[str] = None
+
+
+class SignalCandidateListResponse(BaseModel):
+    analysis_id: str
+    candidates: list[SignalCandidate] = []
+    total_candidates: int = 0
+    approved_count: int = 0
+    rejected_count: int = 0
+    pending_count: int = 0
+    eligible_count: int = 0
+
+
+class CandidateDecisionRequest(BaseModel):
+    status: Optional[Literal["approved", "rejected", "pending"]] = None
+    decision: Optional[Literal["approved", "rejected", "pending"]] = None
+
+    def get_decision(self) -> str:
+        return self.decision or self.status or "pending"
+
+
+class TimingPlanEvaluation(BaseModel):
+    plan_id: str
+    cycle_length_s: int
+    name: str
+    description: str
+    objective_score: float
+    avg_waiting_time_s: float
+    avg_speed_kmh: float
+    throughput_veh_hr: float
+    is_selected: bool = False
+    validation_passed: bool = True
+
+
+class FixedTimeOptimizationResult(BaseModel):
+    signal_id: str
+    evaluated_plans: list[TimingPlanEvaluation] = []
+    selected_plan_id: Optional[str] = None
+    selected_cycle_length_s: Optional[int] = None
+    validation_passed: bool = True
+    notes: str = ""
 
 
 

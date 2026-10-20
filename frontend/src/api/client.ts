@@ -11,6 +11,8 @@ import type {
   SignalListResponse,
   SignalEditRequest,
   SignalEditResponse,
+  SignalCandidateListResponse,
+  CandidateDecisionRequest,
   ApiError,
 } from '../types/api'
 
@@ -125,5 +127,25 @@ export const api = {
 
   resetSimulationSignals: async (simId: string): Promise<SignalListResponse> =>
     handleRequest(client.post(`/api/simulations/${simId}/signals/reset`)),
+
+  getSignalCandidates: async (analysisId: string): Promise<SignalCandidateListResponse> =>
+    handleRequest(client.get(`/api/simulations/${analysisId}/signal-candidates`)),
+
+  updateCandidateDecision: async (
+    analysisId: string,
+    candidateId: string,
+    request: CandidateDecisionRequest
+  ): Promise<{ status: string; candidate_id: string; decision: string }> =>
+    handleRequest(
+      client.post(`/api/simulations/${analysisId}/signal-candidates/${candidateId}/decision`, request)
+    ),
+
+  approveAllCandidates: async (
+    analysisId: string
+  ): Promise<{ message: string; approved_count: number }> =>
+    handleRequest(client.post(`/api/simulations/${analysisId}/signal-candidates/approve-all`)),
+
+  resetCandidates: async (analysisId: string): Promise<{ message: string }> =>
+    handleRequest(client.post(`/api/simulations/${analysisId}/signal-candidates/reset`)),
 }
 

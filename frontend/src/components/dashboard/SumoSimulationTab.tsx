@@ -17,6 +17,8 @@ import type {
   SignalDetailInfo,
   SignalEditRequest,
   TrafficLightState,
+  SignalCandidate,
+  SignalCandidateListResponse,
 } from '../../types/api'
 
 interface SumoSimulationTabProps {
@@ -42,6 +44,14 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
   const [seed, setSeed] = useState<number>(42)
   const [manualVehicles, setManualVehicles] = useState<number>(85)
   const [showDemandConfig, setShowDemandConfig] = useState<boolean>(false)
+
+  // Signal Placement Review & Approval State
+  const [candidatesData, setCandidatesData] = useState<SignalCandidateListResponse | null>(null)
+  const [isLoadingCandidates, setIsLoadingCandidates] = useState<boolean>(false)
+  const [showCandidateReview, setShowCandidateReview] = useState<boolean>(false)
+  const [candidateActionLoading, setCandidateActionLoading] = useState<string | null>(null)
+  const [candidateFilter, setCandidateFilter] = useState<'all' | 'eligible' | 'approved' | 'pending' | 'rejected'>('all')
+  const [selectedCandidate, setSelectedCandidate] = useState<SignalCandidate | null>(null)
 
   // Fullscreen support in Compare Scenarios mode
   const [fullscreenMap, setFullscreenMap] = useState<'baseline' | 'optimized' | null>(null)
@@ -82,6 +92,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
   const singleVehiclesGroupRef = useRef<L.LayerGroup | null>(null)
   const singleSignalsGroupRef = useRef<L.LayerGroup | null>(null)
   const singleSegmentsGroupRef = useRef<L.LayerGroup | null>(null)
+  const singleCandidatesGroupRef = useRef<L.LayerGroup | null>(null)
   const singleMarkersMapRef = useRef<Map<string, L.Marker>>(new Map())
 
   // Marker & Layer Group Refs for Baseline Map
@@ -203,6 +214,76 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
   useEffect(() => {
     initSimulation()
   }, [analysis.analysis_id])
+
+  // ─── Fetch & Manage Traffic Signal Candidates ───────────────────────────────
+  const fetchSignalCandidates = useCallback((analysisId: string) => {
+    setIsLoadingCandidates(true)
+    api
+      .getSignalCandidates(analysisId)
+      .then((data) => {
+        setCandidatesData(data)
+      })
+      .catch((err) => console.warn('Could not load signal candidates:', err))
+      .finally(() => setIsLoadingCandidates(false))
+  }, [])
+
+  useEffect(() => {
+    fetchSignalCandidates(analysis.analysis_id)
+  }, [analysis.analysis_id, fetchSignalCandidates])
+
+  const handleCandidateDecision = async (
+    candidateId: string,
+    decision: 'approved' | 'rejected' | 'pending',
+  ) => {
+    setCandidateActionLoading(candidateId)
+    try {
+      await api.updateCandidateDecision(analysis.analysis_id, candidateId, {
+        status: decision,
+        decision,
+      })
+      fetchSignalCandidates(analysis.analysis_id)
+    } catch (err) {
+      console.error('Failed to update candidate decision:', err)
+    } finally {
+      setCandidateActionLoading(null)
+    }
+  }
+
+  const handleApproveAll = async () => {
+    setCandidateActionLoading('all')
+    try {
+      await api.approveAllCandidates(analysis.analysis_id)
+      fetchSignalCandidates(analysis.analysis_id)
+    } catch (err) {
+      console.error('Failed to approve all candidates:', err)
+    } finally {
+      setCandidateActionLoading(null)
+    }
+  }
+
+  const handleResetDecisions = async () => {
+    setCandidateActionLoading('reset')
+    try {
+      await api.resetCandidates(analysis.analysis_id)
+      fetchSignalCandidates(analysis.analysis_id)
+    } catch (err) {
+      console.error('Failed to reset candidate decisions:', err)
+    } finally {
+      setCandidateActionLoading(null)
+    }
+  }
+
+  const handleApplyCandidatesAndRebuild = () => {
+    setShowCandidateReview(false)
+    initSimulation()
+  }
+
+  const handleFocusCandidate = (cand: SignalCandidate) => {
+    setSelectedCandidate(cand)
+    if (cand.lat && cand.lng) {
+      singleMapRef.current?.setView([cand.lat, cand.lng], 17, { animate: true })
+    }
+  }
 
   // ─── Fetch Congestion Telemetry ─────────────────────────────────────────────
   const fetchCongestion = useCallback((id: string) => {
@@ -330,10 +411,12 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
     const segGroup = L.layerGroup().addTo(map)
     const vehGroup = L.layerGroup().addTo(map)
     const sigGroup = L.layerGroup().addTo(map)
+    const candGroup = L.layerGroup().addTo(map)
 
     singleSegmentsGroupRef.current = segGroup
     singleVehiclesGroupRef.current = vehGroup
     singleSignalsGroupRef.current = sigGroup
+    singleCandidatesGroupRef.current = candGroup
     singleMapRef.current = map
 
     setupBaseNetwork(map, segGroup)
@@ -343,6 +426,52 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
       singleMapRef.current = null
     }
   }, [setupBaseNetwork])
+
+  // ─── Render Candidate Signal Markers on Single Map ──────────────────────────
+  const renderCandidateMarkers = useCallback(() => {
+    const map = singleMapRef.current
+    const layerGroup = singleCandidatesGroupRef.current
+    if (!map || !layerGroup) return
+    layerGroup.clearLayers()
+
+    if (!candidatesData) return
+
+    candidatesData.candidates.forEach((cand) => {
+      if (!cand.lat || !cand.lng) return
+
+      let color = '#f59e0b'
+      if (cand.status === 'approved') color = '#10b981'
+      else if (cand.status === 'rejected') color = '#ef4444'
+      else if (cand.status === 'ineligible') color = '#94a3b8'
+
+      const iconHtml = `
+        <div style="background-color: ${color}; width: 26px; height: 26px; border-radius: 50%; border: 2px solid white; box-shadow: 0 2px 5px rgba(0,0,0,0.35); display: flex; align-items: center; justify-content: center; font-size: 13px; cursor: pointer;">
+          🚦
+        </div>
+      `
+      const icon = L.divIcon({
+        className: 'candidate-signal-marker',
+        html: iconHtml,
+        iconSize: [26, 26],
+        iconAnchor: [13, 13],
+        popupAnchor: [0, -13],
+      })
+
+      const marker = L.marker([cand.lat, cand.lng], { icon })
+      marker.bindTooltip(
+        `<div class="text-xs font-sans"><b>${cand.name}</b><br/>Score: ${cand.priority_score.toFixed(1)}/10 • ${cand.degree}-way • Status: ${cand.status}</div>`,
+        { sticky: true },
+      )
+      marker.on('click', () => {
+        setSelectedCandidate(cand)
+      })
+      layerGroup.addLayer(marker)
+    })
+  }, [candidatesData])
+
+  useEffect(() => {
+    renderCandidateMarkers()
+  }, [renderCandidateMarkers])
 
   // ─── Initialize Baseline Map (Mode B - Left) ────────────────────────────────
   useEffect(() => {
@@ -1041,6 +1170,34 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
             </span>
           </button>
 
+          <button
+            onClick={() => setShowCandidateReview(!showCandidateReview)}
+            className={`px-3 py-1.5 text-xs font-semibold rounded-lg border transition-all flex items-center gap-1.5 ${
+              showCandidateReview
+                ? 'bg-[#FF9933] border-[#FF9933] text-[#0A1145] font-bold shadow-xs'
+                : candidatesData && candidatesData.approved_count > 0
+                  ? 'bg-emerald-50 border-emerald-300 text-emerald-800'
+                  : 'bg-white border-[#cbdbf5] text-[#0A1145] hover:bg-[#eff4ff]'
+            }`}
+          >
+            <span className="material-symbols-outlined text-[16px]">traffic</span>
+            <span>Signal Candidates</span>
+            {candidatesData && (
+              <span
+                className={`px-1.5 py-0.2 rounded-full text-[10px] font-bold ${
+                  candidatesData.approved_count > 0
+                    ? 'bg-[#138808] text-white'
+                    : 'bg-slate-200 text-slate-700'
+                }`}
+              >
+                {candidatesData.approved_count}/{candidatesData.eligible_count}
+              </span>
+            )}
+            <span className="material-symbols-outlined text-[14px]">
+              {showCandidateReview ? 'expand_less' : 'expand_more'}
+            </span>
+          </button>
+
           {signalsList && signalsList.signals.length > 0 && (
             <button
               onClick={() => {
@@ -1168,6 +1325,245 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
         </div>
       )}
 
+      {/* ─── USER-APPROVED TRAFFIC SIGNAL REVIEW & OPTIMIZATION PANEL ─── */}
+      {showCandidateReview && (
+        <div className="bg-[#f8faff] border border-[#cbdbf5] rounded-xl p-5 shadow-xs flex flex-col gap-4 animate-in fade-in duration-200">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-[#cbdbf5] pb-3">
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="material-symbols-outlined text-[#0A1145] text-lg">traffic</span>
+                <h3 className="text-sm font-bold text-[#0A1145]">
+                  Candidate Junction Review & Fixed-Time Signal Optimization
+                </h3>
+                {candidatesData && (
+                  <span className="text-[11px] font-semibold bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded-full border border-emerald-300">
+                    {candidatesData.approved_count} Approved for Compilation
+                  </span>
+                )}
+              </div>
+              <p className="text-xs text-slate-500 mt-0.5">
+                Screened junctions based on degree ≥ 3, approach functional classifications, and observed traffic delays.
+                Approved signals will be compiled into the Optimized scenario and evaluated using multi-cycle fixed-time plans.
+              </p>
+            </div>
+
+            <div className="flex items-center gap-2 flex-wrap">
+              <button
+                onClick={handleApproveAll}
+                disabled={candidateActionLoading !== null}
+                className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white transition-colors flex items-center gap-1 disabled:opacity-50"
+              >
+                <span className="material-symbols-outlined text-[15px]">done_all</span>
+                <span>Approve All Eligible ({candidatesData?.eligible_count ?? 0})</span>
+              </button>
+              <button
+                onClick={handleResetDecisions}
+                disabled={candidateActionLoading !== null}
+                className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-[#cbdbf5] bg-white hover:bg-slate-100 text-slate-700 transition-colors flex items-center gap-1 disabled:opacity-50"
+              >
+                <span className="material-symbols-outlined text-[15px]">restart_alt</span>
+                <span>Reset Decisions</span>
+              </button>
+              <button
+                onClick={handleApplyCandidatesAndRebuild}
+                disabled={isPreparing}
+                className="px-4 py-1.5 text-xs font-bold rounded-lg bg-[#FF9933] hover:bg-[#e68524] text-[#0A1145] shadow-xs transition-all flex items-center gap-1.5 disabled:opacity-50"
+              >
+                <span className="material-symbols-outlined text-[16px]">sync</span>
+                <span>Apply & Rebuild Simulation</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Filter Pills */}
+          <div className="flex items-center gap-2 flex-wrap text-xs">
+            <span className="text-slate-500 font-medium">Filter:</span>
+            {(['all', 'eligible', 'approved', 'pending', 'rejected'] as const).map((flt) => {
+              const count =
+                flt === 'all'
+                  ? candidatesData?.total_candidates ?? 0
+                  : flt === 'eligible'
+                    ? candidatesData?.eligible_count ?? 0
+                    : flt === 'approved'
+                      ? candidatesData?.approved_count ?? 0
+                      : flt === 'pending'
+                        ? candidatesData?.pending_count ?? 0
+                        : candidatesData?.rejected_count ?? 0
+              return (
+                <button
+                  key={flt}
+                  onClick={() => setCandidateFilter(flt)}
+                  className={`px-2.5 py-1 rounded-md font-semibold text-xs transition-colors flex items-center gap-1 ${
+                    candidateFilter === flt
+                      ? 'bg-[#0A1145] text-white'
+                      : 'bg-white border border-[#cbdbf5] text-slate-600 hover:text-[#0A1145]'
+                  }`}
+                >
+                  <span className="capitalize">{flt}</span>
+                  <span className="font-mono text-[10px] opacity-80">({count})</span>
+                </button>
+              )
+            })}
+          </div>
+
+          {/* Candidate Cards Grid */}
+          {isLoadingCandidates ? (
+            <div className="py-8 text-center text-xs text-slate-500 flex flex-col items-center gap-2">
+              <span className="material-symbols-outlined text-2xl animate-spin text-[#0A1145]">progress_activity</span>
+              <span>Screening candidate junctions from road network topology...</span>
+            </div>
+          ) : !candidatesData || candidatesData.candidates.length === 0 ? (
+            <div className="py-6 text-center text-xs text-slate-500 bg-white rounded-lg border border-[#cbdbf5]">
+              No intersection candidates identified in this road selection.
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 max-h-[380px] overflow-y-auto pr-1">
+              {candidatesData.candidates
+                .filter((c) => {
+                  if (candidateFilter === 'eligible') return c.is_eligible
+                  if (candidateFilter === 'approved') return c.status === 'approved'
+                  if (candidateFilter === 'pending') return c.status === 'pending'
+                  if (candidateFilter === 'rejected') return c.status === 'rejected'
+                  return true
+                })
+                .map((cand) => {
+                  const isActing = candidateActionLoading === cand.candidate_id
+                  return (
+                    <div
+                      key={cand.candidate_id}
+                      className={`p-3.5 rounded-xl border transition-all flex flex-col justify-between gap-2.5 ${
+                        cand.candidate_id === selectedCandidate?.candidate_id ? 'ring-2 ring-[#0A1145]' : ''
+                      } ${
+                        cand.status === 'approved'
+                          ? 'bg-emerald-50/70 border-emerald-300 shadow-xs'
+                          : cand.status === 'rejected'
+                            ? 'bg-red-50/40 border-red-200 opacity-75'
+                            : cand.is_eligible
+                              ? 'bg-white border-[#cbdbf5] hover:border-amber-400'
+                              : 'bg-slate-50 border-slate-200 opacity-60'
+                      }`}
+                    >
+                      <div>
+                        {/* Header: Name, Degree, Score */}
+                        <div className="flex items-start justify-between gap-2">
+                          <div>
+                            <div className="font-bold text-xs text-[#0A1145] leading-snug">
+                              {cand.name}
+                            </div>
+                            <div className="text-[10px] text-slate-500 font-mono mt-0.5">
+                              {cand.degree}-Way Intersection • Current: {cand.current_control}
+                            </div>
+                          </div>
+                          <span
+                            className={`px-2 py-0.5 rounded text-[10px] font-bold shrink-0 ${
+                              cand.priority_score >= 6
+                                ? 'bg-amber-100 text-amber-900 border border-amber-300'
+                                : 'bg-slate-100 text-slate-700 border border-slate-200'
+                            }`}
+                          >
+                            Score: {cand.priority_score.toFixed(1)}/10
+                          </span>
+                        </div>
+
+                        {/* Approaches */}
+                        <div className="flex flex-wrap gap-1 mt-2">
+                          {cand.approach_roads.map((appr, aIdx) => (
+                            <span
+                              key={aIdx}
+                              className="text-[10px] bg-white border border-[#cbdbf5] text-slate-600 px-1.5 py-0.2 rounded"
+                            >
+                              {appr}
+                            </span>
+                          ))}
+                        </div>
+
+                        {/* Rationale snippet */}
+                        <p className="text-[11px] text-slate-600 mt-2 line-clamp-2 leading-relaxed">
+                          {cand.reason}
+                        </p>
+
+                        {/* Evidence bullet points */}
+                        {cand.evidence && cand.evidence.length > 0 && (
+                          <div className="mt-2 flex flex-col gap-1 bg-[#f8faff] rounded p-2 border border-[#e2e8f0]">
+                            {cand.evidence.slice(0, 3).map((ev, evIdx) => (
+                              <div key={evIdx} className="text-[10px] text-slate-600 flex items-center gap-1">
+                                <span className="w-1 h-1 rounded-full bg-[#0A1145]"></span>
+                                <span>{ev}</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+
+                        {/* Warrant disclosure */}
+                        <div className="text-[9px] text-slate-400 mt-1.5 italic">
+                          MUTCD Warrant 1 / 3 candidate screening
+                        </div>
+                      </div>
+
+                      {/* Action Bar */}
+                      <div className="flex items-center justify-between gap-2 pt-2 border-t border-slate-200/80">
+                        <button
+                          onClick={() => handleFocusCandidate(cand)}
+                          className="text-[10px] font-semibold text-[#0A1145] hover:underline flex items-center gap-0.5"
+                        >
+                          <span className="material-symbols-outlined text-[13px]">location_on</span>
+                          <span>Locate</span>
+                        </button>
+
+                        <div className="flex items-center gap-1.5">
+                          {cand.is_eligible ? (
+                            <>
+                              <button
+                                onClick={() =>
+                                  handleCandidateDecision(
+                                    cand.candidate_id,
+                                    cand.status === 'approved' ? 'pending' : 'approved',
+                                  )
+                                }
+                                disabled={isActing}
+                                className={`px-2.5 py-1 rounded text-[11px] font-bold transition-colors flex items-center gap-1 ${
+                                  cand.status === 'approved'
+                                    ? 'bg-[#138808] text-white hover:bg-emerald-700'
+                                    : 'bg-emerald-50 text-emerald-800 border border-emerald-300 hover:bg-emerald-100'
+                                } disabled:opacity-50`}
+                              >
+                                <span className="material-symbols-outlined text-[13px]">
+                                  {cand.status === 'approved' ? 'check' : 'add'}
+                                </span>
+                                <span>{cand.status === 'approved' ? 'Approved' : 'Approve'}</span>
+                              </button>
+                              <button
+                                onClick={() =>
+                                  handleCandidateDecision(
+                                    cand.candidate_id,
+                                    cand.status === 'rejected' ? 'pending' : 'rejected',
+                                  )
+                                }
+                                disabled={isActing}
+                                className={`px-2 py-1 rounded text-[11px] font-semibold transition-colors flex items-center gap-0.5 ${
+                                  cand.status === 'rejected'
+                                    ? 'bg-red-600 text-white'
+                                    : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                                } disabled:opacity-50`}
+                              >
+                                <span>{cand.status === 'rejected' ? 'Rejected' : 'Reject'}</span>
+                              </button>
+                            </>
+                          ) : (
+                            <span className="text-[10px] font-semibold text-slate-400 bg-slate-100 px-2 py-0.5 rounded">
+                              Ineligible (Degree &lt; 3)
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  )
+                })}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* ─── MODE A: SINGLE MAP (DEFAULT) ─── */}
       <div className={viewMode === 'single' ? 'flex flex-col gap-4' : 'hidden'}>
         <div className="bg-white rounded-xl border border-[#cbdbf5] shadow-xs overflow-hidden flex flex-col">
@@ -1183,12 +1579,17 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
             </div>
 
             {/* Active Vehicles Counter */}
-            <div className="absolute bottom-4 left-4 z-[500] bg-[#0A1145]/90 text-white backdrop-blur-xs rounded-lg px-3 py-1 shadow-xs text-xs font-mono font-semibold">
-              {vehiclesCount} Active Vehicles
+            <div className="absolute bottom-4 left-4 z-[500] bg-[#0A1145]/90 text-white backdrop-blur-xs rounded-lg px-3 py-1 shadow-xs text-xs font-mono font-semibold flex items-center gap-2">
+              <span>{vehiclesCount} Active Vehicles</span>
+              {simStatus?.initial_vehicles_count ? (
+                <span className="text-[10px] text-slate-300 font-normal border-l border-white/20 pl-2">
+                  {simStatus.initial_vehicles_count} Initial on-network
+                </span>
+              ) : null}
             </div>
 
             {/* Traffic Conditions Legend */}
-            <div className="absolute top-4 right-4 z-[500] bg-white/95 backdrop-blur-xs border border-[#cbdbf5] rounded-lg p-2.5 shadow-xs text-xs flex flex-col gap-1 max-w-[200px]">
+            <div className="absolute top-4 right-4 z-[500] bg-white/95 backdrop-blur-xs border border-[#cbdbf5] rounded-lg p-2.5 shadow-xs text-xs flex flex-col gap-1 max-w-[210px]">
               <div className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-0.5">
                 Vehicle States
               </div>
@@ -1210,7 +1611,11 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
               </div>
               <div className="flex items-center gap-2 text-[11px] text-slate-700">
                 <span className="w-2.5 h-2.5 rounded-full bg-[#138808] border border-white shadow-xs"></span>
-                <span>Signal (Click to Inspect)</span>
+                <span>Active Signal (Inspect)</span>
+              </div>
+              <div className="flex items-center gap-2 text-[11px] text-slate-700">
+                <span className="w-2.5 h-2.5 rounded-full bg-amber-500 border border-white shadow-xs"></span>
+                <span>Candidate Signal (Review)</span>
               </div>
             </div>
           </div>
@@ -1639,6 +2044,80 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
           <span className="text-[11px] font-mono text-slate-600 bg-[#eff4ff] border border-[#cbdbf5] px-2.5 py-1 rounded">
             Seed: {seed} • {duration}s Duration
           </span>
+        </div>
+
+        {/* Scenario Configuration & Fixed-Time Plan Cards */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+          {/* Baseline Scenario Info */}
+          <div className="bg-[#f8faff] rounded-xl border border-[#cbdbf5] p-3.5 flex flex-col justify-between">
+            <div>
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-xs font-bold text-[#0A1145] uppercase tracking-wide flex items-center gap-1.5">
+                  <span className="w-2.5 h-2.5 rounded-full bg-slate-500"></span>
+                  Baseline Scenario
+                </span>
+                <span className="text-[10px] bg-slate-200 text-slate-700 px-2 py-0.5 rounded font-mono font-semibold">
+                  Original Controls
+                </span>
+              </div>
+              <div className="text-xs font-medium text-slate-700 mt-1">
+                {comparison?.baseline_strategy || 'Baseline (Original Controls)'}
+              </div>
+              <p className="text-[11px] text-slate-500 mt-1">
+                Preserves original network controls without intervention. Unsignalized junctions operate under standard priority right-of-way.
+              </p>
+            </div>
+            <div className="flex items-center gap-3 text-[11px] font-mono text-slate-600 mt-3 pt-2 border-t border-slate-200">
+              <span>Signals: <b>{baselineStatus?.signal_count ?? 0}</b></span>
+              <span>Vehicles (t=0): <b>{baselineStatus?.initial_vehicles_count ?? comparison?.initial_vehicles_count ?? 0}</b></span>
+            </div>
+          </div>
+
+          {/* Optimized Scenario Info */}
+          <div className="bg-[#f0fdf4] rounded-xl border border-emerald-300 p-3.5 flex flex-col justify-between">
+            <div>
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-xs font-bold text-[#0A1145] uppercase tracking-wide flex items-center gap-1.5">
+                  <span className="w-2.5 h-2.5 rounded-full bg-[#138808]"></span>
+                  Optimized Scenario
+                </span>
+                <span className="text-[10px] bg-emerald-100 text-emerald-800 border border-emerald-300 px-2 py-0.5 rounded font-mono font-semibold">
+                  {simStatus?.applied_signals_count ?? comparison?.applied_signals_count ?? 0} Signals Applied
+                </span>
+              </div>
+              <div className="text-xs font-bold text-[#0A1145] mt-1">
+                {comparison?.optimized_strategy || simStatus?.strategy || 'Optimized Scenario'}
+              </div>
+              {(() => {
+                const plan = comparison?.selected_fixed_time_plan || simStatus?.selected_fixed_time_plan
+                return plan ? (
+                  <div className="mt-1.5 bg-white/80 rounded p-2 border border-emerald-200 text-[11px]">
+                    <div className="flex items-center justify-between font-semibold text-emerald-900">
+                      <span>Timing Plan: {plan.name}</span>
+                      <span className="font-mono">{plan.cycle_length_s}s Cycle</span>
+                    </div>
+                    <div className="text-slate-600 text-[10px] mt-0.5">
+                      {plan.description}
+                    </div>
+                    <div className="text-[10px] text-emerald-700 font-mono mt-1 flex items-center gap-2">
+                      <span>Validated in SUMO</span>
+                      <span>•</span>
+                      <span>Objective: {plan.objective_score?.toFixed(1)}</span>
+                    </div>
+                  </div>
+                ) : (
+                  <p className="text-[11px] text-slate-500 mt-1">
+                    Applies user-approved traffic signal installations and evaluates timing plan progression.
+                  </p>
+                )
+              })()}
+            </div>
+            <div className="flex items-center gap-3 text-[11px] font-mono text-emerald-800 mt-3 pt-2 border-t border-emerald-200">
+              <span>Approved Signals: <b>{simStatus?.approved_signals_count ?? comparison?.approved_signals_count ?? 0}</b></span>
+              <span>Compiled: <b>{simStatus?.applied_signals_count ?? comparison?.applied_signals_count ?? 0}</b></span>
+              <span>Vehicles (t=0): <b>{simStatus?.initial_vehicles_count ?? comparison?.initial_vehicles_count ?? 0}</b></span>
+            </div>
+          </div>
         </div>
 
         <div className="overflow-x-auto">
