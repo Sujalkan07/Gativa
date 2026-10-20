@@ -246,9 +246,9 @@ class SumoNetworkBuilder:
             u_source_id = str(seg["u"]) if seg.get("u") is not None else None
             v_source_id = str(seg["v"]) if seg.get("v") is not None else None
 
-            # Deduplicate nodes by coordinate (~1.1m precision at 5 decimals) or source ID
-            u_coord_key = (round(coords[0][0], 5), round(coords[0][1], 5))
-            v_coord_key = (round(coords[-1][0], 5), round(coords[-1][1], 5))
+            # Deduplicate nodes by coordinate (~0.1m precision at 6 decimals) or source ID
+            u_coord_key = (round(coords[0][0], 6), round(coords[0][1], 6))
+            v_coord_key = (round(coords[-1][0], 6), round(coords[-1][1], 6))
 
             if u_source_id:
                 u_id = f"node_{u_source_id}"

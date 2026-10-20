@@ -17,11 +17,13 @@ async def health_check():
     }
     warnings = list(settings.validate_api_keys())
 
-    db_status = get_sqlite_status()
+    db_status = get_sqlite_status(include_internals=False)
     overall_status = "healthy"
     if db_status.get("status") != "healthy":
         overall_status = "degraded"
-        warnings.append(f"SQLite persistent storage degraded: {db_status.get('error')}")
+        warnings.append(
+            db_status.get("message") or "SQLite persistent storage is currently degraded or unavailable"
+        )
 
     return {
         "status": overall_status,

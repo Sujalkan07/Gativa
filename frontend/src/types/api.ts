@@ -74,6 +74,8 @@ export interface TrafficObservation {
   congestion_level: 'free_flow' | 'moderate' | 'severe' | 'unknown'
   has_incident: boolean
   observation_timestamp: string | null
+  retrieval_timestamp?: string | null
+  is_stale?: boolean
   source: string
 }
 

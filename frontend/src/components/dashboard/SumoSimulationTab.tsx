@@ -100,9 +100,10 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
   const resultsSegmentsGroupRef = useRef<L.LayerGroup | null>(null)
   const resultsPolylineMapRef = useRef<Map<string, L.Polyline>>(new Map())
 
-  // Stale-response protection refs (Issue O)
+  // Stale-response and concurrency protection refs (Issues O & H)
   const currentAnalysisIdRef = useRef<string>(analysis.analysis_id)
   const activeSimIdRef = useRef<string | null>(simId)
+  const isSteppingRef = useRef<boolean>(false)
 
   useEffect(() => {
     currentAnalysisIdRef.current = analysis.analysis_id
@@ -115,9 +116,15 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
   const TOMTOM_KEY = import.meta.env.VITE_TOMTOM_API_KEY
 
   const getErrorMessage = (err: unknown): string => {
-    if (err instanceof GativaApiError) return err.message
-    if (err instanceof Error) return err.message
-    return String(err)
+    let msg = ''
+    if (err instanceof GativaApiError) msg = err.message
+    else if (err instanceof Error) msg = err.message
+    else msg = String(err)
+
+    if (msg.includes('Traceback') || msg.includes('File "') || msg.includes('line ')) {
+      return 'Simulation operation encountered an internal server error. Please reset or verify network topology.'
+    }
+    return msg
   }
 
   // ─── Initialize or Prepare Simulation ───────────────────────────────────────
@@ -700,7 +707,8 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
     let active = true
 
     const runStep = () => {
-      if (!active) return
+      if (!active || isSteppingRef.current) return
+      isSteppingRef.current = true
       const t0 = performance.now()
 
       api
@@ -739,6 +747,9 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
           if (!active) return
           setError(getErrorMessage(err))
           setIsPlaying(false)
+        })
+        .finally(() => {
+          isSteppingRef.current = false
         })
     }
 
@@ -780,7 +791,8 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
   }, [simId, isPlaying, fetchCongestion])
 
   const handleStepOnce = useCallback(() => {
-    if (!simId) return
+    if (!simId || isSteppingRef.current) return
+    isSteppingRef.current = true
     setError(null)
     api
       .stepSimulation(simId, speedMultiplier)
@@ -800,11 +812,18 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
         if (res.state === 'completed') setViewMode('results')
       })
       .catch((err) => setError(getErrorMessage(err)))
+      .finally(() => {
+        isSteppingRef.current = false
+      })
   }, [simId, speedMultiplier, fetchCongestion])
 
   const handleReset = useCallback(() => {
     if (!simId) return
     setIsPlaying(false)
+    if (timerRef.current) {
+      clearTimeout(timerRef.current)
+      timerRef.current = null
+    }
     setError(null)
     singleMarkersMapRef.current.clear()
     baselineMarkersMapRef.current.clear()

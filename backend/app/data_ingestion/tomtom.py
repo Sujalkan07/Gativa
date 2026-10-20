@@ -80,30 +80,55 @@ async def fetch_flow_for_point(
             )
 
         data = resp.json()
+        if not isinstance(data, dict):
+            return None, DataSourceCoverage(
+                source="tomtom_flow",
+                status="error",
+                message="TomTom API returned malformed response structure",
+            )
+
         fd = data.get("flowSegmentData", {})
         observed = fd.get("currentSpeed")
         freeflow = fd.get("freeFlowSpeed")
 
-        if observed is None:
+        # Validate speed values
+        if observed is None or not isinstance(observed, (int, float)) or observed < 0 or observed > 250:
             return None, DataSourceCoverage(
                 source="tomtom_flow",
                 status="partial",
-                message="TomTom returned no speed data for this location",
+                message="TomTom returned missing or invalid speed data for this location",
             )
+
+        if freeflow is None or not isinstance(freeflow, (int, float)) or freeflow <= 0 or freeflow > 250:
+            freeflow = observed
 
         reduction = None
         if observed is not None and freeflow and freeflow > 0:
-            reduction = 1.0 - (observed / freeflow)
+            reduction = max(0.0, min(1.0, 1.0 - (float(observed) / float(freeflow))))
 
-        now_ts = datetime.now(timezone.utc).isoformat()
+        # Provider observation timestamp: only use when genuinely supplied by provider
+        provider_ts = fd.get("timestamp") or fd.get("observationTime")
+        is_stale = False
+        if provider_ts:
+            try:
+                obs_dt = datetime.fromisoformat(str(provider_ts).replace("Z", "+00:00"))
+                age_seconds = (datetime.now(timezone.utc) - obs_dt).total_seconds()
+                if age_seconds > 3600:
+                    is_stale = True
+            except Exception:
+                provider_ts = None
+
+        retrieval_ts = datetime.now(timezone.utc).isoformat()
         obs = TrafficObservation(
             segment_id=segment_id,
-            observed_speed_kmh=float(observed) if observed is not None else None,
-            free_flow_speed_kmh=float(freeflow) if freeflow is not None else None,
+            observed_speed_kmh=float(observed),
+            free_flow_speed_kmh=float(freeflow),
             speed_reduction_ratio=reduction,
             congestion_level=_classify_congestion(observed, freeflow),
             has_incident=False,
-            observation_timestamp=now_ts,
+            observation_timestamp=provider_ts,
+            retrieval_timestamp=retrieval_ts,
+            is_stale=is_stale,
             source="tomtom",
         )
         return obs, DataSourceCoverage(source="tomtom_flow", status="ok")

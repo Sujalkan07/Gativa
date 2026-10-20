@@ -85,6 +85,8 @@ class TrafficObservation(BaseModel):
     congestion_level: CongestionLevel = "unknown"
     has_incident: bool = False
     observation_timestamp: Optional[str] = None
+    retrieval_timestamp: Optional[str] = None
+    is_stale: bool = False
     source: str = "tomtom"
 
 

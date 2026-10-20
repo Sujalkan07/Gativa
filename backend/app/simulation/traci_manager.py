@@ -9,6 +9,7 @@ import logging
 import os
 import socket
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -118,6 +119,7 @@ class SimulationSession:
         self.conn_label = f"gativa_{sim_id[:8]}"
         self.is_connected = False
         self.error_message: Optional[str] = None
+        self._lock = threading.RLock()
 
         # Cumulative statistics
         self.inserted_vehicles_cumulative = 0
@@ -168,106 +170,115 @@ class SimulationSession:
 
     def start(self):
         """Start or resume the simulation process using the appropriate engine."""
-        if self.state == "running":
-            return
+        with self._lock:
+            if self.state == "running":
+                return
 
-        sumo_bin = find_sumo_binary("sumo")
-        can_run_native = TRACI_AVAILABLE and sumo_bin is not None and self.netconvert_used
+            sumo_bin = find_sumo_binary("sumo")
+            can_run_native = TRACI_AVAILABLE and sumo_bin is not None and self.netconvert_used
 
-        if not can_run_native:
-            self.engine_mode = "fallback"
-            self.state = "running"
-            if not TRACI_AVAILABLE:
-                self.engine_message = "TraCI library not found; running internal kinematics engine."
-            elif not sumo_bin:
-                self.engine_message = "sumo executable not found; running internal kinematics engine."
-            else:
-                self.engine_message = "Network compiled without netconvert; running internal kinematics engine."
-            logger.info("Simulation %s running in fallback kinematics mode: %s", self.sim_id, self.engine_message)
-            return
-
-        if not self.is_connected:
-            self.port = get_free_port()
-            cmd = [
-                sumo_bin,
-                "-c", str(self.cfg_file),
-                "--no-warnings", "true",
-                "--no-step-log", "true",
-                "--start", "true",
-                "--quit-on-end", "true",
-                "--ignore-route-errors", "true",
-            ]
-            try:
-                traci.start(cmd, port=self.port, label=self.conn_label)
-                self.is_connected = True
-                self.engine_mode = "native_sumo"
-                self.engine_message = "Native Eclipse SUMO running successfully via TraCI."
-                self.state = "running"
-                logger.info("Started native SUMO simulation %s via TraCI on port %s", self.sim_id, self.port)
-            except Exception as e:
-                logger.warning("Failed to start native TraCI connection on %s: %s; transitioning to fallback", self.sim_id, e)
-                self.is_connected = False
+            if not can_run_native:
                 self.engine_mode = "fallback"
-                self.engine_message = f"Native SUMO startup failed ({type(e).__name__}); running internal kinematics engine."
-                self.error_message = str(e)
                 self.state = "running"
-        else:
-            self.state = "running"
+                if not TRACI_AVAILABLE:
+                    self.engine_message = "TraCI library not found; running internal kinematics engine."
+                elif not sumo_bin:
+                    self.engine_message = "sumo executable not found; running internal kinematics engine."
+                else:
+                    self.engine_message = "Network compiled without netconvert; running internal kinematics engine."
+                logger.info("Simulation %s running in fallback kinematics mode: %s", self.sim_id, self.engine_message)
+                return
+
+            if not self.is_connected:
+                self.port = get_free_port()
+                cmd = [
+                    sumo_bin,
+                    "-c", str(self.cfg_file),
+                    "--no-warnings", "true",
+                    "--no-step-log", "true",
+                    "--start", "true",
+                    "--quit-on-end", "true",
+                    "--ignore-route-errors", "true",
+                ]
+                try:
+                    traci.start(cmd, port=self.port, label=self.conn_label)
+                    self.is_connected = True
+                    self.engine_mode = "native_sumo"
+                    self.engine_message = "Native Eclipse SUMO running successfully via TraCI."
+                    self.state = "running"
+                    logger.info("Started native SUMO simulation %s via TraCI on port %s", self.sim_id, self.port)
+                except Exception as e:
+                    logger.warning("Failed to start native TraCI connection on %s: %s; transitioning to fallback", self.sim_id, e)
+                    self.is_connected = False
+                    self.engine_mode = "fallback"
+                    self.engine_message = f"Native SUMO startup failed ({type(e).__name__}); running internal kinematics engine."
+                    self.error_message = str(e)
+                    self.state = "running"
+            else:
+                self.state = "running"
 
     def pause(self):
         """Pause the running simulation."""
-        if self.state == "running":
-            self.state = "paused"
-            logger.info("Simulation %s paused at elapsed %.1fs", self.sim_id, self.elapsed_seconds)
+        with self._lock:
+            if self.state == "running":
+                self.state = "paused"
+                logger.info("Simulation %s paused at elapsed %.1fs", self.sim_id, self.elapsed_seconds)
 
     def step(self, num_steps: int = 1) -> dict[str, Any]:
         """Advance the simulation by num_steps and extract real vehicle coordinates & metrics."""
-        if self.state not in ("running", "ready"):
-            return self.get_status()
+        with self._lock:
+            if self.state not in ("running", "ready"):
+                return self.get_status()
 
-        if not self.is_connected and self.engine_mode == "native_sumo":
-            self.start()
+            if not self.is_connected and self.engine_mode == "native_sumo":
+                self.start()
 
-        self.state = "running"
+            self.state = "running"
 
-        if self.is_connected and TRACI_AVAILABLE and self.engine_mode == "native_sumo":
-            try:
-                conn = traci.getConnection(self.conn_label)
-                for _ in range(num_steps):
-                    if self.elapsed_seconds >= self.duration_seconds:
-                        self.state = "completed"
-                        break
+            if self.is_connected and TRACI_AVAILABLE and self.engine_mode == "native_sumo":
+                try:
+                    conn = traci.getConnection(self.conn_label)
+                    for _ in range(num_steps):
+                        if self.elapsed_seconds >= self.duration_seconds:
+                            self.state = "completed"
+                            break
 
-                    # 1. Apply Signal Strategy (Actuated vs Fixed)
-                    if self.strategy == "actuated_adaptive":
-                        self._apply_actuated_signals(conn)
+                        # 1. Apply Signal Strategy (Actuated vs Fixed)
+                        if self.strategy == "actuated_adaptive":
+                            self._apply_actuated_signals(conn)
 
-                    # 2. Advance TraCI step
-                    conn.simulationStep()
-                    self.step_count += 1
-                    self.elapsed_seconds = round(conn.simulation.getTime(), 1)
-                    self.completed_vehicles_cumulative += conn.simulation.getArrivedNumber()
+                        # 2. Advance TraCI step
+                        conn.simulationStep()
+                        self.step_count += 1
+                        self.elapsed_seconds = round(conn.simulation.getTime(), 1)
+                        self.completed_vehicles_cumulative += conn.simulation.getArrivedNumber()
 
-                # 3. Sample edge telemetry once per step batch for high-efficiency post-simulation analysis
-                self._sample_edge_telemetry(conn)
+                    # 3. Sample edge telemetry once per step batch for high-efficiency post-simulation analysis
+                    self._sample_edge_telemetry(conn)
 
-                # 4. Extract Vehicles and Instantaneous Metrics
-                self._extract_traci_state(conn)
-            except Exception as e:
-                logger.warning("TraCI runtime step error on %s: %s; transitioning to fallback kinematics", self.sim_id, e)
+                    # 4. Extract Vehicles and Instantaneous Metrics
+                    self._extract_traci_state(conn)
+                except Exception as e:
+                    logger.warning("TraCI runtime step error on %s: %s; transitioning to fallback kinematics", self.sim_id, e)
+                    self.engine_mode = "fallback"
+                    self.engine_message = f"Native TraCI runtime failure ({type(e).__name__}); transitioned to fallback kinematics."
+                    self.is_connected = False
+                    self._step_kinematics_fallback(num_steps)
+            else:
+                # Deterministic kinematics progression matching real corridor geometry
                 self.engine_mode = "fallback"
-                self.engine_message = f"Native TraCI runtime failure ({type(e).__name__}); transitioned to fallback kinematics."
-                self.is_connected = False
                 self._step_kinematics_fallback(num_steps)
-        else:
-            # Deterministic kinematics progression matching real corridor geometry
-            self.engine_mode = "fallback"
-            self._step_kinematics_fallback(num_steps)
 
-        if self.elapsed_seconds >= self.duration_seconds:
-            self.state = "completed"
+            if self.elapsed_seconds >= self.duration_seconds:
+                self.state = "completed"
+                if self.speed_samples:
+                    self.current_metrics.avg_speed_kmh = round(sum(self.speed_samples) / len(self.speed_samples), 1)
+                if self.waiting_samples:
+                    self.current_metrics.avg_waiting_time_s = round(sum(self.waiting_samples) / len(self.waiting_samples), 1)
+                if self.queue_samples:
+                    self.current_metrics.avg_queue_length_m = round(sum(self.queue_samples) / len(self.queue_samples), 1)
 
-        return self.get_status()
+            return self.get_status()
 
     def _apply_actuated_signals(self, conn):
         """
@@ -551,13 +562,22 @@ class SimulationSession:
             except Exception:
                 continue
 
-        # Compute queues on controlled lanes
+        # Compute queues on controlled lanes and un-signalized priority approaches
         try:
-            for tl_id in conn.trafficlight.getIDList():
-                for lane in conn.trafficlight.getControlledLanes(tl_id):
-                    halting = conn.lane.getLastStepHaltingNumber(lane)
+            tl_ids = conn.trafficlight.getIDList()
+            if tl_ids:
+                for tl_id in tl_ids:
+                    for lane in conn.trafficlight.getControlledLanes(tl_id):
+                        halting = conn.lane.getLastStepHaltingNumber(lane)
+                        if halting > 0:
+                            queue_lengths_m.append(halting * 7.5)  # 7.5m average vehicle + gap
+            else:
+                # Unsignalized network: check halting on incoming priority approaches
+                target_edges = self._valid_sumo_edges or conn.edge.getIDList()
+                for eid in target_edges:
+                    halting = conn.edge.getLastStepHaltingNumber(eid)
                     if halting > 0:
-                        queue_lengths_m.append(halting * 7.5)  # 7.5m average vehicle + gap
+                        queue_lengths_m.append(halting * 7.5)
         except Exception:
             pass
 
@@ -809,10 +829,16 @@ class SimulationSession:
 
         self.cached_signals = fallback_signals
         self.cached_vehicles = vehicles
+        self.speed_samples.append(cur_speed)
+        self.waiting_samples.append(cur_wait)
+        self.queue_samples.append(cur_queue)
+        self.peak_queue_m = max(self.peak_queue_m, cur_queue)
+
         self.current_metrics = SimulationMetrics(
             avg_speed_kmh=cur_speed,
             avg_waiting_time_s=cur_wait,
             avg_queue_length_m=cur_queue,
+            max_queue_length_m=round(self.peak_queue_m, 1),
             completed_vehicles=completed,
             active_vehicles=len(vehicles),
             elapsed_seconds=self.elapsed_seconds,
@@ -821,42 +847,44 @@ class SimulationSession:
 
     def reset(self):
         """Reset the simulation back to step 0."""
-        self.stop()
-        self.step_count = 0
-        self.elapsed_seconds = 0.0
-        self.inserted_vehicles_cumulative = 0
-        self.completed_vehicles_cumulative = 0
-        self.waiting_to_enter_count = 0
-        self.teleported_count = 0
-        self.collision_count = 0
-        self.peak_queue_m = 0.0
-        self.speed_samples.clear()
-        self.waiting_samples.clear()
-        self.queue_samples.clear()
-        self.travel_time_samples.clear()
-        self._vehicle_entry_times.clear()
-        self.cached_vehicles.clear()
-        # Keep cached_signals intact across resets so signal geometries remain available
-        self._edge_telemetry.clear()
-        self._edge_cumulative_stats.clear()
+        with self._lock:
+            self.stop()
+            self.step_count = 0
+            self.elapsed_seconds = 0.0
+            self.inserted_vehicles_cumulative = 0
+            self.completed_vehicles_cumulative = 0
+            self.waiting_to_enter_count = 0
+            self.teleported_count = 0
+            self.collision_count = 0
+            self.peak_queue_m = 0.0
+            self.speed_samples.clear()
+            self.waiting_samples.clear()
+            self.queue_samples.clear()
+            self.travel_time_samples.clear()
+            self._vehicle_entry_times.clear()
+            self.cached_vehicles.clear()
+            # Keep cached_signals intact across resets so signal geometries remain available
+            self._edge_telemetry.clear()
+            self._edge_cumulative_stats.clear()
 
-        self._signal_controllers.clear()
-        self.state = "ready"
-        self.current_metrics = SimulationMetrics(
-            total_duration_seconds=float(self.duration_seconds),
-            scheduled_vehicles=self.scheduled_vehicles,
-        )
-        logger.info("Simulation %s reset to initial state.", self.sim_id)
+            self._signal_controllers.clear()
+            self.state = "ready"
+            self.current_metrics = SimulationMetrics(
+                total_duration_seconds=float(self.duration_seconds),
+                scheduled_vehicles=self.scheduled_vehicles,
+            )
+            logger.info("Simulation %s reset to initial state.", self.sim_id)
 
     def stop(self):
         """Terminate the TraCI connection and process."""
-        if self.is_connected and TRACI_AVAILABLE:
-            try:
-                traci.close(self.conn_label)
-            except Exception as e:
-                logger.debug("TraCI close note: %s", e)
-            self.is_connected = False
-        self.state = "ready" if self.state == "paused" else self.state
+        with self._lock:
+            if self.is_connected and TRACI_AVAILABLE:
+                try:
+                    traci.close(self.conn_label)
+                except Exception as e:
+                    logger.debug("TraCI close note: %s", e)
+                self.is_connected = False
+            self.state = "ready" if self.state == "paused" else self.state
 
     def get_status(self) -> dict[str, Any]:
         """Return the current complete session state."""
@@ -1105,82 +1133,99 @@ class SimulationSession:
                 all_results.append(result)
                 continue
             elif sample_count == 0:
-                # Native mode with 0 samples on this edge
-                if self.step_count > 0:
-                    # Simulation ran; edge was untraversed (free flow)
-                    result = CongestionRoadResult(
-                        segment_id=seg_id,
-                        sumo_edge_ids=edge_ids,
-                        road_name=road_name,
-                        road_type=road_type,
-                        geometry=geom,
-                        avg_speed_kmh=ref_speed_kmh,
-                        ref_speed_kmh=ref_speed_kmh,
-                        min_speed_kmh=ref_speed_kmh,
-                        avg_occupancy_pct=0.0,
-                        peak_occupancy_pct=0.0,
-                        avg_halting=0.0,
-                        peak_halting=0.0,
-                        avg_waiting_s=0.0,
-                        congestion_score=0.0,
-                        severity="free_flow",
-                        congested_duration_s=0.0,
-                        congested_pct=0.0,
-                        sample_count=self.step_count,
-                        data_quality="measured",
-                        engine_mode=self.engine_mode,
-                    )
-                else:
-                    # Pre-simulation baseline estimate
-                    result = CongestionRoadResult(
-                        segment_id=seg_id,
-                        sumo_edge_ids=edge_ids,
-                        road_name=road_name,
-                        road_type=road_type,
-                        geometry=geom,
-                        avg_speed_kmh=ref_speed_kmh,
-                        ref_speed_kmh=ref_speed_kmh,
-                        min_speed_kmh=ref_speed_kmh,
-                        avg_occupancy_pct=0.0,
-                        peak_occupancy_pct=0.0,
-                        avg_halting=0.0,
-                        peak_halting=0.0,
-                        avg_waiting_s=0.0,
-                        congestion_score=0.0,
-                        severity="free_flow",
-                        congested_duration_s=0.0,
-                        congested_pct=0.0,
-                        sample_count=0,
-                        data_quality="estimated",
-                        engine_mode=self.engine_mode,
-                    )
+                # Explicitly handle missing measurements as insufficient data, not free-flow
+                result = CongestionRoadResult(
+                    segment_id=seg_id,
+                    sumo_edge_ids=edge_ids,
+                    road_name=road_name,
+                    road_type=road_type,
+                    geometry=geom,
+                    avg_speed_kmh=0.0,
+                    ref_speed_kmh=ref_speed_kmh,
+                    min_speed_kmh=0.0,
+                    avg_occupancy_pct=0.0,
+                    peak_occupancy_pct=0.0,
+                    avg_halting=0.0,
+                    peak_halting=0.0,
+                    avg_waiting_s=0.0,
+                    congestion_score=0.0,
+                    severity="insufficient_data",
+                    congested_duration_s=0.0,
+                    congested_pct=0.0,
+                    sample_count=0,
+                    data_quality="insufficient",
+                    engine_mode=self.engine_mode,
+                )
                 all_results.append(result)
                 continue
 
-            # Compute aggregates from whole-run cumulative telemetry or combined measured samples
-            if cum_total_samples >= MIN_SAMPLES:
-                avg_speed_ms = cum_sum_speed_ms / cum_total_samples
-                min_speed_ms = cum_min_speed_ms if cum_min_speed_ms != float("inf") else avg_speed_ms
-                avg_occupancy = cum_sum_occupancy / cum_total_samples
-                peak_occupancy = cum_peak_occupancy
-                avg_halting = cum_sum_halting / cum_total_samples
-                peak_halting = cum_peak_halting
-                avg_waiting = cum_sum_waiting / cum_total_samples
-                congested_steps = cum_congested_samples
-                effective_sample_count = cum_total_samples
-            else:
-                speeds_ms = [s["mean_speed_ms"] for s in combined_samples]
-                occupancies = [s["occupancy_pct"] for s in combined_samples]
-                haltings = [s["halting_vehicles"] for s in combined_samples]
-                waitings = [s["waiting_time_s"] for s in combined_samples]
+            # Compute aggregates across constituent edges:
+            # Average across constituent edges to prevent an edge with more samples
+            # from disproportionately weighting the segment summary.
+            edge_stats: list[dict[str, Any]] = []
+            for eid in edge_ids:
+                if eid in self._edge_cumulative_stats and self._edge_cumulative_stats[eid]["total_samples"] > 0:
+                    cst = self._edge_cumulative_stats[eid]
+                    n = cst["total_samples"]
+                    edge_stats.append({
+                        "edge_id": eid,
+                        "samples": n,
+                        "mean_speed_ms": cst["sum_speed_ms"] / n,
+                        "min_speed_ms": cst["min_speed_ms"],
+                        "mean_occupancy": cst["sum_occupancy_pct"] / n,
+                        "peak_occupancy": cst["peak_occupancy_pct"],
+                        "mean_halting": cst["sum_halting"] / n,
+                        "peak_halting": cst["peak_halting"],
+                        "mean_waiting": cst["sum_waiting_s"] / n,
+                        "congested_samples": cst["congested_samples"],
+                    })
 
-                avg_speed_ms = sum(speeds_ms) / len(speeds_ms)
-                min_speed_ms = min(speeds_ms)
-                avg_occupancy = sum(occupancies) / len(occupancies)
-                peak_occupancy = max(occupancies)
-                avg_halting = sum(haltings) / len(haltings)
-                peak_halting = max(haltings)
-                avg_waiting = sum(waitings) / len(waitings)
+            if edge_stats:
+                avg_speed_ms = sum(e["mean_speed_ms"] for e in edge_stats) / len(edge_stats)
+                min_speed_ms = min(e["min_speed_ms"] for e in edge_stats)
+                if min_speed_ms == float("inf"):
+                    min_speed_ms = avg_speed_ms
+                avg_occupancy = sum(e["mean_occupancy"] for e in edge_stats) / len(edge_stats)
+                peak_occupancy = max(e["peak_occupancy"] for e in edge_stats)
+                avg_halting = sum(e["mean_halting"] for e in edge_stats) / len(edge_stats)
+                peak_halting = max(e["peak_halting"] for e in edge_stats)
+                avg_waiting = sum(e["mean_waiting"] for e in edge_stats) / len(edge_stats)
+                congested_steps = max(e["congested_samples"] for e in edge_stats)
+                effective_sample_count = sum(e["samples"] for e in edge_stats)
+            else:
+                # Group combined samples by edge to calculate unweighted edge average
+                edge_groups: dict[str, list[dict]] = {}
+                for s in combined_samples:
+                    edge_groups.setdefault(s["edge_id"], []).append(s)
+
+                edge_means_speed = []
+                edge_means_occ = []
+                edge_means_halt = []
+                edge_means_wait = []
+                all_mins = []
+                all_peak_occ = []
+                all_peak_halt = []
+
+                for eid, samples in edge_groups.items():
+                    s_speeds = [s["mean_speed_ms"] for s in samples]
+                    s_occ = [s["occupancy_pct"] for s in samples]
+                    s_halt = [s["halting_vehicles"] for s in samples]
+                    s_wait = [s["waiting_time_s"] for s in samples]
+                    edge_means_speed.append(sum(s_speeds) / len(s_speeds))
+                    edge_means_occ.append(sum(s_occ) / len(s_occ))
+                    edge_means_halt.append(sum(s_halt) / len(s_halt))
+                    edge_means_wait.append(sum(s_wait) / len(s_wait))
+                    all_mins.append(min(s_speeds))
+                    all_peak_occ.append(max(s_occ))
+                    all_peak_halt.append(max(s_halt))
+
+                avg_speed_ms = sum(edge_means_speed) / len(edge_means_speed) if edge_means_speed else 0.0
+                min_speed_ms = min(all_mins) if all_mins else 0.0
+                avg_occupancy = sum(edge_means_occ) / len(edge_means_occ) if edge_means_occ else 0.0
+                peak_occupancy = max(all_peak_occ) if all_peak_occ else 0.0
+                avg_halting = sum(edge_means_halt) / len(edge_means_halt) if edge_means_halt else 0.0
+                peak_halting = max(all_peak_halt) if all_peak_halt else 0.0
+                avg_waiting = sum(edge_means_wait) / len(edge_means_wait) if edge_means_wait else 0.0
                 congested_steps = sum(
                     1 for s in combined_samples
                     if (1.0 - min(1.0, s["mean_speed_ms"] / max(ref_speed_ms, 0.1))) * 0.5 > 0.3

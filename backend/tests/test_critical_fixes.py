@@ -355,3 +355,204 @@ def test_issue_l_polygon_cache_key_collision_prevention():
     poly_tr_rotated = Polygon([(10, 10), (10, 0), (0, 10), (10, 10)])
     key1_rotated = _get_polygon_cache_key(poly_tr_rotated)
     assert key1 == key1_rotated, "Identical polygon with shifted vertex origin must produce identical cache key"
+
+
+def test_issue_l_polygon_cache_key_with_holes():
+    """Verify that a polygon with a hole produces a distinct cache key from a solid polygon."""
+    solid = Polygon([(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)])
+    with_hole = Polygon(
+        [(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)],
+        holes=[[(2, 2), (8, 2), (8, 8), (2, 8), (2, 2)]],
+    )
+    assert solid.bounds == with_hole.bounds
+    k_solid = _get_polygon_cache_key(solid)
+    k_hole = _get_polygon_cache_key(with_hole)
+    assert k_solid != k_hole, "Polygon with hole must produce a distinct cache key from solid polygon"
+
+
+# ─── REMAINING FIXES: Telemetry Aggregation & Missing Data ───────────────────
+
+def test_multi_edge_unequal_sample_count_aggregation():
+    """
+    Verify that when one edge generates 100 samples and another generates 2 samples,
+    the constituent edges are averaged without allowing the 100-sample edge to drown out the other.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        session = SimulationSession(
+            sim_id="test_sim_unequal",
+            analysis_id="test_analysis",
+            work_dir=Path(tmp_dir),
+            cfg_file=Path(tmp_dir) / "sim.sumocfg",
+            duration_seconds=600,
+            road_segments=[
+                {
+                    "segment_id": "seg_twoway",
+                    "name": "Two-Way Unequal",
+                    "road_type": "arterial",
+                    "speed_limit_kmh": 60.0,
+                }
+            ],
+            netconvert_used=True,
+        )
+        session.engine_mode = "native_sumo"
+        session._segment_edge_map = {"seg_twoway": ["edge_fwd", "edge_rev"]}
+
+        # Edge fwd has 100 samples with mean speed 20 m/s
+        session._edge_cumulative_stats["edge_fwd"] = {
+            "edge_id": "edge_fwd",
+            "total_samples": 100,
+            "sum_speed_ms": 2000.0,
+            "min_speed_ms": 18.0,
+            "max_speed_ms": 22.0,
+            "sum_occupancy_pct": 1000.0,
+            "peak_occupancy_pct": 15.0,
+            "sum_halting": 0.0,
+            "peak_halting": 0.0,
+            "sum_waiting_s": 0.0,
+            "congested_samples": 0,
+            "first_timestamp": 0.0,
+            "last_timestamp": 100.0,
+        }
+
+        # Edge rev has 2 samples with mean speed 10 m/s
+        session._edge_cumulative_stats["edge_rev"] = {
+            "edge_id": "edge_rev",
+            "total_samples": 2,
+            "sum_speed_ms": 20.0,
+            "min_speed_ms": 9.0,
+            "max_speed_ms": 11.0,
+            "sum_occupancy_pct": 40.0,
+            "peak_occupancy_pct": 25.0,
+            "sum_halting": 2.0,
+            "peak_halting": 1.0,
+            "sum_waiting_s": 10.0,
+            "congested_samples": 0,
+            "first_timestamp": 0.0,
+            "last_timestamp": 2.0,
+        }
+
+        summary = session.compute_congestion_summary()
+        res = summary.all_results[0]
+
+        # Edge fwd mean = 20 m/s, Edge rev mean = 10 m/s
+        # Unweighted average across constituent edges = 15 m/s = 54.0 km/h
+        # (If sample-count weighted, it would have been ~19.8 m/s = 71.3 km/h, drowning out rev)
+        expected_kmh = round(15.0 * 3.6, 1)
+        assert abs(res.avg_speed_kmh - expected_kmh) < 1.0, f"Expected ~{expected_kmh} km/h, got {res.avg_speed_kmh}"
+        assert res.data_quality == "measured"
+
+
+def test_missing_telemetry_insufficient_data_honesty():
+    """Verify that an unobserved or untraversed edge is classified as insufficient_data, never free_flow."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        session = SimulationSession(
+            sim_id="test_sim_unobserved",
+            analysis_id="test_analysis",
+            work_dir=Path(tmp_dir),
+            cfg_file=Path(tmp_dir) / "sim.sumocfg",
+            duration_seconds=600,
+            road_segments=[
+                {
+                    "segment_id": "seg_unobserved",
+                    "name": "Untraversed Lane",
+                    "road_type": "local",
+                    "speed_limit_kmh": 50.0,
+                }
+            ],
+            netconvert_used=True,
+        )
+        session.engine_mode = "native_sumo"
+        session.step_count = 50
+        session._segment_edge_map = {"seg_unobserved": ["edge_unobserved"]}
+
+        # No telemetry collected on edge_unobserved
+        summary = session.compute_congestion_summary()
+        res = summary.all_results[0]
+
+        assert res.severity == "insufficient_data", "Untraversed edge must be insufficient_data, not free_flow"
+        assert res.data_quality == "insufficient"
+        assert res.avg_speed_kmh == 0.0, "Must not fabricate free-flow speed for untraversed road"
+        assert res.sample_count == 0
+
+
+def test_zero_baseline_no_change_and_mismatch_disclosures():
+    """Verify that (0, 0) reports no change without claiming improvement, and duration mismatches are disclosed."""
+    metrics_0 = SimulationMetrics(
+        avg_speed_kmh=0.0,
+        avg_waiting_time_s=0.0,
+        avg_queue_length_m=0.0,
+        completed_vehicles=0,
+        total_duration_seconds=300.0,
+        elapsed_seconds=10.0,
+    )
+    metrics_diff_duration = SimulationMetrics(
+        avg_speed_kmh=0.0,
+        avg_waiting_time_s=0.0,
+        avg_queue_length_m=0.0,
+        completed_vehicles=0,
+        total_duration_seconds=600.0,
+        elapsed_seconds=10.0,
+    )
+
+    res = ScenarioComparator.compare(
+        sim_id="test_comp_zeros",
+        analysis_id="test_analysis",
+        baseline_metrics=metrics_0,
+        optimized_metrics=metrics_diff_duration,
+        step_count=5,
+        engine_mode="fallback",
+    )
+
+    # 1. Zero values must report (no change) and is_improvement=False
+    for row in res.rows:
+        assert "no change" in row.variance.lower(), f"Row {row.metric} should say 'no change', got: {row.variance}"
+        assert not row.is_improvement, f"Row {row.metric} must not claim improvement when both are 0"
+
+    # 2. Mismatch disclosure in methodology notes
+    assert "Duration mismatch" in res.methodology_notes
+    assert "Internal kinematics engine estimation" in res.methodology_notes
+
+
+def test_sqlite_status_no_internal_path_leak():
+    """Verify that public health check / sqlite status does not leak filesystem paths."""
+    status = get_sqlite_status(include_internals=False)
+    assert "status" in status
+    assert "initialized" in status
+    assert "path" not in status, "Public SQLite status must not leak local filesystem paths"
+
+    health_resp = client.get("/api/health")
+    assert health_resp.status_code == 200
+    h_data = health_resp.json()
+    assert "path" not in h_data.get("database", {}), "API /health must not leak filesystem paths"
+
+
+def test_simulation_session_thread_safety_and_idempotent_lifecycle():
+    """Verify that repeated stop() and reset() calls are idempotent and thread-safe."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        session = SimulationSession(
+            sim_id="test_sim_lifecycle",
+            analysis_id="test_analysis",
+            work_dir=Path(tmp_dir),
+            cfg_file=Path(tmp_dir) / "sim.sumocfg",
+            duration_seconds=600,
+            road_segments=[
+                {
+                    "segment_id": "seg_1",
+                    "name": "Street",
+                    "road_type": "local",
+                    "speed_limit_kmh": 40.0,
+                }
+            ],
+            netconvert_used=False,
+            is_synthetic_demo=True,
+        )
+
+        # Repeated stop calls should be idempotent
+        session.stop()
+        session.stop()
+
+        # Repeated reset calls should be idempotent
+        session.reset()
+        session.reset()
+        assert session.step_count == 0
+        assert session.state == "ready"

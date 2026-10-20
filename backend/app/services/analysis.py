@@ -188,16 +188,28 @@ async def run_analysis(polygon: GeoJSONPolygon) -> AnalysisResult:
                         s.traffic = obs
             all_traffic_coverages.append(coverage)
 
-        # Aggregate coverage status
+        # Aggregate coverage status: distinguish sampled representative corridors from complete census
         if all_traffic_coverages:
             ok_count = sum(1 for c in all_traffic_coverages if c.status == "ok")
+            sampled_count = len(sample_segs)
+            eligible_count = len(segments)
+            sample_pct = round((ok_count / max(1, eligible_count)) * 100.0, 1)
+
             if ok_count == 0:
                 status = all_traffic_coverages[0].status
-                msg = all_traffic_coverages[0].message
-            elif ok_count == len(all_traffic_coverages):
-                status, msg = "ok", None
+                msg = all_traffic_coverages[0].message or "Traffic observations unavailable for sampled corridors"
+            elif ok_count == sampled_count:
+                status = "ok"
+                msg = (
+                    f"Traffic flow observed for {ok_count} representative segments "
+                    f"({sample_pct}% network sample coverage; representative corridors, not a full network census)"
+                )
             else:
-                status, msg = "partial", f"{ok_count}/{len(all_traffic_coverages)} traffic samples retrieved"
+                status = "partial"
+                msg = (
+                    f"{ok_count}/{sampled_count} traffic samples retrieved "
+                    f"({sample_pct}% of {eligible_count} eligible segments sampled)"
+                )
 
             data_sources.append(DataSourceCoverage(
                 source="tomtom_flow",

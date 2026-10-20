@@ -86,17 +86,23 @@ def init_sqlite_db() -> None:
         logger.error("Failed to initialize SQLite persistent store: %s", exc)
 
 
-def get_sqlite_status() -> dict[str, Any]:
+def get_sqlite_status(include_internals: bool = True) -> dict[str, Any]:
     """Return health status of the SQLite persistent storage layer."""
     global _db_initialized, _db_init_error
     if not _db_initialized and _db_init_error is None:
         init_sqlite_db()
-    return {
+
+    status_dict: dict[str, Any] = {
         "status": "healthy" if _db_initialized else "degraded",
         "initialized": _db_initialized,
-        "path": str(DB_PATH),
         "error": _db_init_error,
     }
+    if _db_init_error:
+        status_dict["error_type"] = "StorageInitializationError"
+        status_dict["message"] = "SQLite persistent storage is currently unavailable"
+    if include_internals:
+        status_dict["path"] = str(DB_PATH)
+    return status_dict
 
 
 def _get_connection() -> sqlite3.Connection:
@@ -104,7 +110,7 @@ def _get_connection() -> sqlite3.Connection:
     if not _db_initialized:
         init_sqlite_db()
     if not _db_initialized:
-        raise RuntimeError(f"SQLite persistent store is unavailable: {_db_init_error}")
+        raise RuntimeError("SQLite persistent store is unavailable")
     DB_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH), timeout=10.0)
     conn.row_factory = sqlite3.Row

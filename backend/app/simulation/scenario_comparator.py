@@ -168,24 +168,30 @@ class ScenarioComparator:
             if base_val <= 0.0:
                 if opt_val <= 0.0:
                     val_str = "0" if is_int else "0.0"
-                    variance_str = f"{val_str} {unit} (0.0% variance)"
-                    is_improvement = True
+                    variance_str = f"{val_str} {unit} (no change)"
+                    return 0.0, 0.0, variance_str, False
                 else:
                     arrow = "↑" if diff > 0 else "↓"
                     diff_str = f"{int(diff):+d}" if is_int else f"{diff:+.1f}"
-                    variance_str = f"{arrow} {diff_str} {unit} (N/A — zero baseline)"
                     is_improvement = (diff > 0) if higher_is_better else (diff < 0)
-                return None, diff, variance_str, is_improvement
+                    reg_note = "" if is_improvement else ", regression"
+                    variance_str = f"{arrow} {diff_str} {unit} (N/A — zero baseline{reg_note})"
+                    return None, diff, variance_str, is_improvement
+
+            diff_str = f"{int(diff):+d}" if is_int else f"{diff:+.1f}"
+            if diff == 0.0:
+                variance_str = f"0.0% ({diff_str} {unit}, no change)"
+                return 0.0, 0.0, variance_str, False
 
             pct = round((diff / base_val * 100.0), 1)
-            diff_str = f"{int(diff):+d}" if is_int else f"{diff:+.1f}"
             if higher_is_better:
-                is_improvement = diff >= 0
-                arrow = "↑" if diff >= 0 else "↓"
-                variance_str = f"{arrow} {pct:+.1f}% ({diff_str} {unit})"
+                is_improvement = diff > 0
+                arrow = "↑" if diff > 0 else "↓"
+                reg_str = "" if is_improvement else ", regression"
+                variance_str = f"{arrow} {pct:+.1f}% ({diff_str} {unit}{reg_str})"
             else:
-                is_improvement = diff <= 0
-                arrow = "↓" if diff <= 0 else "↑"
+                is_improvement = diff < 0
+                arrow = "↓" if diff < 0 else "↑"
                 reg_str = ", regression" if diff > 0 else ""
                 variance_str = f"{arrow} {pct:+.1f}% ({diff_str} {unit}{reg_str})"
             return pct, diff, variance_str, is_improvement
@@ -294,16 +300,26 @@ class ScenarioComparator:
             ),
         ]
 
+        disclosures: list[str] = []
+        if baseline_metrics.total_duration_seconds != optimized_metrics.total_duration_seconds:
+            disclosures.append(
+                f"Duration mismatch: baseline ({baseline_metrics.total_duration_seconds:.0f}s) vs optimized ({optimized_metrics.total_duration_seconds:.0f}s)."
+            )
+        if "fallback" in engine_mode:
+            disclosures.append("Internal kinematics engine estimation mode; not measured TraCI hardware execution.")
+
+        disclosures_prefix = f"[{' | '.join(disclosures)}] " if disclosures else ""
+
         if signal_count == 0:
             notes = (
-                f"Empirical evaluation under {engine_mode} engine over {optimized_metrics.elapsed_seconds:.1f}s elapsed "
+                f"{disclosures_prefix}Empirical evaluation under {engine_mode} engine over {optimized_metrics.elapsed_seconds:.1f}s elapsed "
                 f"(seed 42, {step_count} simulation steps). "
                 f"Network contains 0 traffic signal controllers. All junctions operate under standard priority right-of-way rules. "
                 f"Actuated signal timing is not applicable to unsignalized intersections."
             )
         else:
             notes = (
-                f"Empirical evaluation under {engine_mode} engine over {optimized_metrics.elapsed_seconds:.1f}s elapsed "
+                f"{disclosures_prefix}Empirical evaluation under {engine_mode} engine over {optimized_metrics.elapsed_seconds:.1f}s elapsed "
                 f"(seed 42, {step_count} simulation steps). "
                 f"Baseline: Fixed-Time vs Optimized: Actuated Adaptive."
             )

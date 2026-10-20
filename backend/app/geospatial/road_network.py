@@ -144,11 +144,23 @@ def _clip_geometry_to_polygon(geom, poly: Polygon) -> Optional[LineString]:
     return parts[0] if len(parts) == 1 else max(parts, key=lambda l: l.length)
 
 
+def _canonicalize_ring(coords: list[tuple[float, float]]) -> str:
+    """Return a deterministic, rotation-invariant string for a closed polygon coordinate ring."""
+    if not coords:
+        return ""
+    clean = coords[:-1] if len(coords) > 1 and coords[0] == coords[-1] else coords
+    if not clean:
+        return ""
+    min_idx = clean.index(min(clean))
+    rotated = clean[min_idx:] + clean[:min_idx]
+    return ";".join(f"{x},{y}" for x, y in rotated)
+
+
 def _get_polygon_cache_key(poly: Polygon, max_area_km2: float = 25.0) -> str:
     """
     Generate deterministic, collision-safe cache key from actual polygon geometry and query parameters.
-    Normalizes vertex precision (6 decimals ~0.1m) and exterior ring orientation.
-    Prevents cache collisions between distinct polygons sharing similar bounding boxes.
+    Normalizes vertex precision (6 decimals ~0.1m), exterior ring orientation, and interior holes.
+    Prevents cache collisions between distinct polygons sharing similar bounding boxes or differing holes.
     """
     if poly is None or poly.is_empty:
         return "empty_polygon"
@@ -158,22 +170,23 @@ def _get_polygon_cache_key(poly: Polygon, max_area_km2: float = 25.0) -> str:
         oriented = orient(poly, sign=1.0)
         coords = [(round(x, 6), round(y, 6)) for x, y in oriented.exterior.coords]
     except Exception:
+        oriented = poly
         coords = [(round(x, 6), round(y, 6)) for x, y in poly.exterior.coords]
 
-    # Find minimum vertex index to establish rotation-invariant representation
-    if len(coords) > 1 and coords[0] == coords[-1]:
-        clean_pts = coords[:-1]
-    else:
-        clean_pts = coords
+    ext_str = _canonicalize_ring(coords)
 
-    if clean_pts:
-        min_idx = clean_pts.index(min(clean_pts))
-        canonical_pts = clean_pts[min_idx:] + clean_pts[:min_idx]
-    else:
-        canonical_pts = clean_pts
+    # Process interior rings (holes) if present
+    int_strs = []
+    if hasattr(oriented, "interiors") and oriented.interiors:
+        for interior in oriented.interiors:
+            int_coords = [(round(x, 6), round(y, 6)) for x, y in interior.coords]
+            c_str = _canonicalize_ring(int_coords)
+            if c_str:
+                int_strs.append(c_str)
+        int_strs.sort()
 
-    pts_str = ";".join(f"{x},{y}" for x, y in canonical_pts)
-    key_payload = f"poly:{pts_str}|area_limit:{max_area_km2:.2f}|v:2"
+    holes_payload = f"|holes:{'#'.join(int_strs)}" if int_strs else ""
+    key_payload = f"poly:{ext_str}{holes_payload}|area_limit:{max_area_km2:.2f}|v:3"
     return hashlib.sha256(key_payload.encode("utf-8")).hexdigest()[:24]
 
 
