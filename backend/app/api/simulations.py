@@ -33,6 +33,18 @@ router = APIRouter(prefix="/simulations", tags=["Simulation"])
 async def prepare_simulation(req: SimulationPrepareRequest):
     try:
         return await simulation_service.prepare(req)
+    except KeyError as e:
+        logger.warning("Simulation prepare requested for missing resource: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e).strip("'\""),
+        )
+    except ValueError as e:
+        logger.warning("Simulation prepare validation failure: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(e),
+        )
     except Exception as e:
         logger.error("Failed to prepare simulation: %s", e)
         raise HTTPException(

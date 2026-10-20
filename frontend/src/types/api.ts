@@ -312,6 +312,10 @@ export interface SimulationStatusResponse {
   vehicles: VehiclePosition[]
   traffic_lights?: TrafficLightState[]
   error_message?: string | null
+  network_provenance?: string
+  assumptions?: string[]
+  segments_simulated?: number
+  omitted_segments_count?: number
 }
 
 export interface ScenarioMetricRow {
@@ -333,6 +337,7 @@ export interface ScenarioComparisonResult {
   baseline_metrics: SimulationMetrics
   optimized_metrics: SimulationMetrics
   rows: ScenarioMetricRow[]
+  extended_rows?: ScenarioMetricRow[]
   methodology_notes: string
 }
 

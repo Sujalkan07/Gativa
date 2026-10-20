@@ -97,36 +97,84 @@ def _compute_geodesic_length_m(geom) -> float:
         return 0.0
 
 
-def _clip_geometry_to_polygon(geom, poly: Polygon):
-    """Clip a Shapely geometry strictly to a boundary polygon."""
+def _clip_geometry_to_polygon_parts(geom, poly: Polygon) -> list[LineString]:
+    """
+    Clip a Shapely geometry strictly to a boundary polygon.
+    Preserves all valid LineString fragments (e.g. roads entering, exiting, and re-entering).
+    """
     if geom is None or geom.is_empty:
-        return None
+        return []
     if not poly.intersects(geom):
-        return None
+        return []
     try:
         clipped = geom.intersection(poly)
         if clipped.is_empty:
-            return None
-        if clipped.geom_type == "LineString":
-            return clipped
-        elif clipped.geom_type == "MultiLineString":
-            lines = [l for l in clipped.geoms if l.length > 0]
-            if lines:
-                return max(lines, key=lambda l: l.length)
-        elif clipped.geom_type == "GeometryCollection":
-            lines = [g for g in clipped.geoms if g.geom_type == "LineString" and g.length > 0]
-            if lines:
-                return max(lines, key=lambda l: l.length)
+            return []
+
+        valid_lines: list[LineString] = []
+
+        def _extract_linestrings(g):
+            if g is None or g.is_empty:
+                return
+            if g.geom_type == "LineString":
+                if g.length > 0:
+                    valid_lines.append(g)
+            elif g.geom_type == "MultiLineString":
+                for part in g.geoms:
+                    if part.geom_type == "LineString" and part.length > 0:
+                        valid_lines.append(part)
+            elif g.geom_type == "GeometryCollection":
+                for part in g.geoms:
+                    _extract_linestrings(part)
+
+        _extract_linestrings(clipped)
+        return valid_lines
     except Exception as exc:
         logger.debug("Geometry clipping fallback: %s", exc)
-    return geom
+        if hasattr(geom, "geom_type") and geom.geom_type == "LineString":
+            return [geom]
+        return []
 
 
-def _get_polygon_cache_key(poly: Polygon) -> str:
-    """Generate deterministic cache key for a spatial bounding box (~11m resolution)."""
-    minx, miny, maxx, maxy = poly.bounds
-    bbox_str = f"{minx:.4f}_{miny:.4f}_{maxx:.4f}_{maxy:.4f}"
-    return hashlib.sha256(bbox_str.encode()).hexdigest()[:16]
+def _clip_geometry_to_polygon(geom, poly: Polygon) -> Optional[LineString]:
+    """Clip a Shapely geometry strictly to a boundary polygon. Returns primary LineString."""
+    parts = _clip_geometry_to_polygon_parts(geom, poly)
+    if not parts:
+        return None
+    return parts[0] if len(parts) == 1 else max(parts, key=lambda l: l.length)
+
+
+def _get_polygon_cache_key(poly: Polygon, max_area_km2: float = 25.0) -> str:
+    """
+    Generate deterministic, collision-safe cache key from actual polygon geometry and query parameters.
+    Normalizes vertex precision (6 decimals ~0.1m) and exterior ring orientation.
+    Prevents cache collisions between distinct polygons sharing similar bounding boxes.
+    """
+    if poly is None or poly.is_empty:
+        return "empty_polygon"
+
+    try:
+        from shapely.geometry.polygon import orient
+        oriented = orient(poly, sign=1.0)
+        coords = [(round(x, 6), round(y, 6)) for x, y in oriented.exterior.coords]
+    except Exception:
+        coords = [(round(x, 6), round(y, 6)) for x, y in poly.exterior.coords]
+
+    # Find minimum vertex index to establish rotation-invariant representation
+    if len(coords) > 1 and coords[0] == coords[-1]:
+        clean_pts = coords[:-1]
+    else:
+        clean_pts = coords
+
+    if clean_pts:
+        min_idx = clean_pts.index(min(clean_pts))
+        canonical_pts = clean_pts[min_idx:] + clean_pts[:min_idx]
+    else:
+        canonical_pts = clean_pts
+
+    pts_str = ";".join(f"{x},{y}" for x, y in canonical_pts)
+    key_payload = f"poly:{pts_str}|area_limit:{max_area_km2:.2f}|v:2"
+    return hashlib.sha256(key_payload.encode("utf-8")).hexdigest()[:24]
 
 
 def _get_speed_limit(data: dict) -> Optional[float]:
@@ -401,7 +449,7 @@ async def fetch_road_network(
 
         G: Optional[nx.MultiDiGraph] = None
         source_channel = "osm_api_v06"
-        cache_key = _get_polygon_cache_key(poly)
+        cache_key = _get_polygon_cache_key(poly, max_area_km2=max_area_km2)
 
         # 1. Check local persistent SQLite cache
         try:
@@ -493,67 +541,75 @@ async def fetch_road_network(
                 if "x" in u_data and "y" in u_data and "x" in v_data and "y" in v_data:
                     geom = LineString([[u_data["x"], u_data["y"]], [v_data["x"], v_data["y"]]])
 
-            # Clip geometry strictly to polygon boundary
-            clipped_geom = _clip_geometry_to_polygon(geom, poly)
-            if clipped_geom is None or clipped_geom.is_empty:
+            # Clip geometry strictly to polygon boundary, preserving all valid fragments (Issue E)
+            clipped_parts = _clip_geometry_to_polygon_parts(geom, poly)
+            if not clipped_parts:
                 continue
 
-            length_m = _compute_geodesic_length_m(clipped_geom)
-            if length_m < 1.0:
-                continue
+            for part_idx, clipped_geom in enumerate(clipped_parts):
+                length_m = _compute_geodesic_length_m(clipped_geom)
+                if length_m < 1.0:
+                    continue
 
-            coords_list = [[round(c[0], 6), round(c[1], 6)] for c in clipped_geom.coords]
-            geojson_line = GeoJSONLineString(coordinates=coords_list)
+                coords_list = [[round(c[0], 6), round(c[1], 6)] for c in clipped_geom.coords]
+                if len(coords_list) < 2:
+                    continue
+                geojson_line = GeoJSONLineString(coordinates=coords_list)
 
-            highway = data.get("highway", "unclassified")
-            road_class = _classify_road(highway)
-            osm_highway_str = highway[0] if isinstance(highway, list) else str(highway)
-            osm_id_val = data.get("osmid")
-            osm_id_str = str(osm_id_val[0]) if isinstance(osm_id_val, list) else str(osm_id_val or "")
+                highway = data.get("highway", "unclassified")
+                road_class = _classify_road(highway)
+                osm_highway_str = highway[0] if isinstance(highway, list) else str(highway)
+                osm_id_val = data.get("osmid")
+                osm_id_str = str(osm_id_val[0]) if isinstance(osm_id_val, list) else str(osm_id_val or "")
 
-            # Street Name
-            name = data.get("name")
-            if isinstance(name, list):
-                name = name[0]
-            if not name:
-                loc_prefix = locality or "Corridor"
-                if road_class == "highway":
-                    name = f"{loc_prefix} Expressway Corridor"
-                elif road_class == "arterial":
-                    name = f"{loc_prefix} Primary Arterial Corridor"
-                else:
-                    hw_tag = data.get("highway")
-                    if isinstance(hw_tag, list):
-                        hw_tag = hw_tag[0]
-                    if hw_tag == "residential":
-                        name = f"{loc_prefix} Residential Way"
-                    elif hw_tag in ("tertiary", "tertiary_link"):
-                        name = f"{loc_prefix} Collector Marg"
+                # Street Name
+                name = data.get("name")
+                if isinstance(name, list):
+                    name = name[0]
+                if not name:
+                    loc_prefix = locality or "Corridor"
+                    if road_class == "highway":
+                        name = f"{loc_prefix} Expressway Corridor"
+                    elif road_class == "arterial":
+                        name = f"{loc_prefix} Primary Arterial Corridor"
                     else:
-                        name = f"{loc_prefix} Sector Street"
+                        hw_tag = data.get("highway")
+                        if isinstance(hw_tag, list):
+                            hw_tag = hw_tag[0]
+                        if hw_tag == "residential":
+                            name = f"{loc_prefix} Residential Way"
+                        elif hw_tag in ("tertiary", "tertiary_link"):
+                            name = f"{loc_prefix} Collector Marg"
+                        else:
+                            name = f"{loc_prefix} Sector Street"
 
-            u_ctrl, u_prov = _inspect_node_control(G.nodes[u] if u in G.nodes else {}, data)
-            v_ctrl, v_prov = _inspect_node_control(G.nodes[v] if v in G.nodes else {}, data)
+                u_ctrl, u_prov = _inspect_node_control(G.nodes[u] if u in G.nodes else {}, data)
+                v_ctrl, v_prov = _inspect_node_control(G.nodes[v] if v in G.nodes else {}, data)
 
-            segments.append(RoadSegment(
-                segment_id=f"{u}_{v}_{key}",
-                name=name,
-                road_type=road_class,
-                length_m=round(length_m, 1),
-                geometry=geojson_line,
-                speed_limit_kmh=_get_speed_limit(data),
-                lanes=_get_lanes(data),
-                is_oneway=is_oneway,
-                osm_highway=osm_highway_str,
-                osm_id=osm_id_str,
-                u_control=u_ctrl,
-                v_control=v_ctrl,
-                u_provenance=u_prov,
-                v_provenance=v_prov,
-            ))
+                part_suffix = f"_p{part_idx + 1}" if len(clipped_parts) > 1 else ""
+                seg_id = f"{u}_{v}_{key}{part_suffix}"
 
-            class_counts[road_class] = class_counts.get(road_class, 0) + 1
-            total_length_m += length_m
+                segments.append(RoadSegment(
+                    segment_id=seg_id,
+                    name=name,
+                    road_type=road_class,
+                    length_m=round(length_m, 1),
+                    geometry=geojson_line,
+                    speed_limit_kmh=_get_speed_limit(data),
+                    lanes=_get_lanes(data),
+                    is_oneway=is_oneway,
+                    osm_highway=osm_highway_str,
+                    osm_id=osm_id_str,
+                    u_control=u_ctrl,
+                    v_control=v_ctrl,
+                    u_provenance=u_prov,
+                    v_provenance=v_prov,
+                    u=str(u),
+                    v=str(v),
+                ))
+
+                class_counts[road_class] = class_counts.get(road_class, 0) + 1
+                total_length_m += length_m
 
         total_length_km = round(total_length_m / 1000.0, 2)
 
@@ -590,6 +646,10 @@ async def fetch_road_network(
             },
             signalized_intersection_count=signalized_intersection_count,
             unsignalized_intersection_count=unsignalized_intersection_count,
+            total_eligible_segments=len(segments),
+            segments_analyzed=len(segments),
+            segments_returned=len(segments),
+            omitted_segments_count=0,
         )
 
         coverage = DataSourceCoverage(

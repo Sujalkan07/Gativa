@@ -1,6 +1,7 @@
 """TomTom Traffic Flow and Incidents API adapter."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import logging
 from typing import Optional
 import httpx
@@ -94,6 +95,7 @@ async def fetch_flow_for_point(
         if observed is not None and freeflow and freeflow > 0:
             reduction = 1.0 - (observed / freeflow)
 
+        now_ts = datetime.now(timezone.utc).isoformat()
         obs = TrafficObservation(
             segment_id=segment_id,
             observed_speed_kmh=float(observed) if observed is not None else None,
@@ -101,6 +103,7 @@ async def fetch_flow_for_point(
             speed_reduction_ratio=reduction,
             congestion_level=_classify_congestion(observed, freeflow),
             has_incident=False,
+            observation_timestamp=now_ts,
             source="tomtom",
         )
         return obs, DataSourceCoverage(source="tomtom_flow", status="ok")

@@ -100,6 +100,18 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
   const resultsSegmentsGroupRef = useRef<L.LayerGroup | null>(null)
   const resultsPolylineMapRef = useRef<Map<string, L.Polyline>>(new Map())
 
+  // Stale-response protection refs (Issue O)
+  const currentAnalysisIdRef = useRef<string>(analysis.analysis_id)
+  const activeSimIdRef = useRef<string | null>(simId)
+
+  useEffect(() => {
+    currentAnalysisIdRef.current = analysis.analysis_id
+  }, [analysis.analysis_id])
+
+  useEffect(() => {
+    activeSimIdRef.current = simId
+  }, [simId])
+
   const TOMTOM_KEY = import.meta.env.VITE_TOMTOM_API_KEY
 
   const getErrorMessage = (err: unknown): string => {
@@ -128,9 +140,10 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
       const s = customConfig?.simSeed ?? seed
       const manual = lvl === 'custom' ? (customConfig?.manualCount ?? manualVehicles) : undefined
 
+      const targetAnalysisId = analysis.analysis_id
       api
         .prepareSimulation({
-          analysis_id: analysis.analysis_id,
+          analysis_id: targetAnalysisId,
           duration_seconds: dur,
           strategy: 'actuated_adaptive',
           demand_level: lvl,
@@ -139,7 +152,10 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
           seed: s,
         })
         .then(async (res) => {
+          if (currentAnalysisIdRef.current !== targetAnalysisId) return
+
           setSimId(res.sim_id)
+          activeSimIdRef.current = res.sim_id
           setSimStatus(res)
           setIsPreparing(false)
 
@@ -151,6 +167,8 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
               api.getSimulationSignals(res.sim_id),
               api.getCongestionResults(res.sim_id),
             ])
+            if (currentAnalysisIdRef.current !== targetAnalysisId) return
+
             if (baseRes.status === 'fulfilled') setBaselineStatus(baseRes.value)
             if (compRes.status === 'fulfilled') setComparison(compRes.value)
             if (sigRes.status === 'fulfilled') setSignalsList(sigRes.value)
@@ -160,8 +178,16 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
           }
         })
         .catch((err) => {
+          if (currentAnalysisIdRef.current !== targetAnalysisId) return
           setError(getErrorMessage(err))
           setIsPreparing(false)
+          setSimId(null)
+          activeSimIdRef.current = null
+          setSimStatus(null)
+          setBaselineStatus(null)
+          setComparison(null)
+          setSignalsList(null)
+          setCongestion(null)
         })
     },
     [analysis.analysis_id, demandLevel, demandProfile, durationSeconds, manualVehicles, seed],
@@ -173,10 +199,15 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
 
   // ─── Fetch Congestion Telemetry ─────────────────────────────────────────────
   const fetchCongestion = useCallback((id: string) => {
+    if (!id) return
     setIsLoadingCongestion(true)
     api
       .getCongestionResults(id)
-      .then((data) => setCongestion(data))
+      .then((data) => {
+        if (id === activeSimIdRef.current) {
+          setCongestion(data)
+        }
+      })
       .catch((err) => console.warn('Failed to fetch congestion summary:', err))
       .finally(() => setIsLoadingCongestion(false))
   }, [])
@@ -1602,10 +1633,13 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
               </tr>
             </thead>
             <tbody className="divide-y divide-[#e2e8f0] font-mono text-xs">
-              {comparison?.rows?.map((row, idx) => {
+              {[...(comparison?.rows ?? []), ...(comparison?.extended_rows ?? [])].map((row, idx) => {
                 const isPending =
                   row.variance.toLowerCase().includes('pending') ||
-                  row.variance.toLowerCase().includes('insufficient')
+                  row.variance.toLowerCase().includes('insufficient') ||
+                  row.variance.toLowerCase().includes('zero baseline') ||
+                  row.variance.toLowerCase().includes('n/a') ||
+                  row.variance.toLowerCase().includes('gridlock')
                 return (
                   <tr key={idx} className="hover:bg-[#f8f9ff]">
                     <td className="py-3 px-4 font-sans font-medium text-[#0A1145]">{row.metric}</td>
@@ -1615,7 +1649,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
                       <span
                         className={`inline-flex items-center gap-1 px-2 py-0.5 rounded font-bold ${
                           isPending
-                            ? 'text-slate-500 bg-slate-100'
+                            ? 'text-slate-600 bg-slate-100 font-medium'
                             : row.is_improvement
                               ? 'text-[#138808] bg-[#e6f4ea]'
                               : 'text-[#DC2626] bg-[#fde8e8]'

@@ -31,8 +31,26 @@ def test_sumo_network_builder():
     """Verify SumoNetworkBuilder generates valid XML files and netconvert succeeds."""
     with tempfile.TemporaryDirectory() as tmp_dir:
         builder = SumoNetworkBuilder(Path(tmp_dir))
+
+        # 1. Real road segments with zero traffic signals (Issue A)
+        real_segments = [
+            {
+                "segment_id": "seg_1",
+                "geometry": {"type": "LineString", "coordinates": [[77.59, 12.97], [77.60, 12.97]]},
+                "speed_limit_kmh": 50.0,
+                "lanes": 2,
+                "is_oneway": False,
+            },
+            {
+                "segment_id": "seg_2",
+                "geometry": {"type": "LineString", "coordinates": [[77.60, 12.97], [77.61, 12.97]]},
+                "speed_limit_kmh": 50.0,
+                "lanes": 2,
+                "is_oneway": False,
+            },
+        ]
         result = builder.build(
-            segments=[],
+            segments=real_segments,
             duration_seconds=300,
             demand_rate_veh_hr=2000,
         )
@@ -41,7 +59,36 @@ def test_sumo_network_builder():
         assert Path(result["rou_file"]).is_file()
         assert result["edge_count"] > 0
         assert result["junction_count"] > 0
-        assert result["signal_count"] >= 1
+        assert result["signal_count"] == 0
+
+        # 2. Road segments with verified traffic signal
+        signalized_segments = [
+            {
+                "segment_id": "seg_sig_1",
+                "geometry": {"type": "LineString", "coordinates": [[77.59, 12.97], [77.60, 12.97]]},
+                "u_control": "traffic_signal",
+                "u_provenance": "source_verified",
+            }
+        ]
+        result_sig = builder.build(
+            segments=signalized_segments,
+            duration_seconds=300,
+            demand_rate_veh_hr=2000,
+        )
+        assert result_sig["signal_count"] >= 1
+
+        # 3. Explicit synthetic demo mode
+        result_demo = builder.build(
+            segments=[],
+            duration_seconds=300,
+            allow_synthetic=True,
+        )
+        assert result_demo["edge_count"] > 0
+        assert result_demo["network_provenance"] == "synthetic_demo"
+
+        # 4. Critical Issue B: Reject empty segments when allow_synthetic is False
+        with pytest.raises(ValueError, match="No road segments provided"):
+            builder.build(segments=[], allow_synthetic=False)
 
 
 def test_fallback_net_xml_marked_unvalidated():
@@ -61,7 +108,7 @@ def test_simulation_session_lifecycle():
     """Verify SimulationSession lifecycle: ready -> start -> step -> pause -> reset -> stop."""
     with tempfile.TemporaryDirectory() as tmp_dir:
         builder = SumoNetworkBuilder(Path(tmp_dir))
-        meta = builder.build(segments=[], duration_seconds=120)
+        meta = builder.build(segments=[], duration_seconds=120, allow_synthetic=True)
 
         session = SimulationSession(
             sim_id="test_sim_lifecycle",
@@ -75,6 +122,7 @@ def test_simulation_session_lifecycle():
             junction_count=meta["junction_count"],
             signal_count=meta["signal_count"],
             netconvert_used=meta["netconvert_used"],
+            is_synthetic_demo=True,
         )
 
         try:
@@ -288,7 +336,18 @@ def test_scenario_comparator_division_by_zero():
 
 def test_simulation_api_endpoints():
     """Verify HTTP API endpoints for simulation preparation, step, and comparison."""
-    # 1. Prepare
+    # 1. Validation failure: Missing analysis without synthetic demo returns 404 (Issue B)
+    missing_resp = client.post(
+        "/api/simulations/prepare",
+        json={
+            "analysis_id": "non_existent_analysis_xyz",
+            "duration_seconds": 600,
+            "demand_rate_veh_hr": 2840,
+        },
+    )
+    assert missing_resp.status_code == 404
+
+    # 2. Explicit synthetic demo mode succeeds (Issue B)
     prep_resp = client.post(
         "/api/simulations/prepare",
         json={
@@ -296,6 +355,8 @@ def test_simulation_api_endpoints():
             "duration_seconds": 600,
             "demand_rate_veh_hr": 2840,
             "strategy": "actuated_adaptive",
+            "is_synthetic_demo": True,
+            "is_synthetic_demo": True,
         },
     )
     assert prep_resp.status_code == 201
@@ -305,27 +366,28 @@ def test_simulation_api_endpoints():
     assert sim_data["engine_mode"] in ("native_sumo", "fallback")
     assert sim_data["edge_count"] > 0
     assert sim_data["junction_count"] > 0
+    assert sim_data["network_provenance"] == "synthetic_demo"
 
     try:
-        # 2. Get Status
+        # 3. Get Status
         status_resp = client.get(f"/api/simulations/{sim_id}")
         assert status_resp.status_code == 200
         assert status_resp.json()["sim_id"] == sim_id
         assert status_resp.json()["engine_mode"] in ("native_sumo", "fallback")
 
-        # 3. Start
+        # 4. Start
         start_resp = client.post(f"/api/simulations/{sim_id}/start")
         assert start_resp.status_code == 200
         assert start_resp.json()["state"] == "running"
 
-        # 4. Step
+        # 5. Step
         step_resp = client.post(f"/api/simulations/{sim_id}/step?steps=2")
         assert step_resp.status_code == 200
         step_data = step_resp.json()
         assert step_data["step"] == 2
         assert len(step_data["vehicles"]) > 0
 
-        # 5. Comparison
+        # 6. Comparison
         comp_resp = client.get(f"/api/simulations/{sim_id}/comparison")
         assert comp_resp.status_code == 200
         comp_data = comp_resp.json()
@@ -335,13 +397,13 @@ def test_simulation_api_endpoints():
         assert comp_data["baseline_strategy"] != ""
         assert comp_data["optimized_strategy"] != ""
     finally:
-        # 6. Stop
+        # 7. Stop
         stop_resp = client.post(f"/api/simulations/{sim_id}/stop")
         assert stop_resp.status_code == 200
 
 
 def test_polygon_centroid_corridor():
-    """Verify empty segments with polygon_coords builds corridor centered on polygon centroid."""
+    """Verify empty segments with polygon_coords builds corridor centered on polygon centroid in demo mode."""
     with tempfile.TemporaryDirectory() as tmp_dir:
         # Mumbai polygon coordinates
         mumbai_poly = [
@@ -352,7 +414,7 @@ def test_polygon_centroid_corridor():
             [72.8700, 19.0700],
         ]
         builder = SumoNetworkBuilder(Path(tmp_dir))
-        res = builder.build(segments=[], polygon_coords=mumbai_poly)
+        res = builder.build(segments=[], polygon_coords=mumbai_poly, allow_synthetic=True)
 
         assert res["netconvert_used"] is True or Path(res["net_file"]).is_file()
         assert res["edge_count"] > 0
@@ -365,10 +427,19 @@ def test_polygon_centroid_corridor():
 
 
 def test_traffic_lights_in_session_status():
-    """Verify session status returns valid TrafficLightState list."""
+    """Verify session status returns valid TrafficLightState list for signalized network and zero for unsignalized (Issue A)."""
     with tempfile.TemporaryDirectory() as tmp_dir:
         builder = SumoNetworkBuilder(Path(tmp_dir))
-        meta = builder.build(segments=[], duration_seconds=60)
+        # 1. Network with genuine verified traffic signals
+        sig_segments = [
+            {
+                "segment_id": "seg_sig_status",
+                "geometry": {"type": "LineString", "coordinates": [[77.59, 12.97], [77.60, 12.97]]},
+                "u_control": "traffic_signal",
+                "u_provenance": "source_verified",
+            }
+        ]
+        meta = builder.build(segments=sig_segments, duration_seconds=60)
 
         session = SimulationSession(
             sim_id="test_tl_status",
@@ -381,6 +452,7 @@ def test_traffic_lights_in_session_status():
             edge_count=meta["edge_count"],
             junction_count=meta["junction_count"],
             signal_count=meta["signal_count"],
+            road_segments=sig_segments,
             netconvert_used=False,  # Fallback to test deterministic signals
         )
         try:
@@ -396,6 +468,36 @@ def test_traffic_lights_in_session_status():
             assert tl["state"] in ("green", "yellow", "red")
         finally:
             session.stop()
+
+        # 2. Network with zero signals must honestly report 0 signals
+        unsig_segments = [
+            {
+                "segment_id": "seg_unsig_status",
+                "geometry": {"type": "LineString", "coordinates": [[77.59, 12.97], [77.60, 12.97]]},
+            }
+        ]
+        meta_unsig = builder.build(segments=unsig_segments, duration_seconds=60)
+        session_unsig = SimulationSession(
+            sim_id="test_tl_status_unsig",
+            analysis_id="test_tl_analysis_unsig",
+            work_dir=Path(tmp_dir),
+            cfg_file=Path(meta_unsig["cfg_file"]),
+            duration_seconds=60,
+            demand_rate_veh_hr=2000,
+            strategy="actuated_adaptive",
+            edge_count=meta_unsig["edge_count"],
+            junction_count=meta_unsig["junction_count"],
+            signal_count=meta_unsig["signal_count"],
+            road_segments=unsig_segments,
+            netconvert_used=False,
+        )
+        try:
+            session_unsig.start()
+            status_unsig = session_unsig.step(num_steps=1)
+            assert status_unsig["signal_count"] == 0
+            assert status_unsig["traffic_lights"] == []
+        finally:
+            session_unsig.stop()
 
 
 def test_routable_routes_generation():
@@ -441,6 +543,7 @@ def test_step_speed_multipliers():
             "duration_seconds": 600,
             "demand_rate_veh_hr": 2500,
             "strategy": "actuated_adaptive",
+            "is_synthetic_demo": True,
         },
     )
     assert prep_resp.status_code == 201

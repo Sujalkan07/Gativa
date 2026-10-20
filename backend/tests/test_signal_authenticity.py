@@ -169,7 +169,7 @@ def test_cumulative_whole_run_telemetry():
     """Verify that congestion analysis aggregates telemetry across > 60 steps via _edge_cumulative_stats."""
     with tempfile.TemporaryDirectory() as tmp_dir:
         builder = SumoNetworkBuilder(Path(tmp_dir))
-        meta = builder.build(segments=[], duration_seconds=300)
+        meta = builder.build(segments=[], duration_seconds=300, allow_synthetic=True)
 
         session = SimulationSession(
             sim_id="sim_cum_telemetry_test",

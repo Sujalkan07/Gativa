@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import get_settings
 from app.core.database import connect_to_mongo, close_mongo_connection
+from app.core.sqlite_store import init_sqlite_db
 from app.api import health, analyses, simulations
 
 
@@ -16,6 +17,7 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan: startup and shutdown logic."""
+    init_sqlite_db()
     await connect_to_mongo()
     yield
     await close_mongo_connection()

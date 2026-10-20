@@ -60,6 +60,10 @@ class RoadNetworkMetrics(BaseModel):
     road_class_distribution: dict[str, int]
     signalized_intersection_count: int = 0
     unsignalized_intersection_count: int = 0
+    total_eligible_segments: Optional[int] = None
+    segments_analyzed: Optional[int] = None
+    segments_returned: Optional[int] = None
+    omitted_segments_count: int = 0
 
 
 # ─── Traffic ──────────────────────────────────────────────────────────────────
@@ -100,6 +104,8 @@ class RoadSegment(BaseModel):
     v_control: Optional[JunctionControlType] = None
     u_provenance: Optional[ControlProvenance] = None
     v_provenance: Optional[ControlProvenance] = None
+    u: Optional[str] = None
+    v: Optional[str] = None
 
 
 class TrafficIncident(BaseModel):
@@ -288,6 +294,7 @@ class SimulationPrepareRequest(BaseModel):
     manual_vehicle_count: Optional[int] = None
     seed: Optional[int] = 42
     demand_data_source: Optional[str] = None
+    is_synthetic_demo: bool = False
 
 
 class VehiclePosition(BaseModel):
@@ -366,6 +373,10 @@ class SimulationStatusResponse(BaseModel):
     waiting_to_enter_count: int = 0
     teleported_count: int = 0
     error_message: Optional[str] = None
+    network_provenance: str = "real_osm"
+    assumptions: list[str] = Field(default_factory=list)
+    segments_simulated: int = 0
+    omitted_segments_count: int = 0
 
 
 class ScenarioMetricRow(BaseModel):

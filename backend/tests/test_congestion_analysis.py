@@ -303,7 +303,7 @@ def test_native_sumo_end_to_end_congestion_analysis():
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         builder = SumoNetworkBuilder(Path(tmp_dir))
-        meta = builder.build([], duration_seconds=60)
+        meta = builder.build([], duration_seconds=60, allow_synthetic=True)
         session = SimulationSession(
             sim_id="test_native_e2e",
             analysis_id="test_analysis",
@@ -311,6 +311,7 @@ def test_native_sumo_end_to_end_congestion_analysis():
             cfg_file=Path(meta["cfg_file"]),
             duration_seconds=60,
             netconvert_used=meta["netconvert_used"],
+            is_synthetic_demo=True,
         )
         session._segment_edge_map = meta["segment_edge_map"]
         try:

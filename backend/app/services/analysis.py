@@ -276,6 +276,20 @@ async def run_analysis(polygon: GeoJSONPolygon) -> AnalysisResult:
         ),
     )
 
+    total_eligible = len(segments)
+    capped_segments = prioritized_segments[:600]
+    omitted = max(0, total_eligible - len(capped_segments))
+
+    road_metrics.total_eligible_segments = total_eligible
+    road_metrics.segments_analyzed = total_eligible
+    road_metrics.segments_returned = len(capped_segments)
+    road_metrics.omitted_segments_count = omitted
+
+    if omitted > 0:
+        warnings.append(
+            f"Road network truncated: returning {len(capped_segments)} prioritized segments out of {total_eligible} total eligible segments to maintain responsive performance."
+        )
+
     result = AnalysisResult(
         analysis_id=analysis_id,
         status="completed",
@@ -285,7 +299,7 @@ async def run_analysis(polygon: GeoJSONPolygon) -> AnalysisResult:
         created_at=created_at,
         completed_at=completed_at,
         road_network=road_metrics,
-        segments=prioritized_segments[:600],  # Cap with priority preserved
+        segments=capped_segments,  # Cap with priority preserved (600 segments)
         bottlenecks=bottlenecks,
         weather=weather,
         data_sources=data_sources,
@@ -294,7 +308,7 @@ async def run_analysis(polygon: GeoJSONPolygon) -> AnalysisResult:
 
     # Persist
     await _persist_analysis(analysis_id, result)
-    await _persist_traffic_flow(analysis_id, prioritized_segments[:600], incidents, traffic_by_segment)
+    await _persist_traffic_flow(analysis_id, capped_segments, incidents, traffic_by_segment)
     await _persist_recommendations(analysis_id, recs_result)
 
     logger.info(
@@ -355,7 +369,7 @@ async def _persist_traffic_flow(
     doc = {
         "_id": analysis_id,
         "analysis_id": analysis_id,
-        "segments": [s.model_dump() for s in segments[:500]],
+        "segments": [s.model_dump() for s in segments[:600]],
         "incidents": [i.model_dump() for i in incidents],
         "traffic_map": {k: v.model_dump() for k, v in traffic_by_segment.items()},
     }

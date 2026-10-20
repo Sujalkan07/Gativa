@@ -4,6 +4,7 @@ Supports start, pause, step, reset, stop, adaptive signal actuation, and real-ti
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import socket
@@ -71,6 +72,9 @@ class SimulationSession:
         demand_source_label: Optional[str] = None,
         scheduled_vehicles: int = 0,
         signal_overrides: Optional[dict[str, str]] = None,
+        is_synthetic_demo: bool = False,
+        assumptions: Optional[list[str]] = None,
+        omitted_segments_count: int = 0,
     ):
         self.sim_id = sim_id
         self.analysis_id = analysis_id
@@ -91,13 +95,19 @@ class SimulationSession:
         self.demand_source_label = demand_source_label or f"Calibrated {demand_level} demand ({demand_rate_veh_hr:,} veh/hr)"
         self.scheduled_vehicles = scheduled_vehicles
         self.signal_overrides = signal_overrides or {}
+        self.is_synthetic_demo = is_synthetic_demo
+        self.assumptions = assumptions or []
+        self.omitted_segments_count = omitted_segments_count
+        self.network_provenance = "synthetic_demo" if is_synthetic_demo else "real_osm"
 
         if not self.road_segments:
-            builder = SumoNetworkBuilder(self.work_dir)
-            if self.polygon_coords and len(self.polygon_coords) >= 3:
-                self.road_segments = builder._corridor_from_polygon(self.polygon_coords)
-            else:
-                self.road_segments = builder._default_corridor_segments()
+            if is_synthetic_demo:
+                builder = SumoNetworkBuilder(self.work_dir)
+                if self.polygon_coords and len(self.polygon_coords) >= 3:
+                    self.road_segments = builder._corridor_from_polygon(self.polygon_coords)
+                else:
+                    self.road_segments = builder._default_corridor_segments()
+                self.assumptions.append("synthetic_corridor_fallback")
 
         self.state: SimulationState = "ready"
         self.engine_mode: SimulationEngineMode = "unavailable"
@@ -876,6 +886,10 @@ class SimulationSession:
             "waiting_to_enter_count": self.waiting_to_enter_count,
             "teleported_count": self.teleported_count,
             "error_message": self.error_message,
+            "network_provenance": self.network_provenance,
+            "assumptions": self.assumptions,
+            "segments_simulated": self.edge_count,
+            "omitted_segments_count": self.omitted_segments_count,
         }
 
 
@@ -987,7 +1001,9 @@ class SimulationSession:
                 quality = "estimated"
                 is_opt = self.strategy == "actuated_adaptive"
                 road_factor = 1.15 if road_type == "highway" else (0.85 if road_type == "local" else 1.0)
-                seg_hash = (abs(hash(seg_id)) % 25) / 100.0  # 0.00 to 0.24
+                # Deterministic cross-process SHA-256 hash (Issue I)
+                seg_hash_int = int(hashlib.sha256(seg_id.encode("utf-8")).hexdigest()[:8], 16)
+                seg_hash = (seg_hash_int % 25) / 100.0  # 0.00 to 0.24 reproducible
                 length_m = float(meta.get("length_m") or 100.0)
                 length_factor = min(1.2, max(0.8, length_m / 150.0))
 

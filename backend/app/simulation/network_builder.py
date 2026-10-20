@@ -4,8 +4,10 @@ Generates .nod.xml, .edg.xml, routes.rou.xml, and simulation.sumocfg, and runs n
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -63,6 +65,7 @@ class SumoNetworkBuilder:
         vehicle_types: Optional[dict[str, float]] = None,
         manual_vehicle_count: Optional[int] = None,
         live_observations: Optional[list[dict[str, Any]]] = None,
+        allow_synthetic: bool = False,
     ) -> dict[str, Any]:
         """
         Create complete SUMO simulation directory:
@@ -79,7 +82,9 @@ class SumoNetworkBuilder:
         cfg_file = self.work_dir / "simulation.sumocfg"
 
         # 1. Process Nodes and Edges
-        nodes, edges, segment_edge_map = self._extract_nodes_and_edges(segments, polygon_coords)
+        nodes, edges, segment_edge_map, edge_segment_map, assumptions = self._extract_nodes_and_edges(
+            segments, polygon_coords, allow_synthetic=allow_synthetic
+        )
         self._write_nodes_xml(nod_file, nodes)
         self._write_edges_xml(edg_file, edges)
 
@@ -171,13 +176,21 @@ class SumoNetworkBuilder:
             "edges": edges,
             # segment_id → [sumo_edge_id, ...] map used for congestion telemetry
             "segment_edge_map": segment_edge_map,
+            # sumo_edge_id → source segment_id map for reverse lookup
+            "edge_segment_map": edge_segment_map,
+            "assumptions": assumptions,
+            "total_eligible_segments": len(segments),
+            "segments_simulated": len(edges),
+            "omitted_segments_count": max(0, len(segments) - MAX_SEGMENTS),
+            "network_provenance": "synthetic_demo" if allow_synthetic and not segments else "real_osm",
         }
 
     def _extract_nodes_and_edges(
         self,
         segments: list[dict[str, Any]],
         polygon_coords: Optional[list[list[float]]] = None,
-    ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], dict[str, list[str]]]:
+        allow_synthetic: bool = False,
+    ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], dict[str, list[str]], dict[str, str], list[str]]:
         """
         Extract clean node coordinates and directional edges from road segments.
 
@@ -185,18 +198,30 @@ class SumoNetworkBuilder:
             nodes: node_id → node attributes
             edges: list of edge attribute dicts
             segment_edge_map: segment_id → list of SUMO edge IDs for congestion analysis
+            edge_segment_map: sumo_edge_id → source segment_id
+            assumptions: list of simulation modeling assumptions applied
         """
         nodes: dict[str, dict[str, Any]] = {}
         edges: list[dict[str, Any]] = []
         coord_to_node: dict[tuple[float, float], str] = {}
         segment_edge_map: dict[str, list[str]] = {}
+        edge_segment_map: dict[str, str] = {}
+        assumptions: list[str] = []
+        used_edge_ids: set[str] = set()
 
-        # If empty segments provided, construct corridor from polygon centroid or default
+        # If empty segments provided: ONLY construct corridor if explicitly allowed (synthetic demo)
         if not segments:
-            if polygon_coords and len(polygon_coords) >= 3:
-                segments = self._corridor_from_polygon(polygon_coords)
+            if allow_synthetic:
+                if polygon_coords and len(polygon_coords) >= 3:
+                    segments = self._corridor_from_polygon(polygon_coords)
+                else:
+                    segments = self._default_corridor_segments()
+                assumptions.append("synthetic_corridor_generated")
             else:
-                segments = self._default_corridor_segments()
+                raise ValueError(
+                    "No road segments provided for simulation network construction. "
+                    "Real-area simulations require valid road network data."
+                )
 
         # Truncate to MAX_SEGMENTS with explicit warning
         total_segments = len(segments)
@@ -208,6 +233,7 @@ class SumoNetworkBuilder:
                 total_segments, MAX_SEGMENTS, MAX_SEGMENTS,
             )
             segments = segments[:MAX_SEGMENTS]
+            assumptions.append(f"truncated_to_max_{MAX_SEGMENTS}_segments")
 
         # Build node coordinate registry
         for idx, seg in enumerate(segments):
@@ -216,17 +242,31 @@ class SumoNetworkBuilder:
             if len(coords) < 2:
                 continue
 
-            # Deduplicate nodes by coordinate so connected segments share junction nodes
+            # Node identity: prefer verified source node IDs if available
+            u_source_id = str(seg["u"]) if seg.get("u") is not None else None
+            v_source_id = str(seg["v"]) if seg.get("v") is not None else None
+
+            # Deduplicate nodes by coordinate (~1.1m precision at 5 decimals) or source ID
             u_coord_key = (round(coords[0][0], 5), round(coords[0][1], 5))
             v_coord_key = (round(coords[-1][0], 5), round(coords[-1][1], 5))
 
-            if u_coord_key not in coord_to_node:
-                coord_to_node[u_coord_key] = f"node_{len(coord_to_node)}"
-            if v_coord_key not in coord_to_node:
-                coord_to_node[v_coord_key] = f"node_{len(coord_to_node)}"
+            if u_source_id:
+                u_id = f"node_{u_source_id}"
+                coord_to_node[u_coord_key] = u_id
+            elif u_coord_key in coord_to_node:
+                u_id = coord_to_node[u_coord_key]
+            else:
+                u_id = f"node_{len(coord_to_node)}"
+                coord_to_node[u_coord_key] = u_id
 
-            u_id = coord_to_node[u_coord_key]
-            v_id = coord_to_node[v_coord_key]
+            if v_source_id:
+                v_id = f"node_{v_source_id}"
+                coord_to_node[v_coord_key] = v_id
+            elif v_coord_key in coord_to_node:
+                v_id = coord_to_node[v_coord_key]
+            else:
+                v_id = f"node_{len(coord_to_node)}"
+                coord_to_node[v_coord_key] = v_id
 
             # GeoJSON coordinates are [lon, lat]
             u_lon, u_lat = coords[0][0], coords[0][1]
@@ -287,10 +327,31 @@ class SumoNetworkBuilder:
                 nodes[v_id]["control"] = "roundabout"
                 nodes[v_id]["provenance"] = v_prov or "source_verified"
 
+            # Check and record road attribute assumptions
+            if seg.get("speed_limit_kmh") is None and "default_speed_50kmh_applied" not in assumptions:
+                assumptions.append("default_speed_50kmh_applied")
+            if seg.get("lanes") is None and "default_lanes_2_applied" not in assumptions:
+                assumptions.append("default_lanes_2_applied")
+
             speed_kmh = float(seg.get("speed_limit_kmh") or 50.0)
             lanes = max(1, min(4, int(seg.get("lanes") or 2)))
-            edge_id = str(seg.get("segment_id") or f"edge_{idx}")
-            safe_edge_id = "".join(c if (c.isalnum() or c == "_") else "_" for c in edge_id)
+            raw_seg_id = str(seg.get("segment_id") or f"edge_{idx}")
+
+            # Collision-safe deterministic edge ID sanitization (Issue D)
+            clean_base = re.sub(r"[^a-zA-Z0-9_]", "_", raw_seg_id)
+            if not clean_base or clean_base.strip("_") == "":
+                clean_base = f"edge_{idx}"
+
+            candidate_fwd = clean_base
+            if candidate_fwd in used_edge_ids:
+                disambig = hashlib.sha256(raw_seg_id.encode("utf-8")).hexdigest()[:6]
+                candidate_fwd = f"{clean_base}_{disambig}"
+                if candidate_fwd in used_edge_ids:
+                    candidate_fwd = f"{candidate_fwd}_{idx}"
+
+            used_edge_ids.add(candidate_fwd)
+            edge_segment_map[candidate_fwd] = raw_seg_id
+            safe_edge_id = candidate_fwd
 
             # Build shape strings for true physical road curvature
             shape_str = " ".join(f"{c[0]:.6f},{c[1]:.6f}" for c in coords)
@@ -307,13 +368,21 @@ class SumoNetworkBuilder:
             })
 
             # Track mapping from Gativa segment_id → SUMO edge IDs for congestion analysis
-            seg_id = str(seg.get("segment_id") or f"edge_{idx}")
             seg_edge_ids = [safe_edge_id]
 
-            # If bidirectional, add reverse edge
+            # If bidirectional, add reverse edge with collision-safe ID
             if not seg.get("is_oneway", False):
+                candidate_rev = f"{safe_edge_id}_rev"
+                if candidate_rev in used_edge_ids:
+                    disambig = hashlib.sha256(f"{raw_seg_id}_rev".encode("utf-8")).hexdigest()[:6]
+                    candidate_rev = f"{safe_edge_id}_rev_{disambig}"
+                    if candidate_rev in used_edge_ids:
+                        candidate_rev = f"{candidate_rev}_{idx}"
+                used_edge_ids.add(candidate_rev)
+                edge_segment_map[candidate_rev] = raw_seg_id
+
                 edges.append({
-                    "id": f"{safe_edge_id}_rev",
+                    "id": candidate_rev,
                     "from": v_id,
                     "to": u_id,
                     "speed": round(speed_kmh / 3.6, 2),
@@ -321,13 +390,13 @@ class SumoNetworkBuilder:
                     "shape": shape_str_rev,
                     "name": seg.get("name") or "Road Segment",
                 })
-                seg_edge_ids.append(f"{safe_edge_id}_rev")
+                seg_edge_ids.append(candidate_rev)
 
-            segment_edge_map[seg_id] = seg_edge_ids
+            segment_edge_map[raw_seg_id] = seg_edge_ids
 
         # Authenticity rule: Never classify junctions based on degree >= 3 or force a traffic light.
         # Zero-signal networks compile cleanly with priority rules.
-        return nodes, edges, segment_edge_map
+        return nodes, edges, segment_edge_map, edge_segment_map, assumptions
 
     def _write_nodes_xml(self, file_path: Path, nodes: dict[str, dict[str, Any]]):
         root = ET.Element("nodes")

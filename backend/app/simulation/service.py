@@ -53,8 +53,13 @@ class SimulationService:
         opt_dir.mkdir(parents=True, exist_ok=True)
         base_dir.mkdir(parents=True, exist_ok=True)
 
+        is_demo = getattr(req, "is_synthetic_demo", False)
+
         # Retrieve analysis details if available
         analysis = await get_analysis_by_id(req.analysis_id)
+        if not analysis and not is_demo:
+            raise KeyError(f"Analysis '{req.analysis_id}' not found. Cannot prepare real-area simulation.")
+
         segments_dict = []
         polygon_coords = []
         if analysis:
@@ -62,6 +67,9 @@ class SimulationService:
                 segments_dict = [s.model_dump() for s in analysis.segments]
             if analysis.polygon and analysis.polygon.coordinates:
                 polygon_coords = analysis.polygon.coordinates[0]
+
+        if not segments_dict and not is_demo:
+            raise ValueError(f"Analysis '{req.analysis_id}' contains no road network segments for simulation.")
 
         seed = req.seed or 42
 
@@ -77,6 +85,7 @@ class SimulationService:
             demand_profile=req.demand_profile or "peak",
             vehicle_types=req.vehicle_types,
             manual_vehicle_count=req.manual_vehicle_count,
+            allow_synthetic=is_demo,
         )
 
         # Clone compiled SUMO network files to Baseline scenario (100% parity, instant zero-overhead compilation)
@@ -106,8 +115,12 @@ class SimulationService:
             demand_data_source=build_meta_opt.get("demand_data_source", "road_network_estimation"),
             demand_source_label=build_meta_opt.get("demand_source_label"),
             scheduled_vehicles=build_meta_opt.get("scheduled_vehicles", 0),
+            is_synthetic_demo=is_demo,
+            assumptions=build_meta_opt.get("assumptions", []),
+            omitted_segments_count=build_meta_opt.get("omitted_segments_count", 0),
         )
         opt_session._segment_edge_map = build_meta_opt.get("segment_edge_map", {})
+        opt_session._edge_segment_map = build_meta_opt.get("edge_segment_map", {})
 
         # 2. Baseline Session (Fixed-time uncoordinated control on identical topology)
         base_session = SimulationSession(
@@ -129,8 +142,12 @@ class SimulationService:
             demand_data_source=build_meta_base.get("demand_data_source", "road_network_estimation"),
             demand_source_label=build_meta_base.get("demand_source_label"),
             scheduled_vehicles=build_meta_base.get("scheduled_vehicles", 0),
+            is_synthetic_demo=is_demo,
+            assumptions=build_meta_base.get("assumptions", []),
+            omitted_segments_count=build_meta_base.get("omitted_segments_count", 0),
         )
         base_session._segment_edge_map = build_meta_base.get("segment_edge_map", {})
+        base_session._edge_segment_map = build_meta_base.get("edge_segment_map", {})
 
         self._sessions[sim_id] = opt_session
         self._baseline_sessions[sim_id] = base_session
