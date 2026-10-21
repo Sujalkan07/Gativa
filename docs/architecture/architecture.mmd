@@ -1,0 +1,52 @@
+flowchart TD
+    U["User: draw/select corridor"]
+    MAP["React MapSelectionPage<br/>polygon validation + GeoJSON"]
+    CLIENT["Axios API client<br/>frontend/src/api/client.ts"]
+    API["FastAPI app + routers<br/>backend/main.py"]
+    ANALYSIS_API["Analysis endpoints<br/>app/api/analyses.py"]
+    ANALYSIS["Analysis orchestration<br/>app/services/analysis.py"]
+    OSM["OSMnx road-network pipeline<br/>app/geospatial/road_network.py"]
+    TOMTOM["TomTom Flow / Incidents<br/>app/data_ingestion/tomtom.py"]
+    WEATHER["OpenWeather adapter<br/>app/data_ingestion/openweather.py"]
+    FEATURES["Feature engineering<br/>app/features/pipeline.py"]
+    ML["Congestion classifier<br/>app/ml/classifier.py"]
+    RECS["Recommendations engine<br/>app/recommendations/engine.py"]
+    SQLITE[("SQLite store<br/>app/core/sqlite_store.py")]
+    MONGO[("Optional MongoDB / Motor<br/>app/core/database.py")]
+    DASH["Analysis dashboard<br/>AnalysisDashboardPage.tsx"]
+    SIM_API["Simulation endpoints<br/>app/api/simulations.py"]
+    SIM_SVC["Simulation orchestration<br/>app/simulation/service.py"]
+    BUILDER["SUMO network builder<br/>app/simulation/network_builder.py"]
+    ENGINE["SUMO + netconvert / TraCI<br/>runtime-dependent"]
+    COMPARE["Baseline vs optimized comparator<br/>app/simulation/scenario_comparator.py"]
+    MAPVIEW["Leaflet analysis + simulation views"]
+
+    U --> MAP -->|"POST /api/analyses (GeoJSON)"| CLIENT --> API
+    API --> ANALYSIS_API --> ANALYSIS
+    ANALYSIS --> OSM
+    ANALYSIS --> TOMTOM
+    ANALYSIS --> WEATHER
+    OSM --> FEATURES
+    TOMTOM --> FEATURES
+    WEATHER --> FEATURES
+    FEATURES -. "feature/model relationship exists; exact inference call path to verify" .-> ML
+    ANALYSIS --> RECS
+    ANALYSIS --> SQLITE
+    ANALYSIS -. "optional persistence path; verify read/write fallback" .-> MONGO
+    ANALYSIS -->|"analysis id + results"| CLIENT
+    CLIENT --> DASH
+    DASH --> MAPVIEW
+    DASH -->|"prepare/start/step/status"| CLIENT
+    CLIENT --> SIM_API --> SIM_SVC
+    SIM_SVC --> BUILDER --> ENGINE
+    ENGINE --> COMPARE
+    COMPARE --> SIM_SVC
+    SIM_SVC --> SQLITE
+    SIM_SVC -->|"status / telemetry / comparison / congestion"| CLIENT
+
+    classDef verified fill:#e8f4ff,stroke:#3573a8,color:#102a43;
+    classDef external fill:#fff4dc,stroke:#ad7b00,color:#523900;
+    classDef uncertain fill:#fce8e6,stroke:#b3261e,color:#5f1410;
+    class MAP,CLIENT,API,ANALYSIS_API,ANALYSIS,OSM,FEATURES,RECS,SQLITE,SIM_API,SIM_SVC,BUILDER,COMPARE,DASH verified;
+    class TOMTOM,WEATHER,MONGO,ENGINE external;
+    class ML uncertain;
