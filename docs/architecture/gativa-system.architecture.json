@@ -1,0 +1,485 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Gativa — Smart Traffic Optimization & Microscopic Simulation Architecture",
+    "output": "docs/architecture/gativa-system.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/Sujalkan07/Gativa.git",
+      "provider": "github",
+      "link_mode": "web",
+      "revision": "a202ae1c14d47964854be8200bac14b61bb1d6b2"
+    }
+  },
+  "components": [
+    {
+      "id": "ui_selection",
+      "type": "frontend",
+      "label": "Polygon Selection Canvas",
+      "sublabel": "React 19 + Leaflet :5173",
+      "tag": "OSM / CartoDB / Esri",
+      "pos": [40, 50],
+      "size": [160, 56],
+      "sources": [
+        { "path": "frontend/src/pages/MapSelectionPage.tsx", "line": 87, "end_line": 180, "label": "Polygon drawing & validation" },
+        { "path": "frontend/src/components/selection/LeafletDrawingMap.tsx", "line": 33, "end_line": 120, "label": "Leaflet interactive drawing canvas" }
+      ]
+    },
+    {
+      "id": "ui_dashboard",
+      "type": "frontend",
+      "label": "Analysis Dashboard",
+      "sublabel": "Overview, LOS & Recs Tabs",
+      "tag": "HCM 6th Edition LOS",
+      "pos": [40, 140],
+      "size": [160, 56],
+      "sources": [
+        { "path": "frontend/src/pages/AnalysisDashboardPage.tsx", "line": 17, "end_line": 95, "label": "Multi-tab dashboard lifecycle" },
+        { "path": "frontend/src/components/dashboard/AnalysisOverviewTab.tsx", "line": 40, "end_line": 120, "label": "KPIs & Recharts distribution" },
+        { "path": "frontend/src/components/dashboard/TrafficFlowTab.tsx", "line": 45, "end_line": 130, "label": "HCM Level of Service gradient" }
+      ]
+    },
+    {
+      "id": "ui_sim_tab",
+      "type": "frontend",
+      "label": "SUMO Simulation Canvas",
+      "sublabel": "TraCI Animation & Controls",
+      "tag": "5 FPS Playback Loop",
+      "pos": [40, 230],
+      "size": [160, 56],
+      "sources": [
+        { "path": "frontend/src/components/dashboard/SumoSimulationTab.tsx", "line": 28, "end_line": 120, "label": "Simulation lifecycle & controls" },
+        { "path": "frontend/src/components/dashboard/SumoSimulationTab.tsx", "line": 310, "end_line": 400, "label": "Vehicle animation & signal phases" }
+      ]
+    },
+    {
+      "id": "api_client",
+      "type": "frontend",
+      "label": "Axios API Client",
+      "sublabel": "Typed REST Client",
+      "tag": "Axios 1.7",
+      "pos": [250, 140],
+      "size": [150, 56],
+      "sources": [
+        { "path": "frontend/src/api/client.ts", "line": 20, "end_line": 61, "label": "Axios instance & error extractor" },
+        { "path": "frontend/src/api/client.ts", "line": 65, "end_line": 150, "label": "API endpoints contract" }
+      ]
+    },
+    {
+      "id": "api_gateway",
+      "type": "backend",
+      "label": "FastAPI Application",
+      "sublabel": "REST Router /api :8000",
+      "tag": "FastAPI 0.115",
+      "pos": [480, 140],
+      "size": [160, 56],
+      "sources": [
+        { "path": "backend/main.py", "line": 17, "end_line": 45, "label": "Lifespan & CORS middleware" },
+        { "path": "backend/app/api/analyses.py", "line": 22, "end_line": 70, "label": "Analysis endpoints" },
+        { "path": "backend/app/api/simulations.py", "line": 36, "end_line": 115, "label": "Simulation control endpoints" }
+      ]
+    },
+    {
+      "id": "analysis_service",
+      "type": "backend",
+      "label": "Analysis Orchestrator",
+      "sublabel": "Pipeline Service",
+      "tag": "Async Ingestion",
+      "pos": [480, 50],
+      "size": [160, 56],
+      "sources": [
+        { "path": "backend/app/services/analysis.py", "line": 81, "end_line": 140, "label": "run_analysis pipeline entry" },
+        { "path": "backend/app/services/analysis.py", "line": 141, "end_line": 274, "label": "TomTom & weather ingestion" },
+        { "path": "backend/app/services/analysis.py", "line": 343, "end_line": 420, "label": "Storage persistence logic" }
+      ]
+    },
+    {
+      "id": "geo_engine",
+      "type": "backend",
+      "label": "OSMnx & Graph Engine",
+      "sublabel": "NetworkX Centrality",
+      "tag": "WGS84 Geodesic",
+      "pos": [730, 50],
+      "size": [160, 56],
+      "sources": [
+        { "path": "backend/app/geospatial/road_network.py", "line": 79, "end_line": 140, "label": "Geodesic area & length calculations" },
+        { "path": "backend/app/geospatial/road_network.py", "line": 464, "end_line": 560, "label": "OSM extraction & clipping" },
+        { "path": "backend/app/geospatial/road_network.py", "line": 695, "end_line": 750, "label": "Betweenness centrality bottlenecks" }
+      ]
+    },
+    {
+      "id": "ingestion_engine",
+      "type": "backend",
+      "label": "Data Ingestion Engine",
+      "sublabel": "TomTom & Weather Adapters",
+      "tag": "httpx Async",
+      "pos": [730, 140],
+      "size": [160, 56],
+      "sources": [
+        { "path": "backend/app/data_ingestion/tomtom.py", "line": 60, "end_line": 140, "label": "TomTom flow segment data" },
+        { "path": "backend/app/data_ingestion/tomtom.py", "line": 151, "end_line": 218, "label": "TomTom incident details" },
+        { "path": "backend/app/data_ingestion/openweather.py", "line": 42, "end_line": 100, "label": "OpenWeather telemetry" }
+      ]
+    },
+    {
+      "id": "rec_engine",
+      "type": "backend",
+      "label": "Recommendation Engine",
+      "sublabel": "Civil Interventions",
+      "tag": "Impact Scoring",
+      "pos": [730, 230],
+      "size": [160, 56],
+      "sources": [
+        { "path": "backend/app/recommendations/engine.py", "line": 58, "end_line": 100, "label": "Bottleneck impact scoring" },
+        { "path": "backend/app/recommendations/engine.py", "line": 266, "end_line": 360, "label": "generate_recommendations pipeline" }
+      ]
+    },
+    {
+      "id": "sqlite_store",
+      "type": "database",
+      "label": "SQLite Database",
+      "sublabel": "backend/data/gativa.db",
+      "tag": "Durable Store",
+      "pos": [730, 320],
+      "size": [160, 56],
+      "sources": [
+        { "path": "backend/app/core/sqlite_store.py", "line": 26, "end_line": 95, "label": "Database schema initialization" },
+        { "path": "backend/app/core/sqlite_store.py", "line": 105, "end_line": 160, "label": "Analyses & flow CRUD operations" }
+      ]
+    },
+    {
+      "id": "mongo_store",
+      "type": "database",
+      "label": "MongoDB (Optional)",
+      "sublabel": "Motor Async Client :27017",
+      "tag": "Memory Fallback",
+      "pos": [980, 320],
+      "size": [160, 56],
+      "sources": [
+        { "path": "backend/app/core/database.py", "line": 13, "end_line": 37, "label": "Async connection & ping" },
+        { "path": "backend/app/services/analysis.py", "line": 348, "end_line": 360, "label": "Replace_one document storage" }
+      ]
+    },
+    {
+      "id": "sim_service",
+      "type": "backend",
+      "label": "Simulation Orchestrator",
+      "sublabel": "Dual Session Manager",
+      "tag": "Baseline vs Optimized",
+      "pos": [480, 440],
+      "size": [160, 56],
+      "sources": [
+        { "path": "backend/app/simulation/service.py", "line": 50, "end_line": 125, "label": "prepare dual simulation sessions" },
+        { "path": "backend/app/simulation/service.py", "line": 238, "end_line": 296, "label": "start / pause / step / stop" },
+        { "path": "backend/app/simulation/service.py", "line": 304, "end_line": 357, "label": "scenario comparison & congestion" }
+      ]
+    },
+    {
+      "id": "net_builder",
+      "type": "backend",
+      "label": "SUMO Network Builder",
+      "sublabel": "XML Nodes, Edges & Trips",
+      "tag": "UTM Netconvert",
+      "pos": [730, 440],
+      "size": [160, 56],
+      "sources": [
+        { "path": "backend/app/simulation/network_builder.py", "line": 90, "end_line": 140, "label": "Network compilation & netconvert" },
+        { "path": "backend/app/simulation/network_builder.py", "line": 599, "end_line": 680, "label": "Demand trips generation" }
+      ]
+    },
+    {
+      "id": "traci_manager",
+      "type": "backend",
+      "label": "TraCI Session Manager",
+      "sublabel": "Live Socket Controller",
+      "tag": "Actuated Adaptive",
+      "pos": [730, 530],
+      "size": [160, 56],
+      "sources": [
+        { "path": "backend/app/simulation/traci_manager.py", "line": 208, "end_line": 290, "label": "TraCI socket lifecycle & step" },
+        { "path": "backend/app/simulation/traci_manager.py", "line": 695, "end_line": 780, "label": "Fallback kinematics engine" }
+      ]
+    },
+    {
+      "id": "scenario_comp",
+      "type": "backend",
+      "label": "Scenario Comparator",
+      "sublabel": "Empirical Variance Engine",
+      "tag": "Zero Synthetic Scaling",
+      "pos": [730, 620],
+      "size": [160, 56],
+      "sources": [
+        { "path": "backend/app/simulation/scenario_comparator.py", "line": 25, "end_line": 90, "label": "Baseline vs Optimized comparison" }
+      ]
+    },
+    {
+      "id": "ext_osm",
+      "type": "external",
+      "label": "OpenStreetMap",
+      "sublabel": "OSM API v0.6 & Overpass",
+      "tag": "Public GIS Data",
+      "pos": [980, 50],
+      "size": [160, 56],
+      "sources": [
+        { "path": "backend/app/geospatial/road_network.py", "line": 485, "end_line": 525, "label": "OSM v0.6 and Overpass mirror requests" }
+      ]
+    },
+    {
+      "id": "ext_tomtom",
+      "type": "external",
+      "label": "TomTom Traffic APIs",
+      "sublabel": "Flow & Incidents Telemetry",
+      "tag": "Live Sensor Data",
+      "pos": [980, 140],
+      "size": [160, 56],
+      "sources": [
+        { "path": "backend/app/data_ingestion/tomtom.py", "line": 60, "end_line": 140, "label": "Flow segment data endpoint" },
+        { "path": "backend/app/data_ingestion/tomtom.py", "line": 151, "end_line": 218, "label": "Incident details endpoint" }
+      ]
+    },
+    {
+      "id": "ext_weather",
+      "type": "external",
+      "label": "OpenWeather API",
+      "sublabel": "Microclimate Weather",
+      "tag": "Ambient Context",
+      "pos": [980, 230],
+      "size": [160, 56],
+      "sources": [
+        { "path": "backend/app/data_ingestion/openweather.py", "line": 42, "end_line": 100, "label": "Current weather query" }
+      ]
+    },
+    {
+      "id": "ext_sumo",
+      "type": "external",
+      "label": "Eclipse SUMO",
+      "sublabel": "netconvert & sumo binaries",
+      "tag": "Microscopic Simulator",
+      "pos": [980, 485],
+      "size": [160, 56],
+      "sources": [
+        { "path": "backend/app/simulation/network_builder.py", "line": 105, "end_line": 125, "label": "netconvert invocation" },
+        { "path": "backend/app/simulation/traci_manager.py", "line": 210, "end_line": 240, "label": "SUMO binary & TraCI connection" }
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "Frontend Client (React 19 + TypeScript + Leaflet)",
+      "wraps": ["ui_selection", "ui_dashboard", "ui_sim_tab", "api_client"]
+    },
+    {
+      "kind": "region",
+      "label": "Analysis & Geospatial Pipeline (FastAPI)",
+      "wraps": ["api_gateway", "analysis_service", "geo_engine", "ingestion_engine", "rec_engine"]
+    },
+    {
+      "kind": "region",
+      "label": "Storage Layer (Persistence)",
+      "wraps": ["sqlite_store", "mongo_store"]
+    },
+    {
+      "kind": "region",
+      "label": "Microscopic Simulation Subsystem (Eclipse SUMO + TraCI)",
+      "wraps": ["sim_service", "net_builder", "traci_manager", "scenario_comp"]
+    }
+  ],
+  "connections": [
+    {
+      "id": "selection-to-client",
+      "from": "ui_selection",
+      "to": "api_client",
+      "label": "draw polygon"
+    },
+    {
+      "id": "dashboard-to-client",
+      "from": "ui_dashboard",
+      "to": "api_client",
+      "label": "fetch analysis"
+    },
+    {
+      "id": "sim-to-client",
+      "from": "ui_sim_tab",
+      "to": "api_client",
+      "label": "step & control"
+    },
+    {
+      "id": "client-to-gateway",
+      "from": "api_client",
+      "to": "api_gateway",
+      "label": "HTTP REST :8000",
+      "variant": "emphasis"
+    },
+    {
+      "id": "gateway-to-analysis",
+      "from": "api_gateway",
+      "to": "analysis_service",
+      "label": "POST /analyses",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "gateway-to-simulation",
+      "from": "api_gateway",
+      "to": "sim_service",
+      "label": "POST /simulations",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "analysis-to-geo",
+      "from": "analysis_service",
+      "to": "geo_engine",
+      "label": "road network",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "geo-to-osm",
+      "from": "geo_engine",
+      "to": "ext_osm",
+      "label": "Overpass / v0.6",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "analysis-to-ingestion",
+      "from": "analysis_service",
+      "to": "ingestion_engine",
+      "label": "live feeds",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "ingestion-to-tomtom",
+      "from": "ingestion_engine",
+      "to": "ext_tomtom",
+      "label": "flow & alerts",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "ingestion-to-weather",
+      "from": "ingestion_engine",
+      "to": "ext_weather",
+      "label": "weather query",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "analysis-to-rec",
+      "from": "analysis_service",
+      "to": "rec_engine",
+      "label": "rank civil proposals",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "analysis-to-sqlite",
+      "from": "analysis_service",
+      "to": "sqlite_store",
+      "label": "save analysis & flow",
+      "fromSide": "right",
+      "toSide": "left",
+      "via": [[665, 78], [665, 348]]
+    },
+    {
+      "id": "sqlite-to-mongo",
+      "from": "sqlite_store",
+      "to": "mongo_store",
+      "label": "optional replication",
+      "variant": "dashed"
+    },
+    {
+      "id": "sim-to-sqlite",
+      "from": "sim_service",
+      "to": "sqlite_store",
+      "label": "load segments & decisions",
+      "fromSide": "top",
+      "toSide": "left"
+    },
+    {
+      "id": "sim-to-builder",
+      "from": "sim_service",
+      "to": "net_builder",
+      "label": "compile XML"
+    },
+    {
+      "id": "builder-to-sumo",
+      "from": "net_builder",
+      "to": "ext_sumo",
+      "label": "netconvert --proj.utm"
+    },
+    {
+      "id": "sim-to-traci",
+      "from": "sim_service",
+      "to": "traci_manager",
+      "label": "session control"
+    },
+    {
+      "id": "traci-to-sumo",
+      "from": "traci_manager",
+      "to": "ext_sumo",
+      "label": "TraCI socket client",
+      "variant": "emphasis"
+    },
+    {
+      "id": "traci-to-comparator",
+      "from": "traci_manager",
+      "to": "scenario_comp",
+      "label": "full-run telemetry",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "sim-to-comparator",
+      "from": "sim_service",
+      "to": "scenario_comp",
+      "label": "evaluate variance",
+      "fromSide": "right",
+      "toSide": "left"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Frontend Client (React 19 + TypeScript)",
+      "items": [
+        "Polygon drawing canvas & urban corridor presets powered by OpenStreetMap, CartoDB & Esri basemaps",
+        "Analysis dashboard with 4 specialized tabs: Overview KPIs, HCM 6th LOS speed gradients, Civil recommendations, and SUMO simulation",
+        "5 FPS playback loop animating real-time speed-coded vehicle markers and dynamic traffic signal phase states"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "FastAPI Backend & Geospatial Analytics",
+      "items": [
+        "OSMnx road graph extraction with WGS84 geodesic calculations and physical segment deduplication",
+        "NetworkX betweenness centrality identifies structural intersection bottlenecks across the corridor",
+        "Data ingestion engine correlates TomTom Flow & Incidents feeds with OpenWeather microclimate telemetry",
+        "Evidence-based recommendation engine produces prioritized civil interventions with mandatory civil engineering review notices"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "SUMO Microscopic Simulation Subsystem",
+      "items": [
+        "Compiles UTM-projected XML networks, routes, and demand through Eclipse SUMO netconvert",
+        "Dual independent execution: Optimized Scenario (Actuated Adaptive Signal Control) vs Baseline Scenario (Pre-Timed / Priority)",
+        "TraCI socket client manages live signal actuation with automatic fallback to polyline 2D kinematics when SUMO binary is absent",
+        "Cumulative edge telemetry evaluates post-simulation road-level congestion scores with zero synthetic multipliers"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Storage Layer & Persistence Hygiene",
+      "items": [
+        "Durable local persistence using SQLite (backend/data/gativa.db) for analyses, traffic flow, OSM cache, and candidate decisions",
+        "Optional MongoDB connection with graceful, automatic fallback to in-memory session dictionaries",
+        "Strict data provenance tracking: source_verified (OSM tags), source_inferred, and simulation_assumption"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "5e3851a9-2d5a-49b7-897c-2bb073aef8ea",
+  "status": "current",
+  "command": "deliver",
+  "type": "architecture",
+  "input": "C:\\Users\\sujal\\OneDrive\\Documents\\GitHub\\Gativa\\docs\\architecture\\gativa-system.architecture.json",
+  "output": "C:\\Users\\sujal\\OneDrive\\Documents\\GitHub\\Gativa\\docs\\architecture\\gativa-system.html",
+  "specification": {
+    "sha256": "bea044735b49ef5eb56c166a2ec9b28518c0babee15be6563c5d114483eb61c1",
+    "bytes": 17277
+  },
+  "artifact": {
+    "sha256": "d55a8e8ca9ce76947e7ffdc84688994792edce2ae83bedd4e198486ba216c930",
+    "bytes": 872458
+  }
+}
