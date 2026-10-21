@@ -1,58 +1,12 @@
 import { useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import Header from '../components/Header'
-import LeafletDrawingMap, { type Point } from '../components/selection/LeafletDrawingMap'
+import LeafletDrawingMap, { type Point, type SearchedLocationTarget } from '../components/selection/LeafletDrawingMap'
+import LocationSearchBox from '../components/selection/LocationSearchBox'
 import { api, GativaApiError } from '../api/client'
-import type { GeoJSONPolygon } from '../types/api'
+import type { GeoJSONPolygon, GeocodingResult } from '../types/api'
 
 const MAX_AREA_KM2 = 50
-
-export interface PresetCorridor {
-  name: string
-  city: string
-  center: Point
-  zoom: number
-  coords: Point[]
-}
-
-export const PRESET_CORRIDORS: PresetCorridor[] = [
-  {
-    name: 'Sitapur Rd / Jankipuram',
-    city: 'Lucknow',
-    center: { lat: 26.900, lng: 80.942 },
-    zoom: 14,
-    coords: [
-      { lat: 26.892, lng: 80.932 },
-      { lat: 26.892, lng: 80.952 },
-      { lat: 26.908, lng: 80.952 },
-      { lat: 26.908, lng: 80.932 },
-    ],
-  },
-  {
-    name: 'Connaught Place Radial Grid',
-    city: 'New Delhi',
-    center: { lat: 28.6315, lng: 77.2167 },
-    zoom: 14,
-    coords: [
-      { lat: 28.625, lng: 77.210 },
-      { lat: 28.625, lng: 77.225 },
-      { lat: 28.638, lng: 77.225 },
-      { lat: 28.638, lng: 77.210 },
-    ],
-  },
-  {
-    name: 'Indiranagar / 100ft Spine',
-    city: 'Bengaluru',
-    center: { lat: 12.9775, lng: 77.645 },
-    zoom: 14,
-    coords: [
-      { lat: 12.970, lng: 77.635 },
-      { lat: 12.970, lng: 77.655 },
-      { lat: 12.985, lng: 77.655 },
-      { lat: 12.985, lng: 77.635 },
-    ],
-  },
-]
 
 // ─── Area calculation helpers ─────────────────────────────────────────────────
 
@@ -92,7 +46,32 @@ export default function MapSelectionPage() {
   const [isDrawing, setIsDrawing] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [presetTrigger, setPresetTrigger] = useState<{ coords: Point[]; timestamp: number } | null>(null)
+  const [searchedLocation, setSearchedLocation] = useState<SearchedLocationTarget | null>(null)
+
+  // Handle location selection from search box
+  const handleSelectLocation = useCallback(
+    (loc: GeocodingResult) => {
+      // Clear any previously saved polygon if user moves to a new place
+      if (savedCoords.length >= 3 || draftPoints.length > 0) {
+        setSavedCoords([])
+        setDraftPoints([])
+        setAreaKm2(null)
+      }
+      setError(null)
+      setSearchedLocation({
+        lat: loc.lat,
+        lng: loc.lng,
+        name: loc.name,
+        bounding_box: loc.bounding_box,
+        timestamp: Date.now(),
+      })
+    },
+    [savedCoords.length, draftPoints.length]
+  )
+
+  const handleClearLocation = useCallback(() => {
+    setSearchedLocation(null)
+  }, [])
 
   // Start drawing
   const handleStartDrawing = useCallback(() => {
@@ -131,21 +110,10 @@ export default function MapSelectionPage() {
     setError(null)
   }, [draftPoints])
 
-  // Select a preset corridor
-  const handleSelectPreset = useCallback((preset: PresetCorridor) => {
-    setDraftPoints([])
-    setIsDrawing(false)
-    setError(null)
-    setSavedCoords(preset.coords)
-    const area = computeAreaKm2(preset.coords)
-    setAreaKm2(area)
-    setPresetTrigger({ coords: preset.coords, timestamp: Date.now() })
-  }, [])
-
   // Submit analysis
   const handleAnalyze = useCallback(async () => {
     if (savedCoords.length < 3) {
-      setError('Please draw or select a valid corridor boundary first.')
+      setError('Please draw a valid boundary on the map first.')
       return
     }
 
@@ -196,29 +164,17 @@ export default function MapSelectionPage() {
           savedCoords={savedCoords}
           onAddDraftPoint={handleAddDraftPoint}
           onCompletePolygon={handleCompletePolygon}
-          presetTrigger={presetTrigger}
+          searchedLocation={searchedLocation}
           className="w-full h-[calc(100vh-3.5rem)]"
         />
 
-        {/* Top Center Quick Corridor Presets Bar */}
-        <div className="absolute top-[calc(3.5rem+0.75rem)] left-1/2 -translate-x-1/2 z-[1000] pointer-events-auto flex items-center gap-2 bg-[var(--color-surface-container-lowest)]/95 backdrop-blur-sm px-3.5 py-1.5 rounded-full shadow-md border border-[var(--color-surface-container-high)]">
-          <span className="text-xs font-bold text-[var(--color-on-surface)] flex items-center gap-1 shrink-0">
-            <span className="material-symbols-outlined text-[15px] text-[var(--color-primary-container)]">
-              near_me
-            </span>
-            Corridors:
-          </span>
-          <div className="flex items-center gap-1.5">
-            {PRESET_CORRIDORS.map((p) => (
-              <button
-                key={p.name}
-                onClick={() => handleSelectPreset(p)}
-                className="px-2.5 py-0.5 rounded-full bg-[var(--color-surface-container-low)] hover:bg-[var(--color-secondary-fixed)] hover:text-[var(--color-on-secondary-fixed)] text-[var(--color-on-surface-variant)] text-xs font-semibold transition-colors whitespace-nowrap"
-              >
-                📍 {p.city}
-              </button>
-            ))}
-          </div>
+        {/* Top-left Location Search Bar */}
+        <div className="absolute top-[calc(3.5rem+0.75rem)] left-4 z-[1001] pointer-events-auto">
+          <LocationSearchBox
+            onSelectLocation={handleSelectLocation}
+            onClearLocation={handleClearLocation}
+            selectedLocationName={searchedLocation?.name}
+          />
         </div>
 
         {/* Top-right quick draw / clear floating toolbar */}
@@ -292,7 +248,7 @@ export default function MapSelectionPage() {
                 </div>
               </div>
             ) : !hasPolygon ? (
-              /* State B: Initial State — Prompt user to draw or choose corridor */
+              /* State B: Initial State — Prompt user to draw area */
               <div className="flex items-center justify-between gap-4">
                 <div className="flex items-center gap-3">
                   <span className="material-symbols-outlined text-[var(--color-secondary)] text-2xl">
@@ -303,7 +259,7 @@ export default function MapSelectionPage() {
                       Select an Analysis Area
                     </p>
                     <p className="text-xs text-[var(--color-on-surface-variant)] mt-0.5">
-                      Click a Corridor preset above or click "Draw Area" to sketch a polygon.
+                      Search a location above or click "Draw Area" to sketch a polygon boundary.
                     </p>
                   </div>
                 </div>

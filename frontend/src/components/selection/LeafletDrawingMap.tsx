@@ -7,6 +7,14 @@ export interface Point {
   lng: number
 }
 
+export interface SearchedLocationTarget {
+  lat: number
+  lng: number
+  name: string
+  bounding_box?: [number, number, number, number] | null
+  timestamp: number
+}
+
 interface LeafletDrawingMapProps {
   isDrawing: boolean
   draftPoints: Point[]
@@ -14,7 +22,7 @@ interface LeafletDrawingMapProps {
   onAddDraftPoint: (point: Point) => void
   onCompletePolygon: () => void
   className?: string
-  presetTrigger?: { coords: Point[]; timestamp: number } | null
+  searchedLocation?: SearchedLocationTarget | null
 }
 
 export default function LeafletDrawingMap({
@@ -24,7 +32,7 @@ export default function LeafletDrawingMap({
   onAddDraftPoint,
   onCompletePolygon,
   className = 'w-full h-full',
-  presetTrigger,
+  searchedLocation,
 }: LeafletDrawingMapProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<L.Map | null>(null)
@@ -35,6 +43,7 @@ export default function LeafletDrawingMap({
   const draftPolylineRef = useRef<L.Polyline | null>(null)
   const draftMarkersGroupRef = useRef<L.LayerGroup | null>(null)
   const completedPolygonRef = useRef<L.Polygon | null>(null)
+  const searchMarkerRef = useRef<L.Marker | null>(null)
 
   const [baseLayerType, setBaseLayerType] = useState<'streets' | 'satellite'>('streets')
   const [showTraffic, setShowTraffic] = useState(false)
@@ -291,17 +300,72 @@ export default function LeafletDrawingMap({
     }
   }, [savedCoords, isDrawing])
 
-  // 6. Handle Preset Trigger Smooth Fly-To
+  // 6. Handle Searched Location Pan, Zoom & Marker Pin
   useEffect(() => {
     const map = mapRef.current
-    if (!map || !presetTrigger || presetTrigger.coords.length === 0) return
+    if (!map) return
 
-    const latLngs: L.LatLngExpression[] = presetTrigger.coords.map((p) => [p.lat, p.lng])
-    const bounds = L.latLngBounds(latLngs)
-    if (bounds.isValid()) {
-      map.flyToBounds(bounds, { padding: [45, 45], duration: 1.0 })
+    // Remove old search marker if any
+    if (searchMarkerRef.current) {
+      map.removeLayer(searchMarkerRef.current)
+      searchMarkerRef.current = null
     }
-  }, [presetTrigger])
+
+    if (!searchedLocation) return
+
+    const { lat, lng, name, bounding_box } = searchedLocation
+
+    // Pan & zoom smoothly
+    if (bounding_box && bounding_box.length === 4) {
+      const [minLat, minLng, maxLat, maxLng] = bounding_box
+      const bounds = L.latLngBounds([
+        [minLat, minLng],
+        [maxLat, maxLng],
+      ])
+      if (bounds.isValid()) {
+        map.flyToBounds(bounds, { padding: [50, 50], maxZoom: 16, duration: 1.2 })
+      } else {
+        map.flyTo([lat, lng], 15, { duration: 1.2 })
+      }
+    } else {
+      map.flyTo([lat, lng], 15, { duration: 1.2 })
+    }
+
+    // Place an elegant marker pin
+    const pinIcon = L.divIcon({
+      className: 'gativa-search-pin',
+      iconSize: [32, 40],
+      iconAnchor: [16, 40],
+      html: `
+        <div class="relative flex flex-col items-center pointer-events-auto cursor-pointer">
+          <span class="absolute -top-1 w-6 h-6 rounded-full bg-[#ff9933]/40 animate-ping"></span>
+          <div class="w-8 h-8 rounded-full bg-[#0a1145] border-2 border-[#ff9933] shadow-lg flex items-center justify-center text-white">
+            <span class="material-symbols-outlined text-[17px] text-[#ff9933]">location_on</span>
+          </div>
+          <div class="w-1.5 h-2 bg-[#0a1145] -mt-0.5"></div>
+        </div>
+      `,
+    })
+
+    const marker = L.marker([lat, lng], { icon: pinIcon }).addTo(map)
+    marker.bindTooltip(
+      `<strong>${name}</strong><br/><span style="font-size: 11px; color: #545a90;">Draw area around this location to analyze</span>`,
+      {
+        permanent: false,
+        direction: 'top',
+        offset: [0, -38],
+        opacity: 0.95,
+      }
+    )
+    searchMarkerRef.current = marker
+
+    return () => {
+      if (searchMarkerRef.current) {
+        map.removeLayer(searchMarkerRef.current)
+        searchMarkerRef.current = null
+      }
+    }
+  }, [searchedLocation])
 
   return (
     <div className="relative w-full h-full">

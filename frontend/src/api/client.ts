@@ -13,6 +13,8 @@ import type {
   SignalEditResponse,
   SignalCandidateListResponse,
   CandidateDecisionRequest,
+  GeocodingResult,
+  GeocodingSearchResponse,
   ApiError,
 } from '../types/api'
 
@@ -147,5 +149,76 @@ export const api = {
 
   resetCandidates: async (analysisId: string): Promise<{ message: string }> =>
     handleRequest(client.post(`/api/simulations/${analysisId}/signal-candidates/reset`)),
+
+  searchLocations: async (
+    query: string,
+    limit: number = 6,
+    signal?: AbortSignal
+  ): Promise<GeocodingSearchResponse> => {
+    try {
+      const resp = await client.get<GeocodingSearchResponse>('/api/geocoding/search', {
+        params: { q: query, limit },
+        signal,
+        timeout: 6000,
+      })
+      return resp.data
+    } catch (err: unknown) {
+      if (axios.isCancel(err) || (err as { name?: string })?.name === 'CanceledError') {
+        throw err
+      }
+      try {
+        const fallbackUrl = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=jsonv2&addressdetails=1&limit=${limit}`
+        const fallbackResp = await fetch(fallbackUrl, {
+          signal,
+          headers: { 'Accept-Language': 'en' },
+        })
+        if (!fallbackResp.ok) throw new Error('Geocoding service unavailable')
+        const items = (await fallbackResp.json()) as Array<{
+          place_id?: string | number
+          lat: string | number
+          lon: string | number
+          display_name?: string
+          name?: string
+          boundingbox?: string[]
+          category?: string
+          type?: string
+        }>
+        const results: GeocodingResult[] = (Array.isArray(items) ? items : []).map((item) => {
+          const parts = String(item.display_name || '')
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+          const name = item.name || parts[0] || query
+          const secondary = parts.slice(1).join(', ') || null
+          const rawBbox = item.boundingbox
+          const bbox: [number, number, number, number] | null =
+            rawBbox && rawBbox.length === 4
+              ? [parseFloat(rawBbox[0]), parseFloat(rawBbox[2]), parseFloat(rawBbox[1]), parseFloat(rawBbox[3])]
+              : null
+          return {
+            place_id: String(item.place_id || `${item.lat}_${item.lon}`),
+            name,
+            display_name: item.display_name || name,
+            secondary_text: secondary,
+            lat: parseFloat(String(item.lat)),
+            lng: parseFloat(String(item.lon)),
+            bounding_box: bbox,
+            category: item.category,
+            type: item.type,
+            provider: 'openstreetmap_direct',
+          }
+        })
+        return {
+          query,
+          count: results.length,
+          results,
+          provider: 'openstreetmap_direct',
+        }
+      } catch (fallbackErr: unknown) {
+        if ((fallbackErr as { name?: string })?.name === 'AbortError') throw fallbackErr
+        throw new GativaApiError(extractError(err))
+      }
+    }
+  },
 }
 

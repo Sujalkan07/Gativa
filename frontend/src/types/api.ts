@@ -518,3 +518,25 @@ export interface CongestionSummary {
   all_results: CongestionRoadResult[]
   methodology_notes: string
 }
+
+// ─── Location Geocoding & Search ─────────────────────────────────────────────
+
+export interface GeocodingResult {
+  place_id: string
+  name: string
+  display_name: string
+  secondary_text?: string | null
+  lat: number
+  lng: number
+  bounding_box?: [number, number, number, number] | null // [min_lat, min_lng, max_lat, max_lng]
+  category?: string | null
+  type?: string | null
+  provider?: string
+}
+
+export interface GeocodingSearchResponse {
+  query: string
+  count: number
+  results: GeocodingResult[]
+  provider: string
+}

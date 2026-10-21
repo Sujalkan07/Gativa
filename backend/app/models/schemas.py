@@ -595,3 +595,26 @@ class CongestionSummary(BaseModel):
     all_results: list[CongestionRoadResult]
     methodology_notes: str
 
+
+# ─── Location Geocoding & Search ─────────────────────────────────────────────
+
+class GeocodingResult(BaseModel):
+    place_id: str
+    name: str
+    display_name: str
+    secondary_text: Optional[str] = None
+    lat: float
+    lng: float
+    bounding_box: Optional[list[float]] = None  # [min_lat, min_lng, max_lat, max_lng]
+    category: Optional[str] = None
+    type: Optional[str] = None
+    provider: str = "openstreetmap"
+
+
+class GeocodingSearchResponse(BaseModel):
+    query: str
+    count: int
+    results: list[GeocodingResult] = []
+    provider: str
+
+

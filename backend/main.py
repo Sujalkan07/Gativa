@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import get_settings
 from app.core.database import connect_to_mongo, close_mongo_connection
 from app.core.sqlite_store import init_sqlite_db
-from app.api import health, analyses, simulations
+from app.api import health, analyses, simulations, geocoding
 
 
 settings = get_settings()
@@ -43,3 +43,4 @@ app.add_middleware(
 app.include_router(health.router, prefix="/api")
 app.include_router(analyses.router, prefix="/api")
 app.include_router(simulations.router, prefix="/api")
+app.include_router(geocoding.router, prefix="/api")
