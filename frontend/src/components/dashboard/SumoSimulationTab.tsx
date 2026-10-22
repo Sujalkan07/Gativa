@@ -115,6 +115,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
   const currentAnalysisIdRef = useRef<string>(analysis.analysis_id)
   const activeSimIdRef = useRef<string | null>(simId)
   const isSteppingRef = useRef<boolean>(false)
+  const lastCongestionRefreshTimeRef = useRef<number>(0)
 
   useEffect(() => {
     currentAnalysisIdRef.current = analysis.analysis_id
@@ -167,6 +168,9 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
           demand_level: lvl,
           demand_profile: prof,
           manual_vehicle_count: manual,
+          // Custom demand is an on-network population experiment: spawn the
+          // exact number entered instead of applying the automatic 55% share.
+          initial_population: manual,
           seed: s,
         })
         .then(async (res) => {
@@ -174,6 +178,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
 
           setSimId(res.sim_id)
           activeSimIdRef.current = res.sim_id
+          lastCongestionRefreshTimeRef.current = 0
           setSimStatus(res)
           setIsPreparing(false)
 
@@ -552,14 +557,18 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
         ) {
           currentIds.add(veh.id)
           const isBus = veh.type === 'bus'
+          const trafficState =
+            veh.waiting_time_s >= 4 || veh.speed_kmh < 8
+              ? 'queued'
+              : veh.waiting_time_s >= 1 || veh.speed_kmh < 28
+                ? 'slowing'
+                : 'flowing'
           const speedColor =
-            veh.speed_kmh < 18
+            trafficState === 'queued'
               ? '#DC2626'
-              : veh.speed_kmh <= 35
+              : trafficState === 'slowing'
                 ? '#F59E0B'
-                : isBus
-                  ? '#0A1145'
-                  : '#138808'
+                : '#138808'
 
           const iconHtml = `<div style="transform: rotate(${veh.angle}deg); width: ${isBus ? '22px' : '16px'}; height: ${isBus ? '10px' : '8px'}; background-color: ${speedColor}; border: 1.5px solid #ffffff; border-radius: 2px; box-shadow: 0 1px 3px rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center;">
             ${isBus ? '<span style="font-size: 5px; color: #ffffff; font-weight: bold; font-family: monospace;">B</span>' : ''}
@@ -572,7 +581,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
             html: iconHtml,
           })
 
-          const tooltipHtml = `<div class="text-[11px] font-mono"><b>${veh.id}</b> (${veh.type})<br/>Speed: ${veh.speed_kmh.toFixed(1)} km/h<br/>Wait: ${veh.waiting_time_s.toFixed(1)}s</div>`
+          const tooltipHtml = `<div class="text-[11px] font-mono"><b>${veh.id}</b> (${veh.type})<br/>Traffic: ${trafficState}<br/>Speed: ${veh.speed_kmh.toFixed(1)} km/h<br/>Wait: ${veh.waiting_time_s.toFixed(1)}s</div>`
 
           const existingMarker = markersMap.get(veh.id)
           if (existingMarker) {
@@ -854,6 +863,16 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
             }
           }
 
+          // Keep the Results map tied to the running simulation instead of
+          // leaving it on the first partial snapshot until completion.
+          if (
+            viewMode === 'results' &&
+            res.elapsed_seconds - lastCongestionRefreshTimeRef.current >= 1.0
+          ) {
+            lastCongestionRefreshTimeRef.current = res.elapsed_seconds
+            fetchCongestion(simId)
+          }
+
           if (res.state === 'completed') {
             setIsPlaying(false)
             api.getScenarioComparison(simId).then(setComparison).catch(() => {})
@@ -955,6 +974,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
     baselineVehiclesGroupRef.current?.clearLayers()
     optimizedVehiclesGroupRef.current?.clearLayers()
     setCongestion(null)
+    lastCongestionRefreshTimeRef.current = 0
     setSelectedSegmentId(null)
     api
       .resetSimulation(simId)
@@ -1272,7 +1292,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
             <div>
               {demandLevel === 'custom' ? (
                 <div>
-                  <label className="block text-slate-600 font-medium mb-1">Target Vehicles:</label>
+                  <label className="block text-slate-600 font-medium mb-1">Vehicles at Start:</label>
                   <input
                     type="number"
                     min={10}
@@ -1298,7 +1318,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
 
           <div className="flex items-center justify-between pt-2 border-t border-[#cbdbf5]">
             <span className="text-[11px] text-slate-500">
-              Boundary through-trips prioritized (75%) over internal trips (25%) with minimum 2.0s departure headways.
+              Custom demand places the entered vehicle count across the selected roads at time zero. Other demand modes use boundary through-trips with minimum 2.0s departure headways.
             </span>
             <button
               onClick={() => {

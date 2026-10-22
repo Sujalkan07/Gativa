@@ -268,6 +268,25 @@ def test_natural_vehicle_initialization_at_time_zero():
             assert float(st.attrib.get("depart")) >= 1.0
 
 
+def test_custom_vehicle_count_is_exact_initial_population():
+    """A manual demand count is an exact time-zero population experiment."""
+    analysis = _create_sample_4way_junction_analysis("manual_population_test")
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        meta = SumoNetworkBuilder(Path(tmp_dir)).build(
+            segments=[segment.model_dump() for segment in analysis.segments],
+            duration_seconds=300,
+            manual_vehicle_count=37,
+            initial_population=37,
+            seed=42,
+        )
+        trips = ET.parse(str(meta["rou_file"])).getroot().findall("trip")
+        assert len(trips) == 37
+        assert meta["initial_vehicles_count"] == 37
+        assert meta["scheduled_vehicles"] == 0
+        assert all(trip.attrib["depart"] == "0.0" for trip in trips)
+
+
 def test_fixed_time_signal_optimizer_candidate_generation():
     """Verify FixedTimeSignalOptimizer generates bounded timing alternatives with safe clearance intervals."""
     with tempfile.TemporaryDirectory() as tmp_dir:

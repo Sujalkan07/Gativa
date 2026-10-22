@@ -175,6 +175,7 @@ class SimulationSession:
         self._edge_cumulative_stats: dict[str, dict[str, Any]] = {}
         self._segment_edge_map: dict[str, list[str]] = {}
         self._valid_sumo_edges: Optional[list[str]] = None
+        self._last_edge_sample_time: Optional[float] = None
 
         # Signal actuation state dictionary keyed by tl_id
         self._signal_controllers: dict[str, dict[str, Any]] = {}
@@ -300,10 +301,17 @@ class SimulationSession:
                             if entry_time is not None:
                                 self.travel_time_samples.append(max(1.0, self.elapsed_seconds - entry_time))
 
-                    # 3. Sample edge telemetry once per step batch for high-efficiency post-simulation analysis
-                    self._sample_edge_telemetry(conn)
+                        # Sample at a stable cadence while a batch is running.
+                        # Sampling only after a large batch can hide a queue
+                        # that formed and persisted for most of that batch.
+                        if (
+                            self._last_edge_sample_time is None
+                            or self.elapsed_seconds - self._last_edge_sample_time >= 1.0
+                        ):
+                            self._sample_edge_telemetry(conn)
+                            self._last_edge_sample_time = self.elapsed_seconds
 
-                    # 4. Extract Vehicles and Instantaneous Metrics
+                    # 3. Extract Vehicles and Instantaneous Metrics
                     self._extract_traci_state(conn)
                 except Exception as e:
                     logger.warning("TraCI runtime step error on %s: %s; transitioning to fallback kinematics", self.sim_id, e)
@@ -372,8 +380,18 @@ class SimulationSession:
                             green_lanes_map[p_idx] = list(in_lanes)
 
                     for g_idx in green_phase_indices:
-                        next_idx = (g_idx + 1) % len(phases)
-                        yellow_map[g_idx] = next_idx
+                        # Use the next genuine clearance phase, never assume
+                        # adjacent phase indices are yellow in every SUMO
+                        # program.  Conflicting movements remain red while a
+                        # direction is clearing.
+                        yellow_map[g_idx] = next(
+                            (
+                                (g_idx + offset) % len(phases)
+                                for offset in range(1, len(phases))
+                                if "y" in phases[(g_idx + offset) % len(phases)].state.lower()
+                            ),
+                            g_idx,
+                        )
 
                     current_p = conn.trafficlight.getPhase(tl_id)
                     curr_green = current_p if current_p in green_phase_indices else (green_phase_indices[0] if green_phase_indices else 0)
@@ -444,6 +462,7 @@ class SimulationSession:
                 if should_switch:
                     yellow_p = ctrl["yellow_map"].get(current_green, (current_green + 1) % len(conn.trafficlight.getAllProgramLogics(tl_id)[0].phases))
                     conn.trafficlight.setPhase(tl_id, yellow_p)
+                    conn.trafficlight.setPhaseDuration(tl_id, ctrl["yellow_duration"])
                     ctrl["is_yellow"] = True
                     ctrl["yellow_start"] = current_time
                     ctrl["target_green_phase"] = best_competing_phase
@@ -465,6 +484,7 @@ class SimulationSession:
                 "peak_halting": 0.0,
                 "sum_waiting_s": 0.0,
                 "congested_samples": 0,
+                "observed_vehicle_samples": 0,
                 "first_timestamp": sample["timestamp"],
                 "last_timestamp": sample["timestamp"],
             }
@@ -479,6 +499,8 @@ class SimulationSession:
         st["sum_halting"] += sample["halting_vehicles"]
         st["peak_halting"] = max(st["peak_halting"], float(sample["halting_vehicles"]))
         st["sum_waiting_s"] += sample["waiting_time_s"]
+        if sample.get("vehicle_count", 0) > 0:
+            st["observed_vehicle_samples"] += 1
         st["last_timestamp"] = sample["timestamp"]
 
         if sample["halting_vehicles"] >= 2 or sample["occupancy_pct"] >= 40.0 or sample["mean_speed_ms"] < 3.0:
@@ -523,7 +545,10 @@ class SimulationSession:
                 sample = {
                     "edge_id": edge_id,
                     "timestamp": current_time,
-                    "mean_speed_ms": round(float(mean_speed), 3),
+                    # SUMO returns -1 for an edge with no vehicle.  Preserve
+                    # zero as the display value; vehicle_count distinguishes
+                    # an empty edge from a stopped queue.
+                    "mean_speed_ms": round(max(0.0, float(mean_speed)), 3),
                     "vehicle_count": int(veh_count),
                     "occupancy_pct": round(float(occupancy), 2),
                     "halting_vehicles": int(halting),
@@ -775,6 +800,14 @@ class SimulationSession:
         )
         modeled_active = max(0, initial_active + scheduled_released - scheduled_completed)
 
+        def fallback_signal_state(signal_index: int) -> str:
+            """Two conflicting approach groups with explicit yellow clearance."""
+            phase = t % 42.0
+            group = signal_index % 2
+            if group == 0:
+                return "green" if phase < 17.0 else "yellow" if phase < 21.0 else "red"
+            return "red" if phase < 21.0 else "green" if phase < 38.0 else "yellow"
+
         # Extract real polylines from road segments or polygon bounds
         lines: list[list[list[float]]] = []
         if self.road_segments:
@@ -796,7 +829,8 @@ class SimulationSession:
 
         if lines:
             for idx in range(num_active):
-                target_line = lines[idx % len(lines)]
+                line_index = idx % len(lines)
+                target_line = lines[line_index]
                 n_pts = len(target_line)
                 if n_pts < 2:
                     continue
@@ -807,6 +841,17 @@ class SimulationSession:
                 progress = initial_progress + (t / initial_escape_window)
                 if progress >= 1.0:
                     continue
+
+                # The fallback is an estimated visual model, but it still
+                # represents the core signal rule: an approach slows for
+                # yellow and waits at red while the conflicting group clears.
+                approach_state = fallback_signal_state(line_index) if self.signal_count else "green"
+                stopped_for_signal = False
+                if approach_state == "yellow" and progress >= 0.68:
+                    progress = min(progress, 0.78)
+                elif approach_state == "red" and progress >= 0.78:
+                    progress = 0.78
+                    stopped_for_signal = True
                 seg_float = progress * (n_pts - 1)
                 p_idx = int(seg_float)
                 frac = seg_float - p_idx
@@ -831,10 +876,10 @@ class SimulationSession:
                         id=f"veh_{idx}",
                         lat=v_lat,
                         lng=v_lon,
-                        speed_kmh=round(cur_speed + (idx % 4) - 1.5, 1),
+                        speed_kmh=0.0 if stopped_for_signal else round((cur_speed + (idx % 4) - 1.5) * (0.35 if approach_state == "yellow" else 1.0), 1),
                         angle=bearing,
                         type="bus" if idx % 7 == 0 else "passenger",
-                        waiting_time_s=round(max(0.0, cur_wait * 0.25), 1),
+                        waiting_time_s=round(max(4.0, cur_wait) if stopped_for_signal else max(1.0, cur_wait * 0.25) if approach_state == "yellow" else max(0.0, cur_wait * 0.25), 1),
                     )
                 )
 
@@ -894,14 +939,14 @@ class SimulationSession:
                     unique_signal_coords.append((c_lon, c_lat, "simulation_assumption"))
 
             for s_idx, (s_lon, s_lat, s_prov) in enumerate(unique_signal_coords[: self.signal_count]):
-                phase_green = ((int(t / 15.0) + s_idx) % 2) == 0
+                signal_state = fallback_signal_state(s_idx)
                 fallback_signals.append(
                     TrafficLightState(
                         id=f"TL_{s_idx + 1}",
                         lat=round(s_lat, 6),
                         lng=round(s_lon, 6),
-                        state="green" if phase_green else "red",
-                        is_green=phase_green,
+                        state=signal_state,
+                        is_green=signal_state == "green",
                         phase_duration=15.0,
                         controlled_lanes=[f"approach_{s_idx}_1", f"approach_{s_idx}_2"],
                         provenance=s_prov,  # type: ignore
@@ -951,6 +996,7 @@ class SimulationSession:
             # Keep cached_signals intact across resets so signal geometries remain available
             self._edge_telemetry.clear()
             self._edge_cumulative_stats.clear()
+            self._last_edge_sample_time = None
 
             self._signal_controllers.clear()
             self.state = "ready"
@@ -1276,6 +1322,7 @@ class SimulationSession:
                         "peak_halting": cst["peak_halting"],
                         "mean_waiting": cst["sum_waiting_s"] / n,
                         "congested_samples": cst["congested_samples"],
+                        "observed_vehicle_samples": cst.get("observed_vehicle_samples", n),
                     })
 
             if edge_stats:
@@ -1303,6 +1350,7 @@ class SimulationSession:
                 all_mins = []
                 all_peak_occ = []
                 all_peak_halt = []
+                edge_stats = []
 
                 for eid, samples in edge_groups.items():
                     s_speeds = [s["mean_speed_ms"] for s in samples]
@@ -1316,6 +1364,19 @@ class SimulationSession:
                     all_mins.append(min(s_speeds))
                     all_peak_occ.append(max(s_occ))
                     all_peak_halt.append(max(s_halt))
+                    edge_stats.append({
+                        "edge_id": eid,
+                        "samples": len(samples),
+                        "mean_speed_ms": sum(s_speeds) / len(s_speeds),
+                        "min_speed_ms": min(s_speeds),
+                        "mean_occupancy": sum(s_occ) / len(s_occ),
+                        "peak_occupancy": max(s_occ),
+                        "mean_halting": sum(s_halt) / len(s_halt),
+                        "peak_halting": max(s_halt),
+                        "mean_waiting": sum(s_wait) / len(s_wait),
+                        "congested_samples": sum(1 for s in samples if s["halting_vehicles"] >= 2 or s["occupancy_pct"] >= 40.0 or s["mean_speed_ms"] < 3.0),
+                        "observed_vehicle_samples": sum(1 for s in samples if s.get("vehicle_count", 0) > 0),
+                    })
 
                 avg_speed_ms = sum(edge_means_speed) / len(edge_means_speed) if edge_means_speed else 0.0
                 min_speed_ms = min(all_mins) if all_mins else 0.0
@@ -1324,20 +1385,38 @@ class SimulationSession:
                 avg_halting = sum(edge_means_halt) / len(edge_means_halt) if edge_means_halt else 0.0
                 peak_halting = max(all_peak_halt) if all_peak_halt else 0.0
                 avg_waiting = sum(edge_means_wait) / len(edge_means_wait) if edge_means_wait else 0.0
-                congested_steps = sum(
-                    1 for s in combined_samples
-                    if (1.0 - min(1.0, s["mean_speed_ms"] / max(ref_speed_ms, 0.1))) * 0.5 > 0.3
-                )
+                congested_steps = max((e["congested_samples"] for e in edge_stats), default=0)
                 effective_sample_count = len(combined_samples)
 
-            # Congestion score
+            # Forward and reverse samples share one simulation timeline. Keep
+            # their total for data coverage, but use one direction's window
+            # when converting congestion samples to a duration percentage.
+            duration_sample_count = max((e["samples"] for e in edge_stats), default=effective_sample_count)
+
+            # Congestion is directional.  A long queue in one direction must
+            # color the physical road as congested even when the opposite lane
+            # is empty and moving freely.  Use the worst measured direction
+            # for the map score, while retaining whole-segment averages for
+            # the supporting metrics.
             speed_ratio = min(1.0, avg_speed_ms / max(ref_speed_ms, 0.1))
             halting_ratio = avg_halting / max_observed_halting
-            score = (
+            average_score = (
                 0.5 * (1.0 - speed_ratio)
                 + 0.3 * (avg_occupancy / 100.0)
                 + 0.2 * halting_ratio
             )
+            directional_scores = []
+            for edge in edge_stats:
+                # Ignore an empty direction. SUMO reports zero speed on it,
+                # but that is not a traffic blockage.
+                if edge.get("observed_vehicle_samples", 0) <= 0:
+                    continue
+                directional_scores.append(
+                    0.5 * (1.0 - min(1.0, edge["mean_speed_ms"] / max(ref_speed_ms, 0.1)))
+                    + 0.3 * (edge["mean_occupancy"] / 100.0)
+                    + 0.2 * (edge["mean_halting"] / max_observed_halting)
+                )
+            score = max(average_score, max(directional_scores, default=average_score))
             score = round(max(0.0, min(1.0, score)), 4)
 
             # Severity classification
@@ -1352,9 +1431,9 @@ class SimulationSession:
             else:
                 sev = "severe"
 
-            step_interval_s = 2 * 0.2  # sampled every ~2 steps × 0.2s
+            step_interval_s = 1.0  # native TraCI telemetry is sampled once per second
             congested_duration_s = round(congested_steps * step_interval_s, 1)
-            total_duration_s = round(effective_sample_count * step_interval_s, 1)
+            total_duration_s = round(duration_sample_count * step_interval_s, 1)
             congested_pct = round(100.0 * congested_duration_s / max(total_duration_s, 0.1), 1)
 
             result = CongestionRoadResult(

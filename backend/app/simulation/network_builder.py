@@ -178,7 +178,10 @@ class SumoNetworkBuilder:
             "demand_profile": demand_profile or "peak",
             "demand_data_source": demand_source,
             "demand_source_label": demand_label,
-            "scheduled_vehicles": scheduled_count,
+            # _write_routes_xml returns total trips and initial trips.  Expose
+            # only departures after t=0 here, so custom initial-population
+            # experiments do not look like they have extra scheduled demand.
+            "scheduled_vehicles": max(0, scheduled_count - init_count),
             "initial_vehicles_count": init_count,
             "nodes": nodes,
             "edges": edges,
@@ -733,11 +736,46 @@ class SumoNetworkBuilder:
         if not candidate_initial_edges:
             candidate_initial_edges = actual_edges
 
-        # Shuffle once, then round-robin through the network.  This preserves
-        # an even geographic spread even when the requested population exceeds
-        # the number of valid origin edges.
-        rng_edges = list(candidate_initial_edges)
-        rng.shuffle(rng_edges)
+        # Round-robin across map cells before repeating any cell.  Sampling
+        # every directed edge uniformly overweights dense perimeter corridors
+        # and can leave the centre of a selected area visibly empty.
+        xs = [float(actual_nodes[e["from"]]["x"]) for e in candidate_initial_edges if e["from"] in actual_nodes]
+        xs += [float(actual_nodes[e["to"]]["x"]) for e in candidate_initial_edges if e["to"] in actual_nodes]
+        ys = [float(actual_nodes[e["from"]]["y"]) for e in candidate_initial_edges if e["from"] in actual_nodes]
+        ys += [float(actual_nodes[e["to"]]["y"]) for e in candidate_initial_edges if e["to"] in actual_nodes]
+
+        rng_edges: list[dict[str, Any]] = []
+        if xs and ys:
+            grid_side = min(6, max(3, int(len(candidate_initial_edges) ** 0.5 / 4) + 3))
+            min_x, max_x = min(xs), max(xs)
+            min_y, max_y = min(ys), max(ys)
+            span_x = max(max_x - min_x, 1e-9)
+            span_y = max(max_y - min_y, 1e-9)
+            grid: dict[tuple[int, int], list[dict[str, Any]]] = {}
+            for edge in candidate_initial_edges:
+                start, end = actual_nodes.get(edge["from"]), actual_nodes.get(edge["to"])
+                if not start or not end:
+                    continue
+                mid_x = (float(start["x"]) + float(end["x"])) / 2.0
+                mid_y = (float(start["y"]) + float(end["y"])) / 2.0
+                cell = (
+                    min(grid_side - 1, int((mid_x - min_x) / span_x * grid_side)),
+                    min(grid_side - 1, int((mid_y - min_y) / span_y * grid_side)),
+                )
+                grid.setdefault(cell, []).append(edge)
+
+            cells = list(grid.values())
+            if cells:
+                rng.shuffle(cells)
+                for edges_in_cell in cells:
+                    rng.shuffle(edges_in_cell)
+                for round_index in range(max(len(edges_in_cell) for edges_in_cell in cells)):
+                    for edges_in_cell in cells:
+                        rng_edges.append(edges_in_cell[round_index % len(edges_in_cell)])
+
+        if not rng_edges:
+            rng_edges = list(candidate_initial_edges)
+            rng.shuffle(rng_edges)
 
         initial_trips: list[tuple[float, str, str, str, str, bool]] = []
         for i in range(target_initial):

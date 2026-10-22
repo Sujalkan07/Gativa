@@ -108,6 +108,44 @@ def test_congestion_scoring_formula_and_thresholds():
         assert sev.congested_pct > 0
 
 
+def test_one_direction_blockage_colors_the_full_road_congested():
+    """An empty reverse direction must not dilute a sustained forward queue."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        session = SimulationSession(
+            sim_id="test_directional_blockage",
+            analysis_id="test_analysis",
+            work_dir=Path(tmp_dir),
+            cfg_file=Path(tmp_dir) / "sim.sumocfg",
+            road_segments=[{
+                "segment_id": "seg_blocked",
+                "name": "Blocked arterial",
+                "road_type": "arterial",
+                "speed_limit_kmh": 50.0,
+                "geometry": {"coordinates": [[80.9, 26.8], [80.91, 26.81]]},
+            }],
+            netconvert_used=True,
+        )
+        session.engine_mode = "native_sumo"
+        session._segment_edge_map = {"seg_blocked": ["edge_forward", "edge_reverse"]}
+        session._edge_telemetry["edge_forward"] = [
+            {"edge_id": "edge_forward", "timestamp": float(t), "mean_speed_ms": 0.5,
+             "vehicle_count": 14, "occupancy_pct": 92.0, "halting_vehicles": 12,
+             "waiting_time_s": 60.0}
+            for t in range(8)
+        ]
+        session._edge_telemetry["edge_reverse"] = [
+            {"edge_id": "edge_reverse", "timestamp": float(t), "mean_speed_ms": 0.0,
+             "vehicle_count": 0, "occupancy_pct": 0.0, "halting_vehicles": 0,
+             "waiting_time_s": 0.0}
+            for t in range(8)
+        ]
+
+        result = session.compute_congestion_summary().all_results[0]
+        assert result.severity == "severe"
+        assert result.congestion_score >= 0.80
+        assert result.congested_pct == 100.0
+
+
 def test_insufficient_samples_handling():
     """Verify edges with fewer than 3 samples receive insufficient_data classification."""
     with tempfile.TemporaryDirectory() as tmp_dir:

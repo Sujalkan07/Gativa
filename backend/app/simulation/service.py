@@ -94,6 +94,9 @@ class SimulationService:
             approved_candidate_ids.intersection_update(valid_candidate_ids)
 
         seed = req.seed or 42
+        # The custom count is a controlled initial-population experiment.  It
+        # must not be reduced by the automatic initial-demand share.
+        initial_population = req.manual_vehicle_count if req.manual_vehicle_count is not None else req.initial_population
 
         # 1. Build SUMO network files for Baseline Scenario (Preserves original network controls; no approved signals)
         builder_base = SumoNetworkBuilder(base_dir)
@@ -109,7 +112,7 @@ class SimulationService:
             manual_vehicle_count=req.manual_vehicle_count,
             allow_synthetic=is_demo,
             approved_signal_junctions=None,
-            initial_population=req.initial_population,
+            initial_population=initial_population,
         )
 
         # 2. Build SUMO network files for Optimized Scenario (Compiles user-approved candidate junctions as traffic lights)
@@ -126,7 +129,7 @@ class SimulationService:
             manual_vehicle_count=req.manual_vehicle_count,
             allow_synthetic=is_demo,
             approved_signal_junctions=approved_candidate_ids,
-            initial_population=req.initial_population,
+            initial_population=initial_population,
         )
 
         # Guarantee 100% Demand Parity: Both scenarios execute the EXACT same routes and initial vehicles
