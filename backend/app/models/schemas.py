@@ -287,7 +287,17 @@ SimulationState = Literal[
 ]
 SignalStrategy = Literal["fixed_time", "actuated_adaptive"]
 SimulationEngineMode = Literal["native_sumo", "fallback", "unavailable"]
-ComparisonStatus = Literal["pending", "insufficient_data", "completed", "failed"]
+ComparisonStatus = Literal[
+    "pending",
+    "running",
+    "completed",
+    "completed_validated",
+    "completed_inconclusive",
+    "insufficient_data",
+    "failed",
+    "engine_mismatch",
+    "optimization_unavailable",
+]
 DemandLevel = Literal["low", "normal", "high", "custom"]
 DemandProfile = Literal["peak", "uniform", "ramp_up", "morning_peak"]
 
@@ -421,6 +431,8 @@ class ScenarioComparisonResult(BaseModel):
     initial_vehicles_count: Optional[int] = 0
     fixed_time_plan_summary: Optional[str] = None
     selected_fixed_time_plan: Optional[Any] = None
+    is_validated: Optional[bool] = False
+    optimization_status: Optional[str] = None
 
 
 # ─── Traffic Signal Candidates & User Approval ────────────────────────────────
@@ -467,6 +479,9 @@ class CandidateDecisionRequest(BaseModel):
         return self.decision or self.status or "pending"
 
 
+EvaluationStatus = Literal["success", "failed", "insufficient_data", "invalid_configuration"]
+
+
 class TimingPlanEvaluation(BaseModel):
     plan_id: str
     cycle_length_s: int
@@ -478,6 +493,15 @@ class TimingPlanEvaluation(BaseModel):
     throughput_veh_hr: float
     is_selected: bool = False
     validation_passed: bool = True
+    evaluation_status: EvaluationStatus = "success"
+    diagnostics: Optional[str] = None
+    queue_burden_m: Optional[float] = None
+    max_queue_m: Optional[float] = None
+    completed_vehicles: Optional[int] = None
+    unfinished_vehicles: Optional[int] = None
+    teleported_vehicles: Optional[int] = None
+    spillback_rate: Optional[float] = None
+    phases: Optional[list[dict[str, Any]]] = None
 
 
 class FixedTimeOptimizationResult(BaseModel):
@@ -487,6 +511,12 @@ class FixedTimeOptimizationResult(BaseModel):
     selected_cycle_length_s: Optional[int] = None
     validation_passed: bool = True
     notes: str = ""
+    status: Literal["completed", "failed", "inconclusive", "insufficient_data", "no_signals"] = "completed"
+    optimized_signals_count: int = 1
+    total_signals_count: int = 1
+    failure_reason: Optional[str] = None
+    signal_results: Optional[dict[str, Any]] = None
+    corridor_coordination_applied: bool = False
 
 
 

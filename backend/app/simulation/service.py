@@ -165,8 +165,11 @@ class SimulationService:
             else "Baseline (Original Signal Timing)"
         )
         if applied_signals_count > 0:
-            plan_name = selected_plan.name if selected_plan else "Optimized Fixed-Time Timing"
-            optimized_strat = f"Optimized ({plan_name})"
+            if selected_plan and getattr(selected_plan, "validation_passed", False):
+                plan_name = selected_plan.name
+                optimized_strat = f"Optimized ({plan_name})"
+            else:
+                optimized_strat = f"Intervention ({applied_signals_count} Signals Applied - Baseline Timing Preserved)"
         else:
             optimized_strat = "Intervention (No Signals Approved)"
 
@@ -339,6 +342,8 @@ class SimulationService:
             applied_signals_count=session.applied_signals_count,
             initial_vehicles_count=session.initial_vehicles_count,
             selected_fixed_time_plan=session.selected_fixed_time_plan,
+            engine_transitioned=getattr(session, "engine_transitioned", False),
+            baseline_engine_transitioned=getattr(base_session, "engine_transitioned", False) if base_session else False,
         )
 
     def get_congestion_summary(self, sim_id: str) -> CongestionSummary:

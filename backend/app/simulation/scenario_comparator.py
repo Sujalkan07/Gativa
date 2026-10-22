@@ -38,6 +38,8 @@ class ScenarioComparator:
         applied_signals_count: Optional[int] = None,
         initial_vehicles_count: Optional[int] = None,
         selected_fixed_time_plan: Optional[Any] = None,
+        engine_transitioned: bool = False,
+        baseline_engine_transitioned: bool = False,
     ) -> ScenarioComparisonResult:
         """
         Produce side-by-side scenario comparison table with genuine empirical variance.
@@ -72,6 +74,59 @@ class ScenarioComparator:
             optimized_metrics is not None
             and (optimized_metrics.elapsed_seconds > 0.0 or optimized_metrics.avg_speed_kmh > 0.0 or optimized_metrics.completed_vehicles > 0)
         )
+
+        if engine_transitioned or baseline_engine_transitioned:
+            transition_rows = [
+                ScenarioMetricRow(
+                    metric="Average Speed",
+                    baseline=f"{baseline_metrics.avg_speed_kmh:.1f} km/h" if baseline_metrics else "—",
+                    optimized=f"{optimized_metrics.avg_speed_kmh:.1f} km/h" if optimized_metrics else "—",
+                    variance="Not comparable (engine transitioned mid-run)",
+                    is_improvement=False,
+                ),
+                ScenarioMetricRow(
+                    metric="Average Waiting Time",
+                    baseline=f"{baseline_metrics.avg_waiting_time_s:.1f} s" if baseline_metrics else "—",
+                    optimized=f"{optimized_metrics.avg_waiting_time_s:.1f} s" if optimized_metrics else "—",
+                    variance="Not comparable (engine transitioned mid-run)",
+                    is_improvement=False,
+                ),
+                ScenarioMetricRow(
+                    metric="Average Queue Length",
+                    baseline=f"{baseline_metrics.avg_queue_length_m:.1f} m" if baseline_metrics else "—",
+                    optimized=f"{optimized_metrics.avg_queue_length_m:.1f} m" if optimized_metrics else "—",
+                    variance="Not comparable (engine transitioned mid-run)",
+                    is_improvement=False,
+                ),
+                ScenarioMetricRow(
+                    metric="Completed Vehicles",
+                    baseline=f"{baseline_metrics.completed_vehicles} vehs" if baseline_metrics else "—",
+                    optimized=f"{optimized_metrics.completed_vehicles} vehs" if optimized_metrics else "—",
+                    variance="Not comparable (engine transitioned mid-run)",
+                    is_improvement=False,
+                ),
+            ]
+            return ScenarioComparisonResult(
+                sim_id=sim_id,
+                analysis_id=analysis_id,
+                duration_seconds=duration_seconds,
+                engine_mode=engine_mode,
+                comparison_status="insufficient_data",
+                baseline_strategy=baseline_strategy,
+                optimized_strategy=optimized_strategy,
+                baseline_metrics=baseline_metrics or empty_metrics,
+                optimized_metrics=optimized_metrics or empty_metrics,
+                rows=transition_rows,
+                methodology_notes=(
+                    "Scenario comparison invalidated because simulation execution encountered a runtime "
+                    "error and transitioned between native SUMO and fallback kinematics. Empirical comparison cannot be established."
+                ),
+                signal_count=signal_count,
+                approved_signals_count=approved_signals_count or 0,
+                applied_signals_count=applied_signals_count or 0,
+                initial_vehicles_count=initial_vehicles_count or 0,
+                selected_fixed_time_plan=selected_fixed_time_plan,
+            )
 
         if baseline_engine_mode is not None and baseline_engine_mode != engine_mode:
             mismatch_rows = [
@@ -373,15 +428,50 @@ class ScenarioComparator:
             ),
         ]
 
+        # 8. Unfinished Trips (Lower is better)
+        base_unfin = max(0, baseline_metrics.inserted_vehicles - baseline_metrics.completed_vehicles)
+        opt_unfin = max(0, optimized_metrics.inserted_vehicles - optimized_metrics.completed_vehicles)
+        unfin_pct, unfin_diff, unfin_var, unfin_imp = calc_metric_variance(
+            float(opt_unfin), float(base_unfin), "vehs", higher_is_better=False, is_int=True
+        )
+        extended_rows.append(
+            ScenarioMetricRow(
+                metric="Unfinished Trips",
+                baseline=f"{base_unfin} vehs",
+                optimized=f"{opt_unfin} vehs",
+                variance=unfin_var,
+                is_improvement=unfin_imp,
+            )
+        )
+
         disclosures: list[str] = []
         if baseline_metrics.total_duration_seconds != optimized_metrics.total_duration_seconds:
             disclosures.append(
                 f"Duration mismatch: baseline ({baseline_metrics.total_duration_seconds:.0f}s) vs optimized ({optimized_metrics.total_duration_seconds:.0f}s)."
             )
         if "fallback" in engine_mode:
-            disclosures.append("Internal kinematics engine estimation mode; not measured TraCI hardware execution.")
+            disclosures.append(
+                "Internal kinematics engine estimation mode: values are simulated visual estimates, "
+                "not empirical SUMO hardware measurements. Percentage variances must not be presented as empirical improvements."
+            )
 
         disclosures_prefix = f"[{' | '.join(disclosures)}] " if disclosures else ""
+
+        is_validated = False
+        optimization_status = "unvalidated"
+        if "native" in engine_mode:
+            if wait_imp and speed_imp and queue_imp:
+                is_validated = True
+                optimization_status = "validated_improvement"
+            elif wait_imp or speed_imp or queue_imp:
+                is_validated = True
+                optimization_status = "validated_tradeoff"
+            else:
+                is_validated = True
+                optimization_status = "validated_neutral_or_regression"
+        elif "fallback" in engine_mode:
+            is_validated = False
+            optimization_status = "kinematics_estimate_only"
 
         if signal_count == 0:
             notes = (
@@ -415,5 +505,7 @@ class ScenarioComparator:
             applied_signals_count=applied_signals_count,
             initial_vehicles_count=initial_vehicles_count,
             selected_fixed_time_plan=selected_fixed_time_plan,
+            is_validated=is_validated,
+            optimization_status=optimization_status,
         )
 

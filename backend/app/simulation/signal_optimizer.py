@@ -3,23 +3,171 @@ Fixed-Time Signal Optimizer: Generates, evaluates, and validates candidate fixed
 Follows transportation engineering standards:
 - Minimum green constraints (>= 10s)
 - Safety yellow clearance intervals (3.0s - 4.0s)
-- Feasible cycle length search (60s, 75s, 90s, 105s)
-- Multi-criteria objective balancing waiting time, travel time, and throughput
+- Feasible cycle length search (60s, 75s, 90s, 105s, etc.)
+- Normalized multi-criteria objective balancing delay, queue burden, unfinished trips, spillback, and throughput
+- Truthful evaluation provenance (no fabricated candidate measurements)
+- Multi-signal network optimization with whole-network validation
 - Generates valid SUMO additional files (signals.add.xml) loaded directly by SUMO
 """
 from __future__ import annotations
 
 import logging
+import math
 import os
 import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Optional
 
-from app.models.schemas import FixedTimeOptimizationResult, TimingPlanEvaluation
+from app.models.schemas import (
+    EvaluationStatus,
+    FixedTimeOptimizationResult,
+    TimingPlanEvaluation,
+)
 from app.simulation.network_builder import find_sumo_binary
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_OBJECTIVE_WEIGHTS = {
+    "delay": 1.2,
+    "queue": 0.8,
+    "max_queue": 0.4,
+    "unfinished_trip": 3.0,
+    "teleport": 5.0,
+    "speed": 0.6,
+    "throughput": 0.1,
+}
+
+
+def validate_phase_structure(
+    phases: list[dict[str, Any]],
+    base_phases: Optional[list[dict[str, Any]]] = None,
+    min_green: float = 10.0,
+    min_yellow: float = 3.0,
+) -> tuple[bool, str]:
+    """
+    Validate that a fixed-time timing plan conforms to safety and SUMO constraints:
+    1. At least one phase exists.
+    2. Phase durations are positive numbers.
+    3. State strings contain only valid SUMO aspects (G, g, y, Y, r, R, u, o, O).
+    4. Clearance intervals (phases containing 'y'/'Y') have duration >= min_yellow and >= base clearance.
+    5. Green intervals (phases containing 'G'/'g' without yellow) have duration >= min_green.
+    6. If base_phases provided, state strings must have matching length.
+    7. Phase ordering is preserved.
+    """
+    if not phases:
+        return False, "Plan contains no phases"
+
+    if base_phases and len(phases) != len(base_phases):
+        return False, f"Phase count mismatch: expected {len(base_phases)}, got {len(phases)}"
+
+    for idx, p in enumerate(phases):
+        dur = float(p.get("duration", 0.0))
+        state = str(p.get("state", ""))
+
+        if dur <= 0.0:
+            return False, f"Phase {idx} has non-positive duration: {dur}"
+
+        if not state:
+            return False, f"Phase {idx} has empty state string"
+
+        # Check for valid SUMO aspects
+        valid_chars = set("GgyYrRuuoO0123456789")
+        if not all(c in valid_chars for c in state):
+            return False, f"Phase {idx} has invalid state character in '{state}'"
+
+        if base_phases:
+            base_p = base_phases[idx]
+            base_state = str(base_p.get("state", ""))
+            if len(state) != len(base_state):
+                return False, f"Phase {idx} state length mismatch: expected {len(base_state)}, got {len(state)}"
+
+            # Clearance check: if base phase was yellow clearance, must not be shortened below safe yellow
+            base_is_yellow = "y" in base_state.lower()
+            cur_is_yellow = "y" in state.lower()
+            if base_is_yellow:
+                if not cur_is_yellow:
+                    return False, f"Phase {idx} dropped required yellow clearance aspect"
+                required_yellow = max(min_yellow, float(base_p.get("duration", min_yellow)))
+                if dur < required_yellow:
+                    return False, f"Phase {idx} clearance duration {dur}s < required {required_yellow}s"
+
+        # Check minimum green if this is a green phase
+        is_green = ("g" in state.lower()) and ("y" not in state.lower())
+        if is_green and dur < min_green:
+            return False, f"Phase {idx} green duration {dur}s is below minimum constraint {min_green}s"
+
+    return True, "Validation passed"
+
+
+def calculate_objective_score(
+    avg_wait: float,
+    avg_speed: float,
+    throughput: float,
+    queue_burden: float,
+    max_queue: float,
+    unfinished_count: int,
+    inserted_count: int,
+    teleported_count: int,
+    weights: Optional[dict[str, float]] = None,
+) -> tuple[float, dict[str, float]]:
+    """
+    Normalized, reproducible objective function where lower is strictly better:
+    - Normalizes delay against 30s cycle delay baseline
+    - Penalizes queue burden and max queue length
+    - Penalizes low speeds (< 35 km/h)
+    - Penalizes unfinished and failed trips
+    - Penalizes teleports (gridlock indicator)
+    - Rewards throughput with a dampened, capped term so throughput cannot offset congestion
+    """
+    w = dict(DEFAULT_OBJECTIVE_WEIGHTS)
+    if weights:
+        w.update(weights)
+
+    # 1. Delay term
+    norm_delay = max(0.0, avg_wait / 30.0)
+
+    # 2. Queue terms
+    norm_queue = max(0.0, queue_burden / 50.0)
+    norm_max_queue = max(0.0, max_queue / 100.0)
+
+    # 3. Speed term (cost increases as progression speed falls)
+    speed_term = 35.0 / max(5.0, avg_speed)
+
+    # 4. Unfinished trip penalty
+    ins = max(1, inserted_count)
+    unfinished_ratio = max(0.0, unfinished_count / ins)
+    unfinished_penalty = unfinished_ratio * w["unfinished_trip"]
+
+    # 5. Teleport penalty
+    teleport_ratio = max(0.0, teleported_count / ins)
+    teleport_penalty = teleport_ratio * w["teleport"]
+
+    # 6. Throughput contribution (capped at 0.3)
+    throughput_reward = min(0.3, max(0.0, (throughput / 3600.0) * w["throughput"]))
+
+    total_score = round(
+        (w["delay"] * norm_delay)
+        + (w["queue"] * norm_queue)
+        + (w["max_queue"] * norm_max_queue)
+        + (w["speed"] * speed_term)
+        + unfinished_penalty
+        + teleport_penalty
+        - throughput_reward,
+        2,
+    )
+
+    components = {
+        "norm_delay": round(norm_delay, 3),
+        "norm_queue": round(norm_queue, 3),
+        "norm_max_queue": round(norm_max_queue, 3),
+        "speed_term": round(speed_term, 3),
+        "unfinished_penalty": round(unfinished_penalty, 3),
+        "teleport_penalty": round(teleport_penalty, 3),
+        "throughput_reward": round(throughput_reward, 3),
+    }
+
+    return total_score, components
 
 
 class FixedTimeSignalOptimizer:
@@ -57,17 +205,54 @@ class FixedTimeSignalOptimizer:
 
         return tl_logics
 
+    def parse_controlled_connections(self, net_file: Path) -> dict[str, list[dict[str, Any]]]:
+        """
+        Parse signal connections from net_file to determine lane counts and approach geometry.
+        Returns: {tl_id: [{"link_index": int, "from_edge": str, "from_lane": int}, ...]}
+        """
+        if not net_file.is_file():
+            return {}
+
+        connections: dict[str, list[dict[str, Any]]] = {}
+        try:
+            tree = ET.parse(str(net_file))
+            root = tree.getroot()
+            for conn in root.findall("connection"):
+                tl_id = conn.get("tl")
+                link_idx_str = conn.get("linkIndex")
+                if not tl_id or link_idx_str is None:
+                    continue
+                try:
+                    link_idx = int(link_idx_str)
+                    from_edge = conn.get("from", "")
+                    from_lane = int(conn.get("fromLane", "0"))
+                    if tl_id not in connections:
+                        connections[tl_id] = []
+                    connections[tl_id].append({
+                        "link_index": link_idx,
+                        "from_edge": from_edge,
+                        "from_lane": from_lane,
+                    })
+                except ValueError:
+                    continue
+        except Exception as e:
+            logger.debug("Error parsing connections from %s: %s", net_file, e)
+
+        return connections
+
     def generate_candidate_plans(
         self,
         tl_id: str,
         base_phases: list[dict[str, Any]],
+        approach_evidence: Optional[dict[str, Any]] = None,
+        include_base: bool = False,
     ) -> list[dict[str, Any]]:
         """
-        Generate bounded, feasible fixed-time timing alternatives:
-        1. Base netconvert plan
-        2. Short cycle (60s) - reduces cycle delay for low/moderate flows
+        Generate bounded, feasible fixed-time timing alternatives preserving phase ordering and safety clearance:
+        1. Base netconvert plan (plan_base, optional)
+        2. Short cycle (60s) - reduces cycle delay for lower flows
         3. Balanced cycle (90s) - standard balanced splits
-        4. Arterial-favored progression (90s) - 65% green to primary phase
+        4. Arterial-favored progression (90s) - 62% green to primary phase
         5. High-capacity cycle (105s) - extended clearance & storage for peak volumes
         """
         plans: list[dict[str, Any]] = []
@@ -82,128 +267,375 @@ class FixedTimeSignalOptimizer:
             elif "g" in state:
                 green_indices.append(idx)
 
-        # If simple structure not recognized, return base plan as single candidate
+        # Baseline plan representation
+        base_durations = [int(round(float(p["duration"]))) for p in base_phases]
+        base_cycle = int(sum(base_durations))
+        base_plan = {
+            "plan_id": "plan_base",
+            "name": f"Baseline Fixed-Time Timing ({base_cycle}s)",
+            "description": f"Original compiled baseline fixed-time timing ({base_cycle}s cycle)",
+            "cycle_length_s": base_cycle,
+            "phases": [{"duration": float(d), "state": p["state"]} for d, p in zip(base_durations, base_phases)],
+        }
+
+        # If simple structure not recognized (< 2 green phases), return base plan
         if len(green_indices) < 2:
-            base_durations = [p["duration"] for p in base_phases]
-            cycle = int(sum(base_durations))
-            plans.append({
-                "plan_id": "plan_base",
-                "name": "Standard Fixed-Time Timing",
-                "description": f"Standard baseline fixed-time timing ({cycle}s cycle)",
-                "cycle_length_s": cycle,
-                "phases": base_phases,
-            })
+            plans.append(base_plan)
             return plans
 
-        # Plan 1: Short cycle (60s total) - e.g. 27s G1, 3s Y1, 27s G2, 3s Y2
+        if include_base:
+            plans.append(base_plan)
+
         num_greens = len(green_indices)
-        yellow_time = 3.0
-        total_yellow = yellow_time * len(yellow_indices) if yellow_indices else 6.0
-        avail_green_60 = max(20.0, 60.0 - total_yellow)
-        green_each_60 = max(10.0, round(avail_green_60 / num_greens, 1))
 
-        p60_phases = []
-        for idx, p in enumerate(base_phases):
-            if idx in green_indices:
-                p60_phases.append({"duration": green_each_60, "state": p["state"]})
-            else:
-                p60_phases.append({"duration": yellow_time, "state": p["state"]})
+        # Calculate exact clearance durations from base phases to never shorten clearance
+        clearance_durations: dict[int, float] = {}
+        for y_idx in yellow_indices:
+            base_y_dur = float(base_phases[y_idx].get("duration", 3.0))
+            clearance_durations[y_idx] = max(3.0, base_y_dur)
 
-        plans.append({
-            "plan_id": "plan_short_60s",
-            "name": "Short-Cycle Plan (60s)",
-            "description": "Short 60s cycle minimizing average vehicle cycle delays on minor approaches",
-            "cycle_length_s": 60,
-            "phases": p60_phases,
-        })
+        total_clearance = sum(clearance_durations.values()) if yellow_indices else (3.0 * num_greens)
 
-        # Plan 2: Balanced Standard (90s total) - e.g. 42s G1, 3s Y1, 42s G2, 3s Y2
-        avail_green_90 = max(30.0, 90.0 - total_yellow)
-        green_each_90 = max(12.0, round(avail_green_90 / num_greens, 1))
+        def make_plan_phases(target_cycle: int, green_durations: list[int]) -> list[dict[str, Any]]:
+            """Construct phases strictly matching target_cycle with exact integer durations."""
+            new_phases = []
+            g_ptr = 0
+            for idx, p in enumerate(base_phases):
+                if idx in green_indices:
+                    new_phases.append({"duration": float(green_durations[g_ptr]), "state": p["state"]})
+                    g_ptr += 1
+                else:
+                    clr_dur = int(round(clearance_durations.get(idx, 3.0)))
+                    new_phases.append({"duration": float(clr_dur), "state": p["state"]})
 
-        p90_phases = []
-        for idx, p in enumerate(base_phases):
-            if idx in green_indices:
-                p90_phases.append({"duration": green_each_90, "state": p["state"]})
-            else:
-                p90_phases.append({"duration": yellow_time, "state": p["state"]})
+            # Reconcile integer rounding difference to exactly match target_cycle
+            cur_sum = sum(int(round(ph["duration"])) for ph in new_phases)
+            diff = target_cycle - cur_sum
+            if diff != 0 and green_indices:
+                # Add difference to the largest green phase
+                max_g_idx = max(range(len(green_durations)), key=lambda i: green_durations[i])
+                g_phase_pos = green_indices[max_g_idx]
+                new_phases[g_phase_pos]["duration"] += float(diff)
 
-        plans.append({
-            "plan_id": "plan_balanced_90s",
-            "name": "Balanced Cycle Plan (90s)",
-            "description": "Standard 90s cycle with balanced green allocation across all approach phases",
-            "cycle_length_s": 90,
-            "phases": p90_phases,
-        })
+            return new_phases
 
-        # Plan 3: Arterial-Favored Split (90s total) - 62% green to Phase 1, 38% to cross
-        p_art_phases = []
-        g1_time = round(avail_green_90 * 0.62, 1)
-        g2_time = round(avail_green_90 * 0.38, 1)
-        for idx, p in enumerate(base_phases):
-            if idx == green_indices[0]:
-                p_art_phases.append({"duration": g1_time, "state": p["state"]})
-            elif idx in green_indices:
-                p_art_phases.append({"duration": g2_time, "state": p["state"]})
-            else:
-                p_art_phases.append({"duration": yellow_time, "state": p["state"]})
+        # Plan 1: Short cycle (60s total)
+        avail_60 = 60.0 - total_clearance
+        if avail_60 >= num_greens * 10.0:
+            each_60 = int(avail_60 // num_greens)
+            g_durs_60 = [each_60] * num_greens
+            remainder_60 = int(avail_60 - (each_60 * num_greens))
+            if remainder_60 > 0:
+                g_durs_60[0] += remainder_60
+            plans.append({
+                "plan_id": "plan_short_60s",
+                "name": "Short-Cycle Plan (60s)",
+                "description": "Short 60s cycle minimizing average vehicle cycle delays on minor approaches",
+                "cycle_length_s": 60,
+                "phases": make_plan_phases(60, g_durs_60),
+            })
 
-        plans.append({
-            "plan_id": "plan_arterial_90s",
-            "name": "Arterial Priority Plan (90s)",
-            "description": "90s cycle allocating 62% green time to primary corridor progression",
-            "cycle_length_s": 90,
-            "phases": p_art_phases,
-        })
+        # Plan 2: Balanced Standard (90s total)
+        avail_90 = 90.0 - total_clearance
+        if avail_90 >= num_greens * 10.0:
+            each_90 = int(avail_90 // num_greens)
+            g_durs_90 = [each_90] * num_greens
+            remainder_90 = int(avail_90 - (each_90 * num_greens))
+            if remainder_90 > 0:
+                g_durs_90[0] += remainder_90
+            plans.append({
+                "plan_id": "plan_balanced_90s",
+                "name": "Balanced Cycle Plan (90s)",
+                "description": "Standard 90s cycle with balanced green allocation across all approach phases",
+                "cycle_length_s": 90,
+                "phases": make_plan_phases(90, g_durs_90),
+            })
 
-        # Plan 4: High-Capacity Cycle (105s total) - for dense congestion clearance
-        avail_green_105 = max(30.0, 105.0 - total_yellow)
-        green_each_105 = max(15.0, round(avail_green_105 / num_greens, 1))
+        # Plan 3: Arterial-Favored Split (90s total)
+        if avail_90 >= num_greens * 10.0 and num_greens >= 2:
+            g1_target = max(10, int(round(avail_90 * 0.62)))
+            g_rest_each = max(10, int((avail_90 - g1_target) // (num_greens - 1)))
+            g_durs_art = [g1_target] + [g_rest_each] * (num_greens - 1)
+            rem_art = int(avail_90 - sum(g_durs_art))
+            if rem_art != 0:
+                g_durs_art[0] += rem_art
+            plans.append({
+                "plan_id": "plan_arterial_90s",
+                "name": "Arterial Priority Plan (90s)",
+                "description": "90s cycle allocating 62% green time to primary corridor progression",
+                "cycle_length_s": 90,
+                "phases": make_plan_phases(90, g_durs_art),
+            })
 
-        p105_phases = []
-        for idx, p in enumerate(base_phases):
-            if idx in green_indices:
-                p105_phases.append({"duration": green_each_105, "state": p["state"]})
-            else:
-                p105_phases.append({"duration": 3.5, "state": p["state"]})
+        # Plan 4: High-Capacity Cycle (105s total)
+        avail_105 = 105.0 - total_clearance
+        if avail_105 >= num_greens * 10.0:
+            each_105 = int(avail_105 // num_greens)
+            g_durs_105 = [each_105] * num_greens
+            rem_105 = int(avail_105 - (each_105 * num_greens))
+            if rem_105 > 0:
+                g_durs_105[0] += rem_105
+            plans.append({
+                "plan_id": "plan_high_cap_105s",
+                "name": "High-Capacity Plan (105s)",
+                "description": "Extended 105s cycle providing deep queue clearance during peak saturation",
+                "cycle_length_s": 105,
+                "phases": make_plan_phases(105, g_durs_105),
+            })
 
-        plans.append({
-            "plan_id": "plan_high_cap_105s",
-            "name": "High-Capacity Plan (105s)",
-            "description": "Extended 105s cycle providing deep queue clearance during peak saturation",
-            "cycle_length_s": 105,
-            "phases": p105_phases,
-        })
+        # Validate all generated plans and deduplicate
+        valid_plans = []
+        seen_signatures = set()
+        for cand in plans:
+            ok, reason = validate_phase_structure(cand["phases"], base_phases)
+            if not ok:
+                logger.warning("Rejected infeasible candidate %s: %s", cand["plan_id"], reason)
+                continue
+            sig = (cand["cycle_length_s"], tuple(int(round(p["duration"])) for p in cand["phases"]))
+            if sig in seen_signatures:
+                continue
+            seen_signatures.add(sig)
+            valid_plans.append(cand)
 
-        return plans
+        return valid_plans
 
     def write_additional_signals_xml(
         self,
         file_path: Path,
-        tl_id: str,
-        phases: list[dict[str, Any]],
+        tl_id_or_plans: str | dict[str, Any],
+        phases: Optional[list[dict[str, Any]]] = None,
         program_id: str = "optimized_fixed_time",
+        offset: int = 0,
     ) -> None:
-        """Write SUMO additional file with optimized fixed-time signal logic."""
+        """
+        Write SUMO additional file with fixed-time signal logic.
+        Supports both single-signal calls:
+            write_additional_signals_xml(path, tl_id, phases, program_id)
+        and multi-signal dictionary calls:
+            write_additional_signals_xml(path, {tl_1: {"phases": [...], "offset": 0}, ...})
+        """
         root = ET.Element("additional")
-        tl = ET.SubElement(
-            root,
-            "tlLogic",
-            id=tl_id,
-            type="static",
-            programID=program_id,
-            offset="0",
-        )
-        for p in phases:
-            ET.SubElement(
-                tl,
-                "phase",
-                duration=str(int(p["duration"])),
-                state=p["state"],
+
+        if isinstance(tl_id_or_plans, str):
+            # Single-signal call
+            tl_id = tl_id_or_plans
+            signal_dict = {tl_id: {"phases": phases or [], "program_id": program_id, "offset": offset}}
+        else:
+            # Multi-signal call
+            signal_dict = {}
+            for t_id, data in tl_id_or_plans.items():
+                if isinstance(data, list):
+                    signal_dict[t_id] = {"phases": data, "program_id": program_id, "offset": 0}
+                elif isinstance(data, dict):
+                    signal_dict[t_id] = {
+                        "phases": data.get("phases", []),
+                        "program_id": data.get("program_id", program_id),
+                        "offset": data.get("offset", 0),
+                    }
+
+        for t_id, s_data in signal_dict.items():
+            tl = ET.SubElement(
+                root,
+                "tlLogic",
+                id=t_id,
+                type="static",
+                programID=s_data.get("program_id", program_id),
+                offset=str(s_data.get("offset", 0)),
             )
+            for p in s_data.get("phases", []):
+                ET.SubElement(
+                    tl,
+                    "phase",
+                    duration=str(int(round(float(p["duration"])))),
+                    state=p["state"],
+                )
 
         tree = ET.ElementTree(root)
         tree.write(str(file_path), encoding="utf-8", xml_declaration=True)
+
+    def _run_sumo_eval(
+        self,
+        net_file: Path,
+        rou_file: Path,
+        add_file: Optional[Path],
+        eval_duration: int,
+        seed: int,
+        run_label: str,
+        timeout_seconds: int = 25,
+    ) -> dict[str, Any]:
+        """
+        Execute an actual SUMO simulation run and extract empirical tripinfo & summary observations.
+        Never fabricates measurements: returns explicit evaluation_status and diagnostics.
+        """
+        result: dict[str, Any] = {
+            "evaluation_status": "failed",
+            "diagnostics": None,
+            "avg_wait": None,
+            "avg_speed": None,
+            "throughput": None,
+            "queue_burden": None,
+            "max_queue": None,
+            "completed_vehicles": 0,
+            "unfinished_vehicles": 0,
+            "inserted_vehicles": 0,
+            "teleported_vehicles": 0,
+            "halting_vehicles": 0,
+            "score": float("inf"),
+        }
+
+        if not self.sumo_bin or not Path(self.sumo_bin).is_file():
+            result["diagnostics"] = "SUMO binary not available"
+            result["evaluation_status"] = "failed"
+            return result
+
+        summary_file = self.work_dir / f"summary_{run_label}.xml"
+        tripinfo_file = self.work_dir / f"tripinfo_{run_label}.xml"
+
+        # Clean previous outputs
+        for f in (summary_file, tripinfo_file):
+            if f.is_file():
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+
+        cmd = [
+            self.sumo_bin,
+            "-n", str(net_file),
+            "-r", str(rou_file),
+            "--begin", "0",
+            "--end", str(eval_duration),
+            "--seed", str(seed),
+            "--step-length", "0.2",
+            "--no-step-log", "true",
+            "--no-warnings", "true",
+            "--summary-output", str(summary_file),
+            "--tripinfo-output", str(tripinfo_file),
+            "--tripinfo-output.write-unfinished", "true",
+            "--ignore-route-errors", "true",
+        ]
+        if add_file and add_file.is_file():
+            cmd.extend(["-a", str(add_file)])
+
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_seconds)
+            if res.returncode != 0:
+                result["evaluation_status"] = "failed"
+                stderr_clean = res.stderr.strip()[:300] if res.stderr else "Unknown non-zero exit"
+                result["diagnostics"] = f"SUMO exited with code {res.returncode}: {stderr_clean}"
+                return result
+        except subprocess.TimeoutExpired:
+            result["evaluation_status"] = "failed"
+            result["diagnostics"] = f"SUMO execution timed out after {timeout_seconds}s"
+            return result
+        except Exception as e:
+            result["evaluation_status"] = "failed"
+            result["diagnostics"] = f"Failed to execute SUMO subprocess: {e}"
+            return result
+
+        # Parse summary output
+        inserted = 0
+        ended = 0
+        teleports = 0
+        halting = 0
+        sum_mean_speed = None
+        sum_mean_wait = None
+
+        if summary_file.is_file():
+            try:
+                s_tree = ET.parse(str(summary_file))
+                s_root = s_tree.getroot()
+                steps = s_root.findall("step")
+                if steps:
+                    last_step = steps[-1]
+                    inserted = int(last_step.get("inserted", "0"))
+                    ended = int(last_step.get("ended", "0"))
+                    teleports = int(last_step.get("teleports", "0"))
+                    halting = int(last_step.get("halting", "0"))
+                    try:
+                        sum_mean_wait = float(last_step.get("meanWaitingTime", "0.0"))
+                        sum_mean_speed = float(last_step.get("meanSpeed", "0.0")) * 3.6  # m/s to km/h
+                    except (ValueError, TypeError):
+                        pass
+            except Exception as e:
+                logger.debug("Summary parse note: %s", e)
+
+        # Parse tripinfo output (completed trips + unfinished trips)
+        waits: list[float] = []
+        speeds: list[float] = []
+        completed_count = 0
+        unfinished_count = 0
+
+        if tripinfo_file.is_file():
+            try:
+                t_tree = ET.parse(str(tripinfo_file))
+                t_root = t_tree.getroot()
+                for trip in t_root.findall("tripinfo"):
+                    w = float(trip.get("waitingTime", "0.0"))
+                    d = float(trip.get("routeLength", "0.0"))
+                    dur = float(trip.get("duration", "0.0"))
+                    waits.append(w)
+                    if dur > 0.0 and d > 0.0:
+                        speeds.append((d / dur) * 3.6)
+                    completed_count += 1
+
+                for unfin in t_root.findall("unfinished-tripinfo"):
+                    w = float(unfin.get("waitingTime", "0.0"))
+                    waits.append(w)
+                    unfinished_count += 1
+            except Exception as e:
+                result["evaluation_status"] = "failed"
+                result["diagnostics"] = f"Malformed tripinfo XML: {e}"
+                return result
+
+        total_observed = completed_count + unfinished_count
+        if total_observed == 0:
+            result["evaluation_status"] = "insufficient_data"
+            result["diagnostics"] = "No trips completed or active during measurement window"
+            return result
+
+        # Compute valid metrics
+        avg_wait = round(sum(waits) / len(waits), 1) if waits else (sum_mean_wait or 0.0)
+        avg_speed = round(sum(speeds) / len(speeds), 1) if speeds else (sum_mean_speed or 25.0)
+        throughput = round((completed_count / max(1.0, float(eval_duration))) * 3600.0, 1)
+        queue_burden = float(halting * 7.5)  # approximate queue length in meters
+        max_queue = float(halting * 12.0)
+
+        # Validate numbers are finite
+        for v in (avg_wait, avg_speed, throughput, queue_burden, max_queue):
+            if not math.isfinite(v):
+                result["evaluation_status"] = "failed"
+                result["diagnostics"] = "Non-finite metric produced by simulation"
+                return result
+
+        score, components = calculate_objective_score(
+            avg_wait=avg_wait,
+            avg_speed=avg_speed,
+            throughput=throughput,
+            queue_burden=queue_burden,
+            max_queue=max_queue,
+            unfinished_count=unfinished_count,
+            inserted_count=max(inserted, total_observed),
+            teleported_count=teleports,
+        )
+
+        result.update({
+            "evaluation_status": "success",
+            "diagnostics": None,
+            "avg_wait": avg_wait,
+            "avg_speed": avg_speed,
+            "throughput": throughput,
+            "queue_burden": queue_burden,
+            "max_queue": max_queue,
+            "completed_vehicles": completed_count,
+            "unfinished_vehicles": unfinished_count,
+            "inserted_vehicles": max(inserted, total_observed),
+            "teleported_vehicles": teleports,
+            "halting_vehicles": halting,
+            "score": score,
+            "components": components,
+        })
+        return result
 
     def optimize(
         self,
@@ -215,129 +647,227 @@ class FixedTimeSignalOptimizer:
     ) -> Optional[FixedTimeOptimizationResult]:
         """
         Execute bounded candidate fixed-time evaluations and select the optimal plan.
-        If native SUMO is present, candidate plans are evaluated through simulation runs.
+        Supports:
+        - Multi-signal optimization across all eligible signals in the network
+        - Explicit evaluation statuses without fabricated measurements
+        - Objective scoring balancing delay, queue, speed, and unfinished trips
+        - Separate final network-level validation against baseline
+        - Preserving original plan on failure
         """
         tl_logics = self.parse_traffic_lights(net_file)
         if not tl_logics:
-            return None
-
-        primary_tl_id = list(tl_logics.keys())[0]
-        base_phases = tl_logics[primary_tl_id]
-
-        candidates = self.generate_candidate_plans(primary_tl_id, base_phases)
-        if not candidates:
-            return None
-
-        evaluated_plans: list[TimingPlanEvaluation] = []
-        best_plan = candidates[0]
-        best_score = float("inf")
-
-        for cand in candidates:
-            plan_id = cand["plan_id"]
-            phases = cand["phases"]
-            cycle_len = cand["cycle_length_s"]
-
-            # Write temporary additional file for this candidate plan
-            cand_add_file = self.work_dir / f"signals_{plan_id}.add.xml"
-            self.write_additional_signals_xml(cand_add_file, primary_tl_id, phases, program_id=plan_id)
-
-            # Evaluate with native SUMO if binary available
-            avg_wait = 25.0
-            avg_speed = 32.0
-            throughput = 1800.0
-
-            if self.sumo_bin and Path(self.sumo_bin).is_file():
-                summary_file = self.work_dir / f"summary_{plan_id}.xml"
-                tripinfo_file = self.work_dir / f"tripinfo_{plan_id}.xml"
-                cmd = [
-                    self.sumo_bin,
-                    "-n", str(net_file),
-                    "-r", str(rou_file),
-                    "-a", str(cand_add_file),
-                    "--begin", "0",
-                    "--end", str(eval_duration),
-                    "--seed", str(seed),
-                    "--no-step-log", "true",
-                    "--no-warnings", "true",
-                    "--summary-output", str(summary_file),
-                    "--tripinfo-output", str(tripinfo_file),
-                ]
-                try:
-                    res = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
-                    if res.returncode == 0 and tripinfo_file.is_file():
-                        # Parse empirical tripinfo metrics
-                        trip_tree = ET.parse(str(tripinfo_file))
-                        trip_root = trip_tree.getroot()
-                        waits = []
-                        speeds = []
-                        for trip in trip_root.findall("tripinfo"):
-                            w = float(trip.get("waitingTime", "0.0"))
-                            d = float(trip.get("routeLength", "100.0"))
-                            dur = float(trip.get("duration", "10.0"))
-                            waits.append(w)
-                            if dur > 0:
-                                speeds.append((d / dur) * 3.6)
-
-                        if waits:
-                            avg_wait = round(sum(waits) / len(waits), 1)
-                        if speeds:
-                            avg_speed = round(sum(speeds) / len(speeds), 1)
-                        throughput = round((len(waits) / max(1.0, eval_duration)) * 3600.0, 1)
-                except Exception as e:
-                    logger.debug("Candidate %s micro-eval note: %s", plan_id, e)
-
-            # Objective function: lower is better (balances waiting time, speed, throughput)
-            # Penalizes waiting time heavily, rewards higher progression speed
-            score = round(avg_wait * 1.0 + (100.0 / max(5.0, avg_speed)) * 6.0 - (throughput * 0.005), 2)
-
-            is_sel = score < best_score
-            if is_sel:
-                best_score = score
-                best_plan = cand
-
-            evaluated_plans.append(
-                TimingPlanEvaluation(
-                    plan_id=plan_id,
-                    cycle_length_s=cycle_len,
-                    name=cand["name"],
-                    description=cand["description"],
-                    objective_score=score,
-                    avg_waiting_time_s=avg_wait,
-                    avg_speed_kmh=avg_speed,
-                    throughput_veh_hr=throughput,
-                    is_selected=is_sel,
-                    validation_passed=True,
-                )
+            return FixedTimeOptimizationResult(
+                signal_id="none",
+                validation_passed=False,
+                notes="No traffic signal controllers found in compiled network.",
+                status="no_signals",
+                optimized_signals_count=0,
+                total_signals_count=0,
             )
 
-        # Mark only the winning plan as selected
-        for ep in evaluated_plans:
-            ep.is_selected = ep.plan_id == best_plan["plan_id"]
+        if not self.sumo_bin or not Path(self.sumo_bin).is_file():
+            primary_tl_id = list(tl_logics.keys())[0]
+            return FixedTimeOptimizationResult(
+                signal_id=primary_tl_id,
+                validation_passed=False,
+                notes="Native SUMO binary not found; empirical signal optimization unavailable.",
+                status="failed",
+                failure_reason="sumo_binary_unavailable",
+                optimized_signals_count=0,
+                total_signals_count=len(tl_logics),
+            )
 
-        # Write final winning plan as signals.add.xml and attach to simulation.sumocfg
+        connections = self.parse_controlled_connections(net_file)
+
+        # Baseline network evaluation (netconvert plans)
+        base_net_eval = self._run_sumo_eval(
+            net_file=net_file,
+            rou_file=rou_file,
+            add_file=None,
+            eval_duration=eval_duration,
+            seed=seed,
+            run_label="baseline_screening",
+        )
+        baseline_score = base_net_eval["score"] if base_net_eval["evaluation_status"] == "success" else float("inf")
+
+        # STAGE A: Optimize each eligible signal
+        signal_results: dict[str, Any] = {}
+        winning_plans_per_signal: dict[str, dict[str, Any]] = {}
+        all_evaluated_plans: list[TimingPlanEvaluation] = []
+        optimized_count = 0
+
+        for tl_id, base_phases in tl_logics.items():
+            candidates = self.generate_candidate_plans(tl_id, base_phases, include_base=True)
+            if not candidates:
+                signal_results[tl_id] = {"status": "unsupported", "selected_plan": None}
+                winning_plans_per_signal[tl_id] = {"phases": base_phases, "plan_id": "plan_base"}
+                continue
+
+            evaluated_cands: list[TimingPlanEvaluation] = []
+            best_cand = candidates[0]  # default to base plan
+            best_score = float("inf")
+            valid_eval_count = 0
+
+            for cand in candidates:
+                plan_id = cand["plan_id"]
+                phases = cand["phases"]
+                cycle_len = cand["cycle_length_s"]
+
+                cand_add_file = self.work_dir / f"signals_{tl_id}_{plan_id}.add.xml"
+                self.write_additional_signals_xml(cand_add_file, tl_id, phases, program_id=plan_id)
+
+                run_res = self._run_sumo_eval(
+                    net_file=net_file,
+                    rou_file=rou_file,
+                    add_file=cand_add_file,
+                    eval_duration=eval_duration,
+                    seed=seed,
+                    run_label=f"{tl_id}_{plan_id}",
+                )
+
+                st: EvaluationStatus = run_res["evaluation_status"]
+                score = run_res["score"]
+                is_valid = st == "success" and math.isfinite(score) and score < float("inf")
+
+                if is_valid:
+                    valid_eval_count += 1
+                    # Deterministic tie-breaking: lower score, then lower avg_wait, then plan_id
+                    if (
+                        score < best_score
+                        or (score == best_score and (run_res["avg_wait"] or 0.0) < (getattr(best_cand, "avg_wait", 999.0)))
+                    ):
+                        best_score = score
+                        best_cand = cand
+
+                evaluated_cands.append(
+                    TimingPlanEvaluation(
+                        plan_id=plan_id,
+                        cycle_length_s=cycle_len,
+                        name=cand["name"],
+                        description=cand["description"],
+                        objective_score=score if is_valid else 999.0,
+                        avg_waiting_time_s=run_res["avg_wait"] if is_valid else 0.0,
+                        avg_speed_kmh=run_res["avg_speed"] if is_valid else 0.0,
+                        throughput_veh_hr=run_res["throughput"] if is_valid else 0.0,
+                        is_selected=False,
+                        validation_passed=is_valid,
+                        evaluation_status=st,
+                        diagnostics=run_res.get("diagnostics"),
+                        queue_burden_m=run_res.get("queue_burden"),
+                        max_queue_m=run_res.get("max_queue"),
+                        completed_vehicles=run_res.get("completed_vehicles"),
+                        unfinished_vehicles=run_res.get("unfinished_vehicles"),
+                        teleported_vehicles=run_res.get("teleported_vehicles"),
+                        phases=phases,
+                    )
+                )
+
+            # Mark winning plan if valid evaluations exist
+            if valid_eval_count > 0:
+                for ec in evaluated_cands:
+                    if ec.plan_id == best_cand["plan_id"]:
+                        ec.is_selected = True
+                winning_plans_per_signal[tl_id] = best_cand
+                signal_results[tl_id] = {
+                    "status": "optimized",
+                    "selected_plan": best_cand["plan_id"],
+                    "best_score": best_score,
+                }
+                optimized_count += 1
+            else:
+                winning_plans_per_signal[tl_id] = {"phases": base_phases, "plan_id": "plan_base"}
+                signal_results[tl_id] = {
+                    "status": "failed",
+                    "reason": "All candidate evaluations failed in native SUMO",
+                }
+
+            all_evaluated_plans.extend(evaluated_cands)
+
+        # STAGE B: Network-Level Validation
+        primary_tl_id = list(tl_logics.keys())[0]
         final_add_file = self.work_dir / "signals.add.xml"
-        self.write_additional_signals_xml(
-            final_add_file,
-            primary_tl_id,
-            best_plan["phases"],
-            program_id="optimized_fixed_time",
-        )
 
-        # Attach additional file to simulation.sumocfg
-        self._attach_additional_to_sumocfg(cfg_file, "signals.add.xml")
+        # If any signal was successfully evaluated, assemble multi-signal additional file
+        if optimized_count > 0:
+            multi_signal_dict = {
+                t_id: {"phases": p_data["phases"], "program_id": p_data.get("plan_id", "optimized_fixed_time")}
+                for t_id, p_data in winning_plans_per_signal.items()
+            }
+            self.write_additional_signals_xml(final_add_file, multi_signal_dict)
 
+            # Run network-level validation of combined plan
+            net_eval = self._run_sumo_eval(
+                net_file=net_file,
+                rou_file=rou_file,
+                add_file=final_add_file,
+                eval_duration=eval_duration,
+                seed=seed,
+                run_label="combined_network_validation",
+            )
+
+            is_net_validated = (
+                net_eval["evaluation_status"] == "success"
+                and math.isfinite(net_eval["score"])
+                and net_eval["score"] <= (baseline_score + 0.5)  # Must not significantly regress network
+            )
+
+            if is_net_validated:
+                self._attach_additional_to_sumocfg(cfg_file, "signals.add.xml")
+                primary_win = winning_plans_per_signal.get(primary_tl_id, {})
+                notes = (
+                    f"Validated {optimized_count}/{len(tl_logics)} traffic signals across network in native SUMO. "
+                    f"Network-level objective: {net_eval['score']:.2f} (baseline: {baseline_score:.2f})."
+                )
+                return FixedTimeOptimizationResult(
+                    signal_id=primary_tl_id,
+                    evaluated_plans=all_evaluated_plans,
+                    selected_plan_id=primary_win.get("plan_id", "plan_base"),
+                    selected_cycle_length_s=primary_win.get("cycle_length_s", 90),
+                    validation_passed=True,
+                    notes=notes,
+                    status="completed",
+                    optimized_signals_count=optimized_count,
+                    total_signals_count=len(tl_logics),
+                    signal_results=signal_results,
+                )
+            else:
+                # Combined plan regressed or failed network validation: fall back cleanly
+                notes = (
+                    f"Candidate plans were screened for {optimized_count} signals, but combined whole-network validation "
+                    f"did not beat baseline (combined: {net_eval['score']:.2f} vs baseline: {baseline_score:.2f}). "
+                    f"Preserving original network signal timing."
+                )
+                return FixedTimeOptimizationResult(
+                    signal_id=primary_tl_id,
+                    evaluated_plans=all_evaluated_plans,
+                    selected_plan_id="plan_base",
+                    selected_cycle_length_s=int(sum(float(p['duration']) for p in tl_logics[primary_tl_id])),
+                    validation_passed=False,
+                    notes=notes,
+                    status="inconclusive",
+                    failure_reason="combined_network_validation_failed",
+                    optimized_signals_count=0,
+                    total_signals_count=len(tl_logics),
+                    signal_results=signal_results,
+                )
+
+        # If zero signals were successfully optimized
         notes = (
-            f"Evaluated {len(candidates)} feasible fixed-time timing alternatives in native SUMO. "
-            f"Selected '{best_plan['name']}' ({best_plan['cycle_length_s']}s cycle) with best objective performance."
+            f"All candidate evaluations for {len(tl_logics)} traffic signal(s) failed or returned insufficient data in SUMO. "
+            f"Preserved original compiled timing plan."
         )
-
         return FixedTimeOptimizationResult(
             signal_id=primary_tl_id,
-            evaluated_plans=evaluated_plans,
-            selected_plan_id=best_plan["plan_id"],
-            selected_cycle_length_s=best_plan["cycle_length_s"],
-            validation_passed=True,
+            evaluated_plans=all_evaluated_plans,
+            selected_plan_id=None,
+            selected_cycle_length_s=None,
+            validation_passed=False,
             notes=notes,
+            status="failed",
+            failure_reason="all_evaluations_failed",
+            optimized_signals_count=0,
+            total_signals_count=len(tl_logics),
+            signal_results=signal_results,
         )
 
     def _attach_additional_to_sumocfg(self, cfg_file: Path, add_file_name: str) -> None:

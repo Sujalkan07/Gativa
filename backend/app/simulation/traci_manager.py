@@ -148,6 +148,8 @@ class SimulationSession:
         self.conn_label = f"gativa_{sim_id[:8]}"
         self.is_connected = False
         self.error_message: Optional[str] = None
+        self.engine_transitioned = False
+        self.engine_transition_reason: Optional[str] = None
         self._lock = threading.RLock()
 
         # Cumulative statistics
@@ -315,8 +317,10 @@ class SimulationSession:
                     self._extract_traci_state(conn)
                 except Exception as e:
                     logger.warning("TraCI runtime step error on %s: %s; transitioning to fallback kinematics", self.sim_id, e)
+                    self.engine_transitioned = True
+                    self.engine_transition_reason = f"TraCI runtime step failure ({type(e).__name__}): {e}"
                     self.engine_mode = "fallback"
-                    self.engine_message = f"Native TraCI runtime failure ({type(e).__name__}); transitioned to fallback kinematics."
+                    self.engine_message = f"Native TraCI runtime failure ({type(e).__name__}); transitioned to fallback kinematics (measurements invalidated for empirical comparison)."
                     self.is_connected = False
                     self._step_kinematics_fallback(num_steps)
             else:
@@ -754,22 +758,14 @@ class SimulationSession:
         )
         t = self.elapsed_seconds
 
-        # Distinct physics-based progression per strategy (no artificial scalar multiplier between runs)
+        # Physics-based visual kinematics estimation without fabricated empirical benefits
         has_intervention = bool(self.applied_signals_count > 0 or "Optimized" in self.strategy or self.strategy == "actuated_adaptive")
         is_optimized = has_intervention
         flow_ratio = min(1.2, self.demand_rate_veh_hr / max(1000.0, self.edge_count * 800.0))
         base_speed = max(15.0, 42.0 * (1.0 - flow_ratio * 0.35))
         base_wait = max(4.0, flow_ratio * 32.0)
         base_queue = max(8.0, flow_ratio * 55.0)
-
-        if has_intervention and self.applied_signals_count > 0:
-            benefit = min(0.18, self.applied_signals_count * 0.04)
-            base_speed = round(base_speed * (1.0 + benefit), 1)
-            base_wait = max(2.0, round(base_wait * (1.0 - benefit * 1.1), 1))
-            base_queue = max(4.0, round(base_queue * (1.0 - benefit), 1))
-            throughput_rate = (self.demand_rate_veh_hr / 3600.0) * (0.75 + benefit)
-        else:
-            throughput_rate = (self.demand_rate_veh_hr / 3600.0) * 0.72
+        throughput_rate = (self.demand_rate_veh_hr / 3600.0) * 0.72
 
         # Cyclic variation reflecting intersection signal phases
         cycle = math.sin(t / 12.0)
@@ -987,6 +983,8 @@ class SimulationSession:
             self.teleported_count = 0
             self.collision_count = 0
             self.peak_queue_m = 0.0
+            self.engine_transitioned = False
+            self.engine_transition_reason = None
             self.speed_samples.clear()
             self.waiting_samples.clear()
             self.queue_samples.clear()
@@ -1062,6 +1060,8 @@ class SimulationSession:
             "assumptions": self.assumptions,
             "segments_simulated": self.edge_count,
             "omitted_segments_count": self.omitted_segments_count,
+            "engine_transitioned": self.engine_transitioned,
+            "engine_transition_reason": self.engine_transition_reason,
         }
 
 

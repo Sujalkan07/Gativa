@@ -290,7 +290,16 @@ export interface SimulationMetrics {
 }
 
 export type SimulationEngineMode = 'native_sumo' | 'fallback' | 'unavailable'
-export type ComparisonStatus = 'pending' | 'insufficient_data' | 'completed' | 'failed'
+export type ComparisonStatus =
+  | 'pending'
+  | 'running'
+  | 'completed'
+  | 'completed_validated'
+  | 'completed_inconclusive'
+  | 'insufficient_data'
+  | 'failed'
+  | 'engine_mismatch'
+  | 'optimization_unavailable'
 
 export interface TrafficLightState {
   id: string
@@ -358,6 +367,8 @@ export interface ScenarioComparisonResult {
   initial_vehicles_count?: number
   fixed_time_plan_summary?: string | null
   selected_fixed_time_plan?: TimingPlanEvaluation | null
+  is_validated?: boolean
+  optimization_status?: string
 }
 
 // ─── Traffic Signal Candidates & User Approval ────────────────────────────────
@@ -400,6 +411,8 @@ export interface CandidateDecisionRequest {
   decision?: 'approved' | 'rejected' | 'pending'
 }
 
+export type EvaluationStatus = 'success' | 'failed' | 'insufficient_data' | 'invalid_configuration'
+
 export interface TimingPlanEvaluation {
   plan_id: string
   cycle_length_s: number
@@ -411,6 +424,15 @@ export interface TimingPlanEvaluation {
   throughput_veh_hr: number
   is_selected: boolean
   validation_passed: boolean
+  evaluation_status?: EvaluationStatus
+  diagnostics?: string | null
+  queue_burden_m?: number | null
+  max_queue_m?: number | null
+  completed_vehicles?: number | null
+  unfinished_vehicles?: number | null
+  teleported_vehicles?: number | null
+  spillback_rate?: number | null
+  phases?: Record<string, any>[]
 }
 
 export interface FixedTimeOptimizationResult {
@@ -420,6 +442,12 @@ export interface FixedTimeOptimizationResult {
   selected_cycle_length_s?: number | null
   validation_passed: boolean
   notes: string
+  status?: 'completed' | 'failed' | 'inconclusive' | 'insufficient_data' | 'no_signals'
+  optimized_signals_count?: number
+  total_signals_count?: number
+  failure_reason?: string | null
+  signal_results?: Record<string, any> | null
+  corridor_coordination_applied?: boolean
 }
 
 // ─── Traffic Signal Inspection & Editing ──────────────────────────────────────

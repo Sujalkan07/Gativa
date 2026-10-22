@@ -1062,9 +1062,9 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
               </span>
             )}
             {engineMode === 'fallback' && (
-              <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-amber-50 text-amber-700 border border-amber-300">
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-amber-50 text-amber-700 border border-amber-300" title="Simulated visual estimate model; not native SUMO hardware execution">
                 <span className="w-2 h-2 rounded-full bg-amber-500"></span>
-                Fallback Kinematics
+                Fallback Kinematics (Visual Estimate)
               </span>
             )}
           </div>
@@ -2033,12 +2033,18 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
               {comparison?.comparison_status && (
                 <span
                   className={`text-[10px] font-semibold uppercase px-2 py-0.5 rounded border ${
-                    comparison.comparison_status === 'completed'
+                    comparison.comparison_status === 'completed' || comparison.comparison_status === 'completed_validated'
                       ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
-                      : 'bg-slate-100 text-slate-600 border-slate-200'
+                      : comparison.comparison_status === 'completed_inconclusive'
+                        ? 'bg-amber-50 text-amber-700 border-amber-200'
+                        : comparison.comparison_status === 'failed' || comparison.comparison_status === 'engine_mismatch'
+                          ? 'bg-rose-50 text-rose-700 border-rose-200'
+                          : comparison.comparison_status === 'running'
+                            ? 'bg-blue-50 text-blue-700 border-blue-200'
+                            : 'bg-slate-100 text-slate-600 border-slate-200'
                   }`}
                 >
-                  {comparison.comparison_status}
+                  {comparison.comparison_status.replace(/_/g, ' ')}
                 </span>
               )}
             </div>
@@ -2106,9 +2112,15 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
                       {plan.description}
                     </div>
                     <div className="text-[10px] text-emerald-700 font-mono mt-1 flex items-center gap-2">
-                      <span>Validated in SUMO</span>
-                      <span>•</span>
-                      <span>Objective: {plan.objective_score?.toFixed(1)}</span>
+                      <span className={plan.validation_passed ? "text-emerald-700 font-semibold" : "text-amber-700"}>
+                        {plan.validation_passed ? "Validated in SUMO" : "Inconclusive / Screening Only"}
+                      </span>
+                      {plan.objective_score != null && plan.objective_score < 900 && (
+                        <>
+                          <span>•</span>
+                          <span>Objective: {plan.objective_score?.toFixed(1)}</span>
+                        </>
+                      )}
                     </div>
                   </div>
                 ) : (
