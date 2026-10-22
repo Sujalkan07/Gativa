@@ -19,7 +19,10 @@ import type {
 } from '../types/api'
 
 
-const BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
+// Use the same-origin /api proxy in local development and behind a single
+// reverse proxy. Set VITE_API_BASE_URL only when the API is intentionally hosted
+// on a separate origin with matching CORS policy.
+const BASE_URL = import.meta.env.VITE_API_BASE_URL || ''
 
 const client = axios.create({
   baseURL: BASE_URL,

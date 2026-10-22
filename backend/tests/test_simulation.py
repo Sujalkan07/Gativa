@@ -9,12 +9,81 @@ import tempfile
 
 from main import app
 from app.simulation.network_builder import find_sumo_binary, SumoNetworkBuilder
-from app.simulation.traci_manager import SimulationSession
+from app.simulation.traci_manager import SimulationSession, normalize_traffic_light_state
 from app.simulation.scenario_comparator import ScenarioComparator
 from app.simulation.service import simulation_service
 from app.models.schemas import SimulationMetrics, SimulationPrepareRequest
 
 client = TestClient(app)
+
+
+@pytest.mark.parametrize(
+    ("sumo_state", "display_state"),
+    [
+        ("GrGr", "green"),
+        ("yyyy", "yellow"),
+        ("uuuu", "yellow"),
+        ("rrrr", "red"),
+        ("oooo", "unknown"),
+        ("", "unknown"),
+    ],
+)
+def test_sumo_signal_state_normalization(sumo_state, display_state):
+    assert normalize_traffic_light_state(sumo_state) == display_state
+
+
+def test_native_sumo_extracts_real_signal_state():
+    """Compile a signalized crossing and verify TraCI exposes its live phase."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        segments = [
+            {
+                "segment_id": "west_approach",
+                "geometry": {"type": "LineString", "coordinates": [[77.590, 12.970], [77.600, 12.970]]},
+                "u": "west", "v": "center", "v_control": "traffic_signal", "v_provenance": "source_verified",
+            },
+            {
+                "segment_id": "east_approach",
+                "geometry": {"type": "LineString", "coordinates": [[77.600, 12.970], [77.610, 12.970]]},
+                "u": "center", "v": "east", "u_control": "traffic_signal", "u_provenance": "source_verified",
+            },
+            {
+                "segment_id": "south_approach",
+                "geometry": {"type": "LineString", "coordinates": [[77.600, 12.960], [77.600, 12.970]]},
+                "u": "south", "v": "center", "v_control": "traffic_signal", "v_provenance": "source_verified",
+            },
+            {
+                "segment_id": "north_approach",
+                "geometry": {"type": "LineString", "coordinates": [[77.600, 12.970], [77.600, 12.980]]},
+                "u": "center", "v": "north", "u_control": "traffic_signal", "u_provenance": "source_verified",
+            },
+        ]
+        work_dir = Path(tmp_dir)
+        meta = SumoNetworkBuilder(work_dir).build(segments, duration_seconds=60)
+        assert meta["netconvert_used"] is True
+        session = SimulationSession(
+            sim_id="test_native_signal_state",
+            analysis_id="test_native_signal_state",
+            work_dir=work_dir,
+            cfg_file=Path(meta["cfg_file"]),
+            duration_seconds=60,
+            edge_count=meta["edge_count"],
+            junction_count=meta["junction_count"],
+            signal_count=meta["signal_count"],
+            road_segments=segments,
+            netconvert_used=meta["netconvert_used"],
+        )
+        try:
+            session.start()
+            assert session.engine_mode == "native_sumo"
+            status = session.step(num_steps=1)
+            assert status["engine_mode"] == "native_sumo"
+            assert status["elapsed_seconds"] == pytest.approx(0.2)
+            assert status["traffic_lights"], "native TraCI should return the compiled signal"
+            for signal in status["traffic_lights"]:
+                assert signal["state"] in {"green", "yellow", "red", "unknown"}
+                assert signal["is_green"] is (signal["state"] == "green")
+        finally:
+            session.stop()
 
 
 def test_find_sumo_binary():
@@ -189,6 +258,7 @@ def test_fallback_corridor_interpolation():
         status = session.step(num_steps=2)
 
         assert len(status["vehicles"]) > 0
+        assert status["elapsed_seconds"] == pytest.approx(0.4)
         for veh in status["vehicles"]:
             # Vehicles must be interpolated around Bangalore [12.9x, 77.5x-77.6x], NOT hardcoded Lucknow!
             assert 12.90 <= veh["lat"] <= 13.05, f"Expected Bangalore latitude, got {veh['lat']}"
@@ -243,6 +313,24 @@ def test_scenario_comparator_honest_variance():
     comp_row = next(r for r in res.rows if r.metric == "Completed Vehicles")
     assert "+25.0%" in comp_row.variance
     assert comp_row.is_improvement is True
+
+
+def test_scenario_comparator_withholds_mixed_engine_comparison():
+    metrics = SimulationMetrics(avg_speed_kmh=20.0, elapsed_seconds=10.0)
+    result = ScenarioComparator.compare(
+        sim_id="mixed_engine_test",
+        analysis_id="analysis_mixed_engine_test",
+        duration_seconds=60,
+        engine_mode="fallback",
+        baseline_engine_mode="native_sumo",
+        baseline_metrics=metrics.model_copy(deep=True),
+        optimized_metrics=metrics.model_copy(deep=True),
+        step_count=10,
+    )
+
+    assert result.comparison_status == "insufficient_data"
+    assert "baseline ran with native_sumo" in result.methodology_notes
+    assert all("engine mismatch" in row.variance.lower() for row in result.rows)
 
 
 def test_scenario_comparator_pending_state():

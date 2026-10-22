@@ -32,6 +32,7 @@ class ScenarioComparator:
         baseline_strategy: str = "Baseline (Fixed-Time Signal Control)",
         optimized_strategy: str = "Optimized (Actuated Adaptive Signal Control)",
         step_count: int = 0,
+        baseline_engine_mode: Optional[SimulationEngineMode] = None,
         signal_count: Optional[int] = None,
         approved_signals_count: Optional[int] = None,
         applied_signals_count: Optional[int] = None,
@@ -71,6 +72,60 @@ class ScenarioComparator:
             optimized_metrics is not None
             and (optimized_metrics.elapsed_seconds > 0.0 or optimized_metrics.avg_speed_kmh > 0.0 or optimized_metrics.completed_vehicles > 0)
         )
+
+        if baseline_engine_mode is not None and baseline_engine_mode != engine_mode:
+            mismatch_rows = [
+                ScenarioMetricRow(
+                    metric="Average Speed",
+                    baseline=f"{baseline_metrics.avg_speed_kmh:.1f} km/h" if baseline_metrics else "—",
+                    optimized=f"{optimized_metrics.avg_speed_kmh:.1f} km/h" if optimized_metrics else "—",
+                    variance="Not comparable (engine mismatch)",
+                    is_improvement=False,
+                ),
+                ScenarioMetricRow(
+                    metric="Average Waiting Time",
+                    baseline=f"{baseline_metrics.avg_waiting_time_s:.1f} s" if baseline_metrics else "—",
+                    optimized=f"{optimized_metrics.avg_waiting_time_s:.1f} s" if optimized_metrics else "—",
+                    variance="Not comparable (engine mismatch)",
+                    is_improvement=False,
+                ),
+                ScenarioMetricRow(
+                    metric="Average Queue Length",
+                    baseline=f"{baseline_metrics.avg_queue_length_m:.1f} m" if baseline_metrics else "—",
+                    optimized=f"{optimized_metrics.avg_queue_length_m:.1f} m" if optimized_metrics else "—",
+                    variance="Not comparable (engine mismatch)",
+                    is_improvement=False,
+                ),
+                ScenarioMetricRow(
+                    metric="Completed Vehicles",
+                    baseline=f"{baseline_metrics.completed_vehicles} vehs" if baseline_metrics else "—",
+                    optimized=f"{optimized_metrics.completed_vehicles} vehs" if optimized_metrics else "—",
+                    variance="Not comparable (engine mismatch)",
+                    is_improvement=False,
+                ),
+            ]
+            return ScenarioComparisonResult(
+                sim_id=sim_id,
+                analysis_id=analysis_id,
+                duration_seconds=duration_seconds,
+                engine_mode=engine_mode,
+                comparison_status="insufficient_data",
+                baseline_strategy=baseline_strategy,
+                optimized_strategy=optimized_strategy,
+                baseline_metrics=baseline_metrics or empty_metrics,
+                optimized_metrics=optimized_metrics or empty_metrics,
+                rows=mismatch_rows,
+                methodology_notes=(
+                    "Scenario comparison withheld because the baseline ran with "
+                    f"{baseline_engine_mode} while the optimized run used {engine_mode}. "
+                    "Engine modes must match before metric variances are meaningful."
+                ),
+                signal_count=signal_count,
+                approved_signals_count=approved_signals_count or 0,
+                applied_signals_count=applied_signals_count or 0,
+                initial_vehicles_count=initial_vehicles_count or 0,
+                selected_fixed_time_plan=selected_fixed_time_plan,
+            )
 
         # 1. Check for Pending state (simulation has not stepped yet)
         if not has_baseline and not has_optimized and step_count == 0:

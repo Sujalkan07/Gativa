@@ -23,7 +23,11 @@ from app.models.schemas import (
     TrafficLightState,
     VehiclePosition,
 )
-from app.simulation.network_builder import find_sumo_binary, SumoNetworkBuilder
+from app.simulation.network_builder import (
+    SIMULATION_STEP_LENGTH_SECONDS,
+    find_sumo_binary,
+    SumoNetworkBuilder,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +51,23 @@ def get_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", 0))
         return s.getsockname()[1]
+
+
+def normalize_traffic_light_state(state_str: str) -> str:
+    """Reduce SUMO's per-link signal state to a safe junction-level display state.
+
+    SUMO returns one character per controlled link (for example ``GrGr``), not
+    words such as ``green``. A junction with no active red/yellow/green aspect
+    (for example an off signal represented by ``o``) must not be shown as green.
+    """
+    state = (state_str or "").lower()
+    if "y" in state or "u" in state:
+        return "yellow"
+    if "g" in state:
+        return "green"
+    if "r" in state:
+        return "red"
+    return "unknown"
 
 
 class SimulationSession:
@@ -265,7 +286,19 @@ class SimulationSession:
                         conn.simulationStep()
                         self.step_count += 1
                         self.elapsed_seconds = round(conn.simulation.getTime(), 1)
-                        self.completed_vehicles_cumulative += conn.simulation.getArrivedNumber()
+                        # Departure/arrival lists are reset each simulation
+                        # step.  Capture them here rather than after a batched
+                        # step, otherwise a populated t=0 network appears to
+                        # have inserted zero vehicles in the metrics.
+                        for v_id in conn.simulation.getDepartedIDList():
+                            self._vehicle_entry_times[v_id] = self.elapsed_seconds
+                            self.inserted_vehicles_cumulative += 1
+                        arrived_ids = conn.simulation.getArrivedIDList()
+                        self.completed_vehicles_cumulative += len(arrived_ids)
+                        for v_id in arrived_ids:
+                            entry_time = self._vehicle_entry_times.pop(v_id, None)
+                            if entry_time is not None:
+                                self.travel_time_samples.append(max(1.0, self.elapsed_seconds - entry_time))
 
                     # 3. Sample edge telemetry once per step batch for high-efficiency post-simulation analysis
                     self._sample_edge_telemetry(conn)
@@ -616,13 +649,7 @@ class SimulationSession:
         try:
             for tl_id in conn.trafficlight.getIDList():
                 state_str = conn.trafficlight.getRedYellowGreenState(tl_id)
-                tl_state = "green"
-                if "y" in state_str.lower():
-                    tl_state = "yellow"
-                elif "r" in state_str.lower() and "g" not in state_str.lower():
-                    tl_state = "red"
-                elif "g" in state_str.lower():
-                    tl_state = "green"
+                tl_state = normalize_traffic_light_state(state_str)
 
                 tl_lat = None
                 tl_lng = None
@@ -696,7 +723,10 @@ class SimulationSession:
         """Kinematics model progression interpolating vehicles along real corridor geometry."""
         import math
         self.step_count += num_steps
-        self.elapsed_seconds = min(float(self.duration_seconds), round(self.step_count * 0.5, 1))
+        self.elapsed_seconds = min(
+            float(self.duration_seconds),
+            round(self.step_count * SIMULATION_STEP_LENGTH_SECONDS, 1),
+        )
         t = self.elapsed_seconds
 
         # Distinct physics-based progression per strategy (no artificial scalar multiplier between runs)
@@ -721,7 +751,29 @@ class SimulationSession:
         cur_speed = max(5.0, round(base_speed + cycle * 2.5, 1))
         cur_wait = max(0.0, round(base_wait - cycle * 4.0, 1))
         cur_queue = max(0.0, round(base_queue - cycle * 6.0, 1))
-        completed = int(t * throughput_rate)
+        # The fallback is a transparent visual estimate.  It must still honor
+        # the configured initial population: vehicles begin spread through the
+        # selected roads and leave those roads over a finite travel window.
+        # Native SUMO remains the source of authoritative movement metrics.
+        initial_escape_window = max(45.0, min(240.0, self.duration_seconds * 0.65))
+        # Older callers may construct a fallback session without build
+        # metadata. Keep a small visible preview for those sessions; normal
+        # prepared simulations always use the generated initial population.
+        fallback_initial_count = self.initial_vehicles_count or 5
+        initial_active = max(0, int(fallback_initial_count * (1.0 - t / initial_escape_window)))
+        scheduled_released = min(
+            self.scheduled_vehicles,
+            max(0, int(self.scheduled_vehicles * t / max(1.0, self.duration_seconds))),
+        )
+        scheduled_completed = max(
+            0,
+            int(self.scheduled_vehicles * max(0.0, t - initial_escape_window * 0.45) / max(1.0, self.duration_seconds)),
+        )
+        completed = min(
+            fallback_initial_count + self.scheduled_vehicles,
+            (fallback_initial_count - initial_active) + scheduled_completed,
+        )
+        modeled_active = max(0, initial_active + scheduled_released - scheduled_completed)
 
         # Extract real polylines from road segments or polygon bounds
         lines: list[list[list[float]]] = []
@@ -736,9 +788,11 @@ class SimulationSession:
         if not lines and self.polygon_coords and len(self.polygon_coords) >= 2:
             lines = [self.polygon_coords]
 
-        # Deterministic vehicle distribution along corridor polylines
+        # Deterministic vehicle distribution along corridor polylines.  Render
+        # enough vehicles to make an initial population visible without making
+        # the browser map unusable on very large scenarios.
         vehicles: list[VehiclePosition] = []
-        num_active = min(30, max(5, int(12 + 6 * math.cos(t / 18.0))))
+        num_active = min(120, modeled_active)
 
         if lines:
             for idx in range(num_active):
@@ -747,8 +801,12 @@ class SimulationSession:
                 if n_pts < 2:
                     continue
 
-                # Advance vehicle along segment polyline
-                progress = ((t * 0.02 + idx * 0.19) % 1.0)
+                # Vehicles are spread across each road at t=0 and progress to
+                # its exit.  They intentionally do not wrap around and reappear.
+                initial_progress = (idx * 0.61803398875) % 0.82
+                progress = initial_progress + (t / initial_escape_window)
+                if progress >= 1.0:
+                    continue
                 seg_float = progress * (n_pts - 1)
                 p_idx = int(seg_float)
                 frac = seg_float - p_idx
@@ -864,7 +922,10 @@ class SimulationSession:
             avg_queue_length_m=cur_queue,
             max_queue_length_m=round(self.peak_queue_m, 1),
             completed_vehicles=completed,
-            active_vehicles=len(vehicles),
+            active_vehicles=modeled_active,
+            scheduled_vehicles=self.scheduled_vehicles,
+            inserted_vehicles=min(fallback_initial_count + self.scheduled_vehicles, fallback_initial_count + scheduled_released),
+            waiting_to_enter_count=max(0, self.scheduled_vehicles - scheduled_released),
             elapsed_seconds=self.elapsed_seconds,
             total_duration_seconds=float(self.duration_seconds),
         )

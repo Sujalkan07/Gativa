@@ -6,7 +6,7 @@
 [![Leaflet](https://img.shields.io/badge/GIS-Leaflet%20%2B%20OpenStreetMap-199900.svg?style=flat-square&logo=leaflet&logoColor=white)](https://leafletjs.com)
 [![Eclipse SUMO](https://img.shields.io/badge/Simulation-Eclipse%20SUMO%201.28+-276DC3.svg?style=flat-square)](https://eclipse.dev/sumo/)
 [![Tailwind CSS](https://img.shields.io/badge/Styling-Tailwind%20CSS%20v4-38B2AC.svg?style=flat-square&logo=tailwind-css&logoColor=white)](https://tailwindcss.com)
-[![Tests](https://img.shields.io/badge/Tests-77%20Passed%2C%201%20Skipped-10B981.svg?style=flat-square)](https://github.com/Sujalkan07/Gativa)
+[![Tests](https://img.shields.io/badge/Tests-85%20Passed%2C%201%20Skipped-10B981.svg?style=flat-square)](https://github.com/Sujalkan07/Gativa)
 
 > **Gativa** is an open-source, full-stack geospatial intelligence and microscopic traffic simulation platform designed for municipal civil engineers, urban transport planners, and GIS researchers. It enables users to search locations, sketch road networks, evaluate Level of Service (HCM 6th Edition), diagnose structural bottlenecks, review evidence-based physical infrastructure recommendations, and execute authentic microscopic traffic simulations using **Eclipse SUMO** and **TraCI** with zero synthetic data fabrication.
 
@@ -39,6 +39,8 @@
 23. [Known Limitations & Roadmap](#23-known-limitations--roadmap)
 24. [Engineering Disclaimer & Attribution](#24-engineering-disclaimer--attribution)
 25. [License](#25-license)
+26. [Deployment Model](docs/DEPLOYMENT.md)
+27. [Production Readiness Roadmap](docs/ROADMAP.md)
 
 ---
 
@@ -64,7 +66,7 @@ Urban transport decisions often depend on either static spreadsheet formulas or 
 - **Maturity**: Functional Engineering Prototype / Decision Support System.
 - **Backend**: FastAPI 0.115+ (Python 3.12) with SQLite durable local persistence and optional MongoDB support.
 - **Frontend**: React 19, TypeScript, Vite 8, Tailwind CSS v4, Leaflet GIS.
-- **Test Suite Status**: **77 Passed, 1 Skipped, 0 Failed** across 12 test suites covering GIS math, critical security/boundary fixes, signal authenticity, candidate screening, fixed-time optimization, and live API endpoints.
+- **Test Suite Status**: **85 Passed, 1 Skipped, 0 Failed** in the local Python 3.12/SUMO 1.28 run across 12 test files. CI is configured to run the backend suite and frontend production build on pull requests.
 
 ---
 
@@ -637,6 +639,8 @@ npm run build
 ---
 
 ## 23. Known Limitations & Roadmap
+
+See [Deployment Model](docs/DEPLOYMENT.md) for the supported local setup and the intended private deployment controls. The prioritized production-readiness work is tracked in [Production Readiness Roadmap](docs/ROADMAP.md) and linked GitHub issues.
 
 ### Current Limitations
 - **Decision-Support Scope**: Recommendations provide geometric and traffic feasibility screening. They do not substitute for on-site geotechnical, structural, or environmental impact assessments.

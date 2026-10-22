@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 # Maximum road segments to compile into a single SUMO network.
 # Supports large corridor selections (e.g. 354+ segments).
 MAX_SEGMENTS = 1000
+SIMULATION_STEP_LENGTH_SECONDS = 0.2
 
 
 def find_sumo_binary(binary_name: str = "sumo") -> Optional[str]:
@@ -716,12 +717,13 @@ class SumoNetworkBuilder:
         bus_fraction = (vehicle_types or {}).get("bus", 0.12)
 
         # 3. Spatially Distributed Initial Vehicle Population (at t=0.0)
-        # Distributes initial vehicles across DISTINCT interior/approach edges rather than piling up at one entrance
+        # Start a meaningful share of the requested demand on roads throughout
+        # the selected area.  We cycle through valid origin edges instead of
+        # capping the population at one vehicle per edge.
         if initial_population is not None and initial_population >= 0:
             target_initial = initial_population
         else:
-            # Natural baseline population: ~20-30% of total demand, capped by edge count
-            target_initial = max(4, min(len(actual_edges), int(total_vehicles * 0.25)))
+            target_initial = min(total_vehicles, max(12, int(total_vehicles * 0.55)))
 
         # Find candidate edges that have valid downstream progression paths
         candidate_initial_edges = [
@@ -731,13 +733,15 @@ class SumoNetworkBuilder:
         if not candidate_initial_edges:
             candidate_initial_edges = actual_edges
 
-        # Sample distinct edges so each initial vehicle begins on a separate road segment
+        # Shuffle once, then round-robin through the network.  This preserves
+        # an even geographic spread even when the requested population exceeds
+        # the number of valid origin edges.
         rng_edges = list(candidate_initial_edges)
         rng.shuffle(rng_edges)
-        selected_initial_edges = rng_edges[:target_initial]
 
         initial_trips: list[tuple[float, str, str, str, str, bool]] = []
-        for i, init_edge in enumerate(selected_initial_edges):
+        for i in range(target_initial):
+            init_edge = rng_edges[i % len(rng_edges)]
             reachable_nodes = reachable_map.get(init_edge["to"], set())
             valid_dests = [
                 ex["id"] for ex in exit_edges
@@ -798,7 +802,7 @@ class SumoNetworkBuilder:
                 "to": t_edge,
             }
             if is_initial:
-                # Distribute on-network at time zero across distinct edges with average speed
+                # Distribute on-network at time zero across the selected area.
                 trip_attribs["departPos"] = "random"
                 trip_attribs["departSpeed"] = "avg"
                 trip_attribs["departLane"] = "best"
@@ -822,7 +826,7 @@ class SumoNetworkBuilder:
         time_elem = ET.SubElement(root, "time")
         ET.SubElement(time_elem, "begin", value="0")
         ET.SubElement(time_elem, "end", value=str(duration_seconds))
-        ET.SubElement(time_elem, "step-length", value="0.2")
+        ET.SubElement(time_elem, "step-length", value=str(SIMULATION_STEP_LENGTH_SECONDS))
 
         processing_elem = ET.SubElement(root, "processing")
         ET.SubElement(processing_elem, "ignore-route-errors", value="true")

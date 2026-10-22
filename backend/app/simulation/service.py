@@ -31,6 +31,7 @@ from app.models.schemas import (
 )
 from app.services.analysis import get_analysis_by_id
 from app.simulation.network_builder import SumoNetworkBuilder, find_sumo_binary
+from app.simulation.signal_candidates import generate_signal_candidates
 from app.simulation.scenario_comparator import ScenarioComparator
 from app.simulation.signal_optimizer import FixedTimeSignalOptimizer
 from app.simulation.traci_manager import SimulationSession
@@ -84,6 +85,13 @@ class SimulationService:
         elif analysis:
             persisted_decisions = get_candidate_decisions_sync(req.analysis_id)
             approved_candidate_ids = {cid for cid, st in persisted_decisions.items() if st == "approved"}
+
+        # Decisions made before the shortlist policy may refer to weak or
+        # clustered junctions.  Only currently screened candidates can alter a
+        # simulation network.
+        if analysis:
+            valid_candidate_ids = {candidate.candidate_id for candidate in generate_signal_candidates(analysis)}
+            approved_candidate_ids.intersection_update(valid_candidate_ids)
 
         seed = req.seed or 42
 
@@ -322,6 +330,7 @@ class SimulationService:
             baseline_strategy=baseline_strat,
             optimized_strategy=optimized_strat,
             step_count=session.step_count,
+            baseline_engine_mode=base_session.engine_mode if base_session else None,
             signal_count=sig_count,
             approved_signals_count=session.approved_signals_count,
             applied_signals_count=session.applied_signals_count,

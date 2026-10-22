@@ -249,18 +249,6 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
     }
   }
 
-  const handleApproveAll = async () => {
-    setCandidateActionLoading('all')
-    try {
-      await api.approveAllCandidates(analysis.analysis_id)
-      fetchSignalCandidates(analysis.analysis_id)
-    } catch (err) {
-      console.error('Failed to approve all candidates:', err)
-    } finally {
-      setCandidateActionLoading(null)
-    }
-  }
-
   const handleResetDecisions = async () => {
     setCandidateActionLoading('reset')
     try {
@@ -434,7 +422,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
     if (!map || !layerGroup) return
     layerGroup.clearLayers()
 
-    if (!candidatesData) return
+    if (!showCandidateReview || !candidatesData) return
 
     candidatesData.candidates.forEach((cand) => {
       if (!cand.lat || !cand.lng) return
@@ -467,7 +455,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
       })
       layerGroup.addLayer(marker)
     })
-  }, [candidatesData])
+  }, [candidatesData, showCandidateReview])
 
   useEffect(() => {
     renderCandidateMarkers()
@@ -633,7 +621,13 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
           tl.lng <= 180
         ) {
           const stateColor =
-            tl.state === 'green' ? '#138808' : tl.state === 'yellow' ? '#F59E0B' : '#DC2626'
+            tl.state === 'green'
+              ? '#138808'
+              : tl.state === 'yellow'
+                ? '#F59E0B'
+                : tl.state === 'red'
+                  ? '#DC2626'
+                  : '#64748B'
 
           const isRemoved = tl.control_type === 'priority' || tl.control_type === 'uncontrolled'
           const sigIcon = L.divIcon({
@@ -1181,7 +1175,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
             }`}
           >
             <span className="material-symbols-outlined text-[16px]">traffic</span>
-            <span>Signal Candidates</span>
+            <span>Signal Review</span>
             {candidatesData && (
               <span
                 className={`px-1.5 py-0.2 rounded-full text-[10px] font-bold ${
@@ -1342,20 +1336,12 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
                 )}
               </div>
               <p className="text-xs text-slate-500 mt-0.5">
-                Screened junctions based on degree ≥ 3, approach functional classifications, and observed traffic delays.
+                Up to eight spatially separated major intersections are screened from four-way topology, road class, and observed delay evidence.
                 Approved signals will be compiled into the Optimized scenario and evaluated using multi-cycle fixed-time plans.
               </p>
             </div>
 
             <div className="flex items-center gap-2 flex-wrap">
-              <button
-                onClick={handleApproveAll}
-                disabled={candidateActionLoading !== null}
-                className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white transition-colors flex items-center gap-1 disabled:opacity-50"
-              >
-                <span className="material-symbols-outlined text-[15px]">done_all</span>
-                <span>Approve All Eligible ({candidatesData?.eligible_count ?? 0})</span>
-              </button>
               <button
                 onClick={handleResetDecisions}
                 disabled={candidateActionLoading !== null}

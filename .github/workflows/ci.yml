@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend tests (Python 3.12 + SUMO)
+    runs-on: ubuntu-latest
+    env:
+      SUMO_HOME: /usr/share/sumo
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+      - name: Install SUMO
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes sumo sumo-tools
+      - name: Install backend dependencies
+        run: python -m pip install -r backend/requirements-dev.txt
+      - name: Run backend test suite
+        working-directory: backend
+        # Live-provider smoke tests are opt-in: they depend on external API
+        # keys and Overpass availability, neither of which is a stable PR gate.
+        run: python -m pytest -q -k "not live"
+
+  frontend:
+    name: Frontend typecheck and production build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Typecheck and build
+        working-directory: frontend
+        run: npm run build

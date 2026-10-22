@@ -5,6 +5,7 @@ Implements user-reviewable, evidence-backed candidate screening with durable SQL
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, Optional
 
 from app.core.sqlite_store import (
@@ -21,6 +22,20 @@ from app.models.schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+# A map selection can contain hundreds of topological junctions.  A traffic
+# signal is an intervention that needs a focused, human review, so only expose
+# a small, spatially independent shortlist rather than every junction that has
+# three connecting road segments.
+MAX_REVIEW_CANDIDATES = 8
+MIN_CANDIDATE_SPACING_METERS = 250.0
+
+
+def _distance_meters(first: SignalCandidate, second: SignalCandidate) -> float:
+    """Return an approximate great-circle distance between two candidates."""
+    lat_scale = 111_320.0
+    lon_scale = lat_scale * math.cos(math.radians((first.lat + second.lat) / 2.0))
+    return math.hypot((first.lat - second.lat) * lat_scale, (first.lng - second.lng) * lon_scale)
 
 
 def _extract_junction_nodes(
@@ -146,9 +161,12 @@ def generate_signal_candidates(analysis: AnalysisResult) -> list[SignalCandidate
             if drops:
                 avg_speed_drop = sum(drops) / len(drops)
 
-        # Eligibility check
+        # Signalization is only screened for major intersections.  The old
+        # degree >= 3 rule treated ordinary residential T-junctions as signal
+        # candidates and flooded the map with markers.
         is_already_signal = current_control == "traffic_signal"
-        is_eligible = degree >= 3 and not is_already_signal
+        has_major_approach = any(road_type in {"arterial", "highway", "collector"} for road_type in road_types)
+        is_eligible = degree >= 4 and has_major_approach and not is_already_signal
 
         evidence: list[str] = [
             f"Junction Topology: {degree}-way intersection ({', '.join(road_types) if road_types else 'local'})",
@@ -239,9 +257,24 @@ def generate_signal_candidates(analysis: AnalysisResult) -> list[SignalCandidate
             )
         )
 
-    # Sort: Eligible candidates first by priority score descending, then ineligible
-    candidates.sort(key=lambda c: (1 if c.is_eligible else 0, c.priority_score), reverse=True)
-    return candidates
+    # Existing source-verified signals are shown by the simulation itself; they
+    # do not belong in the installation-candidate review layer.  Keep only
+    # high-priority candidates and de-duplicate nearby junctions so a single
+    # corridor cannot produce a wall of traffic-light icons.
+    eligible = [c for c in candidates if c.is_eligible]
+    eligible.sort(
+        key=lambda c: (c.priority_score, c.degree),
+        reverse=True,
+    )
+
+    shortlist: list[SignalCandidate] = []
+    for candidate in eligible:
+        if any(_distance_meters(candidate, chosen) < MIN_CANDIDATE_SPACING_METERS for chosen in shortlist):
+            continue
+        shortlist.append(candidate)
+        if len(shortlist) == MAX_REVIEW_CANDIDATES:
+            break
+    return shortlist
 
 
 def get_signal_candidates_response(analysis: AnalysisResult) -> SignalCandidateListResponse:
