@@ -91,7 +91,7 @@ export const api = {
   },
 
   prepareSimulation: async (request: SimulationPrepareRequest): Promise<SimulationStatusResponse> =>
-    handleRequest(client.post('/api/simulations/prepare', request)),
+    handleRequest(client.post('/api/simulations/prepare', request, { timeout: 180000 })),
 
   startSimulation: async (simId: string): Promise<SimulationStatusResponse> =>
     handleRequest(client.post(`/api/simulations/${simId}/start`)),

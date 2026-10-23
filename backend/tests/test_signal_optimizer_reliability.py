@@ -332,7 +332,28 @@ class TestCandidateEvaluation:
             "score": float("inf"),
         }
 
-        with patch.object(optimizer, "_run_sumo_eval", return_value=failed_eval):
+        # Baseline screening succeeds, but candidate evaluations all fail
+        baseline_success_eval = {
+            "evaluation_status": "success",
+            "diagnostics": None,
+            "avg_wait": 30.0,
+            "avg_speed": 28.0,
+            "throughput": 1000.0,
+            "queue_burden": 15.0,
+            "max_queue": 25.0,
+            "completed_vehicles": 40,
+            "unfinished_vehicles": 2,
+            "inserted_vehicles": 42,
+            "teleported_vehicles": 0,
+            "score": 12.0,
+        }
+
+        def mock_eval(*args, **kwargs):
+            if kwargs.get("run_label") == "baseline_screening":
+                return baseline_success_eval
+            return failed_eval
+
+        with patch.object(optimizer, "_run_sumo_eval", side_effect=mock_eval):
             result = optimizer.optimize(net_file, rou_file, cfg_file)
 
         assert result is not None
@@ -809,3 +830,406 @@ class TestRealSumoIntegration:
                 assert final_add.is_file()
                 sumocfg_content = (work_path / "simulation.sumocfg").read_text(encoding="utf-8")
                 assert "signals.add.xml" in sumocfg_content
+
+
+# ─── G. TARGETED REGRESSION TESTS FOR ISSUES 1 - 5 ─────────────────────────────
+
+class TestIssue1BaselineEvaluationValidation:
+    """Issue 1: A failed baseline evaluation must never allow candidate plans to pass validation."""
+
+    def test_failed_baseline_evaluation_returns_inconclusive_and_rejects_candidates(self, tmp_path):
+        optimizer = FixedTimeSignalOptimizer(tmp_path)
+        net_file = tmp_path / "network.net.xml"
+        rou_file = tmp_path / "routes.rou.xml"
+        cfg_file = tmp_path / "simulation.sumocfg"
+
+        net_xml = """<net>
+            <tlLogic id="tl_test" type="static" programID="0" offset="0">
+                <phase duration="30" state="GGGrrr"/>
+                <phase duration="3" state="yyyrrr"/>
+                <phase duration="30" state="rrrGGG"/>
+                <phase duration="3" state="rrryyy"/>
+            </tlLogic>
+        </net>"""
+        net_file.write_text(net_xml, encoding="utf-8")
+        rou_file.write_text("<routes/>", encoding="utf-8")
+        cfg_file.write_text("<configuration><input><net-file value='network.net.xml'/></input></configuration>", encoding="utf-8")
+
+        # Baseline evaluation fails
+        failed_baseline = {
+            "evaluation_status": "failed",
+            "diagnostics": "Baseline simulation timeout",
+            "score": float("inf"),
+            "completed_vehicles": 0,
+            "unfinished_vehicles": 0,
+            "inserted_vehicles": 0,
+            "teleported_vehicles": 0,
+        }
+
+        with patch.object(optimizer, "_run_sumo_eval", return_value=failed_baseline):
+            result = optimizer.optimize(net_file, rou_file, cfg_file)
+
+        assert result is not None
+        assert result.validation_passed is False
+        assert result.status == "inconclusive"
+        assert result.failure_reason == "baseline_evaluation_failed"
+        assert result.selected_plan_id == "plan_base"
+        assert not (tmp_path / "signals.add.xml").exists()
+        sumocfg_content = cfg_file.read_text(encoding="utf-8")
+        assert "signals.add.xml" not in sumocfg_content
+
+    def test_combined_network_validation_failure_cleans_up_and_detaches_signals(self, tmp_path):
+        """If combined network validation fails/regresses, signals.add.xml is detached and deleted."""
+        optimizer = FixedTimeSignalOptimizer(tmp_path)
+        net_file = tmp_path / "network.net.xml"
+        rou_file = tmp_path / "routes.rou.xml"
+        cfg_file = tmp_path / "simulation.sumocfg"
+
+        net_xml = """<net>
+            <tlLogic id="tl_test" type="static" programID="0" offset="0">
+                <phase duration="30" state="GGGrrr"/>
+                <phase duration="3" state="yyyrrr"/>
+                <phase duration="30" state="rrrGGG"/>
+                <phase duration="3" state="rrryyy"/>
+            </tlLogic>
+        </net>"""
+        net_file.write_text(net_xml, encoding="utf-8")
+        rou_file.write_text("<routes/>", encoding="utf-8")
+        cfg_file.write_text("<configuration><input><net-file value='network.net.xml'/></input></configuration>", encoding="utf-8")
+
+        def mock_eval(*args, **kwargs):
+            label = kwargs.get("run_label", "")
+            if label == "baseline_screening":
+                return {
+                    "evaluation_status": "success",
+                    "diagnostics": None,
+                    "avg_wait": 25.0,
+                    "avg_speed": 30.0,
+                    "throughput": 1000.0,
+                    "queue_burden": 15.0,
+                    "max_queue": 25.0,
+                    "completed_vehicles": 50,
+                    "unfinished_vehicles": 2,
+                    "inserted_vehicles": 52,
+                    "teleported_vehicles": 0,
+                    "score": 10.0,
+                }
+            elif "combined" in label:
+                # Combined validation regressed heavily!
+                return {
+                    "evaluation_status": "success",
+                    "diagnostics": "Network gridlock in combined validation",
+                    "avg_wait": 95.0,
+                    "avg_speed": 8.0,
+                    "throughput": 200.0,
+                    "queue_burden": 85.0,
+                    "max_queue": 150.0,
+                    "completed_vehicles": 10,
+                    "unfinished_vehicles": 42,
+                    "inserted_vehicles": 52,
+                    "teleported_vehicles": 5,
+                    "score": 85.0,
+                }
+            else:
+                # Candidate screening succeeded individually
+                return {
+                    "evaluation_status": "success",
+                    "diagnostics": None,
+                    "avg_wait": 20.0,
+                    "avg_speed": 32.0,
+                    "throughput": 1100.0,
+                    "queue_burden": 12.0,
+                    "max_queue": 20.0,
+                    "completed_vehicles": 55,
+                    "unfinished_vehicles": 1,
+                    "inserted_vehicles": 56,
+                    "teleported_vehicles": 0,
+                    "score": 8.5,
+                }
+
+        with patch.object(optimizer, "_run_sumo_eval", side_effect=mock_eval):
+            result = optimizer.optimize(net_file, rou_file, cfg_file)
+
+        assert result.validation_passed is False
+        assert result.status == "inconclusive"
+        assert result.failure_reason == "combined_network_validation_failed"
+        assert not (tmp_path / "signals.add.xml").exists()
+        sumocfg_content = cfg_file.read_text(encoding="utf-8")
+        assert "signals.add.xml" not in sumocfg_content
+
+
+class TestIssue2AllRedPreservation:
+    """Issue 2: All-red and pure-red clearance phase durations must be strictly preserved."""
+
+    def test_all_red_phase_durations_strictly_preserved(self, tmp_path):
+        optimizer = FixedTimeSignalOptimizer(tmp_path)
+        base_phases = [
+            {"duration": 25.0, "state": "GGGrrr"},
+            {"duration": 4.0, "state": "yyyrrr"},
+            {"duration": 2.0, "state": "rrrrrr"},  # All-red clearance (2s)
+            {"duration": 25.0, "state": "rrrGGG"},
+            {"duration": 4.0, "state": "rrryyy"},
+            {"duration": 2.0, "state": "rrrrrr"},  # All-red clearance (2s)
+        ]
+
+        candidates = optimizer.generate_candidate_plans("tl_all_red", base_phases)
+        assert len(candidates) >= 2, "Should generate candidate plans"
+
+        for cand in candidates:
+            phases = cand["phases"]
+            assert len(phases) == 6
+            # Phase 1: yellow >= 4.0s
+            assert "y" in phases[1]["state"].lower()
+            assert phases[1]["duration"] >= 4.0
+            # Phase 2: all-red strictly 2.0s
+            assert all(c in "rR" for c in phases[2]["state"])
+            assert phases[2]["duration"] == 2.0, f"All-red duration altered: {phases[2]['duration']}"
+            # Phase 4: yellow >= 4.0s
+            assert "y" in phases[4]["state"].lower()
+            assert phases[4]["duration"] >= 4.0
+            # Phase 5: all-red strictly 2.0s
+            assert all(c in "rR" for c in phases[5]["state"])
+            assert phases[5]["duration"] == 2.0, f"All-red duration altered: {phases[5]['duration']}"
+
+            # Validate phase structure passes
+            ok, msg = validate_phase_structure(phases, base_phases)
+            assert ok is True, f"Candidate plan failed validation: {msg}"
+
+    def test_validation_rejects_plan_that_shortens_or_modifies_all_red_phase(self):
+        base_phases = [
+            {"duration": 30.0, "state": "GGGrrr"},
+            {"duration": 3.0, "state": "yyyrrr"},
+            {"duration": 2.0, "state": "rrrrrr"},  # All-red
+            {"duration": 30.0, "state": "rrrGGG"},
+            {"duration": 3.0, "state": "rrryyy"},
+            {"duration": 2.0, "state": "rrrrrr"},  # All-red
+        ]
+        # Plan that changed all-red duration from 2.0s to 3.0s
+        altered_all_red = [
+            {"duration": 30.0, "state": "GGGrrr"},
+            {"duration": 3.0, "state": "yyyrrr"},
+            {"duration": 3.0, "state": "rrrrrr"},  # Altered!
+            {"duration": 30.0, "state": "rrrGGG"},
+            {"duration": 3.0, "state": "rrryyy"},
+            {"duration": 2.0, "state": "rrrrrr"},
+        ]
+        ok, msg = validate_phase_structure(altered_all_red, base_phases)
+        assert ok is False
+        assert "all-red clearance duration" in msg.lower()
+
+
+class TestIssue3MeasuredQueueBurdenAndMaxQueue:
+    """Issue 3: Queue burden and max queue must be computed from actual step samples, not last-step multipliers."""
+
+    def test_queue_metrics_derived_from_all_step_samples(self, tmp_path):
+        optimizer = FixedTimeSignalOptimizer(tmp_path)
+        # Create summary XML with dynamic queue across time
+        summary_path = tmp_path / "summary_test_queue.xml"
+        summary_xml = """<summary>
+            <step time="0.2" halting="0" inserted="5" ended="0" teleports="0" meanWaitingTime="0.0" meanSpeed="12.0"/>
+            <step time="1.0" halting="2" inserted="10" ended="0" teleports="0" meanWaitingTime="2.0" meanSpeed="10.0"/>
+            <step time="2.0" halting="6" inserted="15" ended="1" teleports="0" meanWaitingTime="5.0" meanSpeed="8.0"/>
+            <step time="3.0" halting="10" inserted="20" ended="2" teleports="0" meanWaitingTime="8.0" meanSpeed="6.0"/>
+            <step time="4.0" halting="4" inserted="22" ended="5" teleports="0" meanWaitingTime="10.0" meanSpeed="9.0"/>
+            <step time="5.0" halting="0" inserted="25" ended="10" teleports="0" meanWaitingTime="12.0" meanSpeed="11.0"/>
+        </summary>"""
+        summary_path.write_text(summary_xml, encoding="utf-8")
+
+        tripinfo_path = tmp_path / "tripinfo_test_queue.xml"
+        tripinfo_xml = """<tripinfos>
+            <tripinfo id="v1" duration="10.0" routeLength="100.0" waitingTime="2.0"/>
+        </tripinfos>"""
+        tripinfo_path.write_text(tripinfo_xml, encoding="utf-8")
+
+        # Note: haltings = [0, 2, 6, 10, 4, 0]
+        # max_halting = 10 -> max_queue = 10 * 7.5 = 75.0m
+        # mean_halting = 22 / 6 = 3.667 -> queue_burden = 3.667 * 7.5 = 27.5m
+        def write_files(*args, **kwargs):
+            summary_path.write_text(summary_xml, encoding="utf-8")
+            tripinfo_path.write_text(tripinfo_xml, encoding="utf-8")
+            m = MagicMock()
+            m.returncode = 0
+            return m
+
+        with patch("subprocess.run", side_effect=write_files):
+            res = optimizer._run_sumo_eval(
+                net_file=tmp_path / "net.xml",
+                rou_file=tmp_path / "rou.xml",
+                add_file=None,
+                eval_duration=60,
+                seed=42,
+                run_label="test_queue",
+            )
+
+        assert res["evaluation_status"] == "success"
+        assert res["max_queue"] == 75.0, f"Expected peak queue 75.0m from step series, got {res['max_queue']}"
+        assert res["queue_burden"] == 27.5, f"Expected mean queue burden 27.5m, got {res['queue_burden']}"
+
+
+class TestIssue4NeutralFallbackTelemetry:
+    """Issue 4: Fallback telemetry must be strictly neutral and free from intervention bias."""
+
+    def test_fallback_telemetry_neutral_between_baseline_and_intervention(self, tmp_path):
+        from app.simulation.traci_manager import SimulationSession
+
+        segments = [
+            {
+                "segment_id": "seg_1",
+                "geometry": {"type": "LineString", "coordinates": [[77.200, 28.600], [77.205, 28.600]]},
+                "u": "n1", "v": "n2",
+            }
+        ]
+
+        cfg_file = tmp_path / "sim.sumocfg"
+        cfg_file.write_text("<configuration/>", encoding="utf-8")
+
+        # Baseline session
+        base_session = SimulationSession(
+            sim_id="test_neutral_base",
+            analysis_id="test_analysis",
+            work_dir=tmp_path,
+            cfg_file=cfg_file,
+            strategy="Baseline (Fixed-Time)",
+            applied_signals_count=0,
+            road_segments=segments,
+            netconvert_used=False,  # Fallback mode
+        )
+        base_session._segment_edge_map = {"seg_1": ["edge_1"]}
+
+        # Intervention session
+        opt_session = SimulationSession(
+            sim_id="test_neutral_opt",
+            analysis_id="test_analysis",
+            work_dir=tmp_path,
+            cfg_file=cfg_file,
+            strategy="Optimized (Actuated Adaptive)",
+            applied_signals_count=1,
+            road_segments=segments,
+            netconvert_used=False,  # Fallback mode
+        )
+        opt_session._segment_edge_map = {"seg_1": ["edge_1"]}
+
+        # Step both sessions
+        base_session.step(num_steps=3)
+        opt_session.step(num_steps=3)
+
+        base_telemetry = base_session._edge_telemetry.get("edge_1", [])
+        opt_telemetry = opt_session._edge_telemetry.get("edge_1", [])
+
+        assert len(base_telemetry) > 0
+        assert len(opt_telemetry) > 0
+
+        # Verify exact neutrality across all samples
+        for b_sample, o_sample in zip(base_telemetry, opt_telemetry):
+            assert b_sample["vehicle_count"] == o_sample["vehicle_count"], "vehicle_count must be neutral"
+            assert b_sample["occupancy_pct"] == o_sample["occupancy_pct"], "occupancy_pct must be neutral"
+            assert b_sample["halting_vehicles"] == o_sample["halting_vehicles"], "halting_vehicles must be neutral"
+            assert b_sample["mean_speed_ms"] == o_sample["mean_speed_ms"], "mean_speed_ms must be neutral"
+
+
+class TestIssue5ScenarioComparisonValidationSeparation:
+    """Issue 5: Scenario comparison must separate run completion from signal optimization validation."""
+
+    def test_unvalidated_when_optimizer_fails_despite_runtime_fluctuations(self):
+        baseline = SimulationMetrics(
+            avg_speed_kmh=25.0,
+            avg_waiting_time_s=30.0,
+            avg_queue_length_m=40.0,
+            completed_vehicles=500,
+            elapsed_seconds=100.0,
+        )
+        optimized = SimulationMetrics(
+            avg_speed_kmh=28.0,  # Improved speed
+            avg_waiting_time_s=24.0,  # Improved wait
+            avg_queue_length_m=35.0,  # Improved queue
+            completed_vehicles=520,
+            elapsed_seconds=100.0,
+        )
+
+        # Signal optimization failed/inconclusive
+        res = ScenarioComparator.compare(
+            sim_id="sim_test_sep",
+            analysis_id="analysis_test_sep",
+            duration_seconds=600,
+            engine_mode="native_sumo",
+            baseline_metrics=baseline,
+            optimized_metrics=optimized,
+            step_count=20,
+            signal_count=2,
+            applied_signals_count=2,
+            optimizer_validation_passed=False,
+            optimizer_status="combined_network_validation_failed",
+        )
+
+        assert res.is_validated is False
+        assert res.comparison_status == "completed_inconclusive"
+        assert res.optimization_status == "optimization_inconclusive_baseline_preserved"
+        assert "not pass whole-network baseline validation" in res.methodology_notes
+
+    def test_validated_when_optimizer_passed_and_runtime_improved(self):
+        baseline = SimulationMetrics(
+            avg_speed_kmh=25.0,
+            avg_waiting_time_s=30.0,
+            avg_queue_length_m=40.0,
+            completed_vehicles=500,
+            elapsed_seconds=100.0,
+        )
+        optimized = SimulationMetrics(
+            avg_speed_kmh=28.0,
+            avg_waiting_time_s=24.0,
+            avg_queue_length_m=35.0,
+            completed_vehicles=520,
+            elapsed_seconds=100.0,
+        )
+
+        res = ScenarioComparator.compare(
+            sim_id="sim_test_sep_ok",
+            analysis_id="analysis_test_sep_ok",
+            duration_seconds=600,
+            engine_mode="native_sumo",
+            baseline_metrics=baseline,
+            optimized_metrics=optimized,
+            step_count=20,
+            signal_count=2,
+            applied_signals_count=2,
+            optimizer_validation_passed=True,
+            optimizer_status="completed",
+        )
+
+        assert res.is_validated is True
+        assert res.comparison_status == "completed_validated"
+        assert res.optimization_status == "validated_improvement"
+        assert "Fixed-time signal optimization validated" in res.methodology_notes
+
+    def test_fallback_engine_never_validated(self):
+        baseline = SimulationMetrics(
+            avg_speed_kmh=25.0,
+            avg_waiting_time_s=30.0,
+            avg_queue_length_m=40.0,
+            completed_vehicles=500,
+            elapsed_seconds=100.0,
+        )
+        optimized = SimulationMetrics(
+            avg_speed_kmh=30.0,
+            avg_waiting_time_s=20.0,
+            avg_queue_length_m=25.0,
+            completed_vehicles=600,
+            elapsed_seconds=100.0,
+        )
+
+        res = ScenarioComparator.compare(
+            sim_id="sim_test_fallback",
+            analysis_id="analysis_test_fallback",
+            duration_seconds=600,
+            engine_mode="fallback",
+            baseline_metrics=baseline,
+            optimized_metrics=optimized,
+            step_count=20,
+            signal_count=1,
+            applied_signals_count=1,
+            optimizer_validation_passed=True,  # Even if True!
+        )
+
+        assert res.is_validated is False
+        assert res.comparison_status == "completed_inconclusive"
+        assert res.optimization_status == "kinematics_estimate_only"

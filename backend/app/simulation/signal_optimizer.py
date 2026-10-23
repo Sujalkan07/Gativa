@@ -11,6 +11,7 @@ Follows transportation engineering standards:
 """
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import math
 import os
@@ -51,9 +52,10 @@ def validate_phase_structure(
     2. Phase durations are positive numbers.
     3. State strings contain only valid SUMO aspects (G, g, y, Y, r, R, u, o, O).
     4. Clearance intervals (phases containing 'y'/'Y') have duration >= min_yellow and >= base clearance.
-    5. Green intervals (phases containing 'G'/'g' without yellow) have duration >= min_green.
-    6. If base_phases provided, state strings must have matching length.
-    7. Phase ordering is preserved.
+    5. Pure-red / all-red clearance intervals (phases with all 'r'/'R') strictly preserve original base duration.
+    6. Green intervals (phases containing 'G'/'g' without yellow) have duration >= min_green.
+    7. If base_phases provided, state strings must have matching length.
+    8. Phase ordering is preserved.
     """
     if not phases:
         return False, "Plan contains no phases"
@@ -82,7 +84,6 @@ def validate_phase_structure(
             if len(state) != len(base_state):
                 return False, f"Phase {idx} state length mismatch: expected {len(base_state)}, got {len(state)}"
 
-            # Clearance check: if base phase was yellow clearance, must not be shortened below safe yellow
             base_is_yellow = "y" in base_state.lower()
             cur_is_yellow = "y" in state.lower()
             if base_is_yellow:
@@ -90,7 +91,17 @@ def validate_phase_structure(
                     return False, f"Phase {idx} dropped required yellow clearance aspect"
                 required_yellow = max(min_yellow, float(base_p.get("duration", min_yellow)))
                 if dur < required_yellow:
-                    return False, f"Phase {idx} clearance duration {dur}s < required {required_yellow}s"
+                    return False, f"Phase {idx} yellow clearance duration {dur}s < required {required_yellow}s"
+
+            # All-red / pure-red clearance preservation
+            base_is_all_red = all(c in "rR" for c in base_state) and len(base_state) > 0
+            cur_is_all_red = all(c in "rR" for c in state) and len(state) > 0
+            if base_is_all_red:
+                if not cur_is_all_red:
+                    return False, f"Phase {idx} altered required all-red clearance aspect '{base_state}' to '{state}'"
+                base_all_red_dur = float(base_p.get("duration", 0.0))
+                if abs(dur - base_all_red_dur) > 0.01:
+                    return False, f"Phase {idx} all-red clearance duration {dur}s must strictly preserve base duration {base_all_red_dur}s"
 
         # Check minimum green if this is a green phase
         is_green = ("g" in state.lower()) and ("y" not in state.lower())
@@ -257,15 +268,23 @@ class FixedTimeSignalOptimizer:
         """
         plans: list[dict[str, Any]] = []
 
-        # Identify green phases vs yellow clearance phases
+        # Identify green phases vs yellow clearance vs pure-red/all-red clearance phases
         green_indices = []
         yellow_indices = []
+        all_red_indices = []
+        other_indices = []
+
         for idx, p in enumerate(base_phases):
-            state = p["state"].lower()
-            if "y" in state:
+            state = p.get("state", "")
+            state_lower = state.lower()
+            if "y" in state_lower:
                 yellow_indices.append(idx)
-            elif "g" in state:
+            elif "g" in state_lower:
                 green_indices.append(idx)
+            elif all(c in "rR" for c in state) and len(state) > 0:
+                all_red_indices.append(idx)
+            else:
+                other_indices.append(idx)
 
         # Baseline plan representation
         base_durations = [int(round(float(p["duration"]))) for p in base_phases]
@@ -288,13 +307,23 @@ class FixedTimeSignalOptimizer:
 
         num_greens = len(green_indices)
 
-        # Calculate exact clearance durations from base phases to never shorten clearance
+        # Calculate exact clearance durations from base phases:
+        # 1. Yellow clearance: duration >= base clearance and >= 3.0s
+        # 2. Pure-red / all-red clearance: strictly preserve base duration
+        # 3. Other transition phases: preserve base duration
         clearance_durations: dict[int, float] = {}
         for y_idx in yellow_indices:
             base_y_dur = float(base_phases[y_idx].get("duration", 3.0))
             clearance_durations[y_idx] = max(3.0, base_y_dur)
 
-        total_clearance = sum(clearance_durations.values()) if yellow_indices else (3.0 * num_greens)
+        for r_idx in all_red_indices:
+            base_r_dur = float(base_phases[r_idx].get("duration", 2.0))
+            clearance_durations[r_idx] = base_r_dur
+
+        for o_idx in other_indices:
+            clearance_durations[o_idx] = float(base_phases[o_idx].get("duration", 3.0))
+
+        total_clearance = sum(clearance_durations.values())
 
         def make_plan_phases(target_cycle: int, green_durations: list[int]) -> list[dict[str, Any]]:
             """Construct phases strictly matching target_cycle with exact integer durations."""
@@ -305,14 +334,15 @@ class FixedTimeSignalOptimizer:
                     new_phases.append({"duration": float(green_durations[g_ptr]), "state": p["state"]})
                     g_ptr += 1
                 else:
-                    clr_dur = int(round(clearance_durations.get(idx, 3.0)))
-                    new_phases.append({"duration": float(clr_dur), "state": p["state"]})
+                    clr_dur = clearance_durations.get(idx, float(p.get("duration", 3.0)))
+                    new_phases.append({"duration": float(round(clr_dur, 2)), "state": p["state"]})
 
-            # Reconcile integer rounding difference to exactly match target_cycle
+            # Reconcile integer rounding difference to exactly match target_cycle.
+            # Difference is reconciled strictly against the largest green phase,
+            # never modifying yellow clearance or all-red clearance durations.
             cur_sum = sum(int(round(ph["duration"])) for ph in new_phases)
             diff = target_cycle - cur_sum
             if diff != 0 and green_indices:
-                # Add difference to the largest green phase
                 max_g_idx = max(range(len(green_durations)), key=lambda i: green_durations[i])
                 g_phase_pos = green_indices[max_g_idx]
                 new_phases[g_phase_pos]["duration"] += float(diff)
@@ -533,30 +563,49 @@ class FixedTimeSignalOptimizer:
             result["diagnostics"] = f"Failed to execute SUMO subprocess: {e}"
             return result
 
-        # Parse summary output
+        # Parse summary output across all recorded simulation steps
         inserted = 0
         ended = 0
         teleports = 0
         halting = 0
         sum_mean_speed = None
         sum_mean_wait = None
+        haltings: list[int] = []
+        step_waits: list[float] = []
+        step_speeds: list[float] = []
 
         if summary_file.is_file():
             try:
                 s_tree = ET.parse(str(summary_file))
                 s_root = s_tree.getroot()
                 steps = s_root.findall("step")
+                for s in steps:
+                    try:
+                        h = int(s.get("halting", "0"))
+                        haltings.append(h)
+                    except (ValueError, TypeError):
+                        pass
+                    try:
+                        w_val = float(s.get("meanWaitingTime", "0.0"))
+                        step_waits.append(w_val)
+                    except (ValueError, TypeError):
+                        pass
+                    try:
+                        sp_val = float(s.get("meanSpeed", "0.0")) * 3.6  # m/s to km/h
+                        step_speeds.append(sp_val)
+                    except (ValueError, TypeError):
+                        pass
+
                 if steps:
                     last_step = steps[-1]
                     inserted = int(last_step.get("inserted", "0"))
                     ended = int(last_step.get("ended", "0"))
                     teleports = int(last_step.get("teleports", "0"))
                     halting = int(last_step.get("halting", "0"))
-                    try:
-                        sum_mean_wait = float(last_step.get("meanWaitingTime", "0.0"))
-                        sum_mean_speed = float(last_step.get("meanSpeed", "0.0")) * 3.6  # m/s to km/h
-                    except (ValueError, TypeError):
-                        pass
+                    if step_waits:
+                        sum_mean_wait = sum(step_waits) / len(step_waits)
+                    if step_speeds:
+                        sum_mean_speed = sum(step_speeds) / len(step_speeds)
             except Exception as e:
                 logger.debug("Summary parse note: %s", e)
 
@@ -595,11 +644,18 @@ class FixedTimeSignalOptimizer:
             return result
 
         # Compute valid metrics
-        avg_wait = round(sum(waits) / len(waits), 1) if waits else (sum_mean_wait or 0.0)
-        avg_speed = round(sum(speeds) / len(speeds), 1) if speeds else (sum_mean_speed or 25.0)
+        avg_wait = round(sum(waits) / len(waits), 1) if waits else (round(sum_mean_wait, 1) if sum_mean_wait is not None else 0.0)
+        avg_speed = round(sum(speeds) / len(speeds), 1) if speeds else (round(sum_mean_speed, 1) if sum_mean_speed is not None else 25.0)
         throughput = round((completed_count / max(1.0, float(eval_duration))) * 3600.0, 1)
-        queue_burden = float(halting * 7.5)  # approximate queue length in meters
-        max_queue = float(halting * 12.0)
+
+        # Measured queue statistics across the entire measurement run:
+        # Peak halting vehicles observed across all simulation steps
+        max_halting_count = max(haltings) if haltings else halting
+        # Time-integrated mean halting vehicles observed across all simulation steps
+        mean_halting_count = (sum(haltings) / len(haltings)) if haltings else float(halting)
+        # Standard SUMO queuing spatial extent (7.5m = 5m vehicle + 2.5m minGap)
+        queue_burden = round(mean_halting_count * 7.5, 1)
+        max_queue = round(max_halting_count * 7.5, 1)
 
         # Validate numbers are finite
         for v in (avg_wait, avg_speed, throughput, queue_burden, max_queue):
@@ -642,8 +698,10 @@ class FixedTimeSignalOptimizer:
         net_file: Path,
         rou_file: Path,
         cfg_file: Path,
-        eval_duration: int = 150,
+        eval_duration: int = 45,
         seed: int = 42,
+        target_signal_ids: Optional[set[str]] = None,
+        max_signals_to_optimize: int = 6,
     ) -> Optional[FixedTimeOptimizationResult]:
         """
         Execute bounded candidate fixed-time evaluations and select the optimal plan.
@@ -688,7 +746,52 @@ class FixedTimeSignalOptimizer:
             seed=seed,
             run_label="baseline_screening",
         )
-        baseline_score = base_net_eval["score"] if base_net_eval["evaluation_status"] == "success" else float("inf")
+
+        # Require successful baseline evaluation with finite score
+        if (
+            base_net_eval["evaluation_status"] != "success"
+            or not math.isfinite(base_net_eval.get("score", float("inf")))
+        ):
+            primary_tl_id = list(tl_logics.keys())[0]
+            diag = base_net_eval.get("diagnostics") or f"Evaluation status: {base_net_eval['evaluation_status']}"
+            notes = (
+                f"Baseline network evaluation did not succeed ({diag}). "
+                f"Cannot validate candidate timing plans without a valid empirical baseline. "
+                f"Preserving original network signal timing."
+            )
+            final_add_file = self.work_dir / "signals.add.xml"
+            final_add_file.unlink(missing_ok=True)
+            self._detach_additional_from_sumocfg(cfg_file, "signals.add.xml")
+            return FixedTimeOptimizationResult(
+                signal_id=primary_tl_id,
+                evaluated_plans=[],
+                selected_plan_id="plan_base",
+                selected_cycle_length_s=int(sum(float(p["duration"]) for p in tl_logics[primary_tl_id])),
+                validation_passed=False,
+                notes=notes,
+                status="inconclusive",
+                failure_reason="baseline_evaluation_failed",
+                optimized_signals_count=0,
+                total_signals_count=len(tl_logics),
+                signal_results={},
+            )
+
+        baseline_score = float(base_net_eval["score"])
+
+        # Determine signals to optimize in Stage A
+        eligible_tl_ids = list(tl_logics.keys())
+        if target_signal_ids:
+            # Target signals specified: prioritize approved/selected signals present in network
+            targets = [t for t in eligible_tl_ids if t in target_signal_ids]
+            signals_to_screen = targets if targets else eligible_tl_ids[:max_signals_to_optimize]
+        else:
+            # Prioritize signals by complexity (controlled connection count)
+            signals_to_screen = sorted(
+                eligible_tl_ids,
+                key=lambda t: len(connections.get(t, [])),
+                reverse=True,
+            )[:max_signals_to_optimize]
+        signals_to_screen_set = set(signals_to_screen)
 
         # STAGE A: Optimize each eligible signal
         signal_results: dict[str, Any] = {}
@@ -696,26 +799,29 @@ class FixedTimeSignalOptimizer:
         all_evaluated_plans: list[TimingPlanEvaluation] = []
         optimized_count = 0
 
+        # Preserve baseline timing for signals outside current screening batch
         for tl_id, base_phases in tl_logics.items():
+            if tl_id not in signals_to_screen_set:
+                winning_plans_per_signal[tl_id] = {"phases": base_phases, "plan_id": "plan_base"}
+                signal_results[tl_id] = {
+                    "status": "baseline_preserved",
+                    "selected_plan": "plan_base",
+                    "reason": "Signal preserved with baseline netconvert timing",
+                }
+
+        for tl_id in signals_to_screen:
+            base_phases = tl_logics[tl_id]
             candidates = self.generate_candidate_plans(tl_id, base_phases, include_base=True)
             if not candidates:
                 signal_results[tl_id] = {"status": "unsupported", "selected_plan": None}
                 winning_plans_per_signal[tl_id] = {"phases": base_phases, "plan_id": "plan_base"}
                 continue
 
-            evaluated_cands: list[TimingPlanEvaluation] = []
-            best_cand = candidates[0]  # default to base plan
-            best_score = float("inf")
-            valid_eval_count = 0
-
-            for cand in candidates:
+            def _eval_candidate(cand: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
                 plan_id = cand["plan_id"]
                 phases = cand["phases"]
-                cycle_len = cand["cycle_length_s"]
-
                 cand_add_file = self.work_dir / f"signals_{tl_id}_{plan_id}.add.xml"
                 self.write_additional_signals_xml(cand_add_file, tl_id, phases, program_id=plan_id)
-
                 run_res = self._run_sumo_eval(
                     net_file=net_file,
                     rou_file=rou_file,
@@ -724,6 +830,25 @@ class FixedTimeSignalOptimizer:
                     seed=seed,
                     run_label=f"{tl_id}_{plan_id}",
                 )
+                return cand, run_res
+
+            # Concurrently evaluate candidates using ThreadPoolExecutor for fast non-blocking screening
+            workers = min(4, os.cpu_count() or 2, len(candidates))
+            if workers > 1:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                    eval_tuples = list(executor.map(_eval_candidate, candidates))
+            else:
+                eval_tuples = [_eval_candidate(c) for c in candidates]
+
+            evaluated_cands: list[TimingPlanEvaluation] = []
+            best_cand = candidates[0]  # default to base plan
+            best_score = float("inf")
+            valid_eval_count = 0
+
+            for cand, run_res in eval_tuples:
+                plan_id = cand["plan_id"]
+                phases = cand["phases"]
+                cycle_len = cand["cycle_length_s"]
 
                 st: EvaluationStatus = run_res["evaluation_status"]
                 score = run_res["score"]
@@ -806,7 +931,9 @@ class FixedTimeSignalOptimizer:
             )
 
             is_net_validated = (
-                net_eval["evaluation_status"] == "success"
+                base_net_eval["evaluation_status"] == "success"
+                and math.isfinite(baseline_score)
+                and net_eval["evaluation_status"] == "success"
                 and math.isfinite(net_eval["score"])
                 and net_eval["score"] <= (baseline_score + 0.5)  # Must not significantly regress network
             )
@@ -831,11 +958,16 @@ class FixedTimeSignalOptimizer:
                     signal_results=signal_results,
                 )
             else:
-                # Combined plan regressed or failed network validation: fall back cleanly
+                # Combined plan regressed or failed network validation: clean up and fall back cleanly
+                final_add_file.unlink(missing_ok=True)
+                self._detach_additional_from_sumocfg(cfg_file, "signals.add.xml")
+                eval_diag = net_eval.get("diagnostics")
+                comb_score_str = f"{net_eval['score']:.2f}" if math.isfinite(net_eval.get("score", float("nan"))) else "failed"
                 notes = (
                     f"Candidate plans were screened for {optimized_count} signals, but combined whole-network validation "
-                    f"did not beat baseline (combined: {net_eval['score']:.2f} vs baseline: {baseline_score:.2f}). "
-                    f"Preserving original network signal timing."
+                    f"did not beat baseline (combined: {comb_score_str} vs baseline: {baseline_score:.2f}"
+                    + (f", diagnostics: {eval_diag}" if eval_diag else "")
+                    + "). Preserving original network signal timing."
                 )
                 return FixedTimeOptimizationResult(
                     signal_id=primary_tl_id,
@@ -852,6 +984,8 @@ class FixedTimeSignalOptimizer:
                 )
 
         # If zero signals were successfully optimized
+        final_add_file.unlink(missing_ok=True)
+        self._detach_additional_from_sumocfg(cfg_file, "signals.add.xml")
         notes = (
             f"All candidate evaluations for {len(tl_logics)} traffic signal(s) failed or returned insufficient data in SUMO. "
             f"Preserved original compiled timing plan."
@@ -888,3 +1022,22 @@ class FixedTimeSignalOptimizer:
             logger.info("Attached %s to %s successfully", add_file_name, cfg_file)
         except Exception as e:
             logger.warning("Could not attach additional-files to sumocfg: %s", e)
+
+    def _detach_additional_from_sumocfg(self, cfg_file: Path, add_file_name: str) -> None:
+        """Detach additional-files element from simulation.sumocfg if present."""
+        if not cfg_file.is_file():
+            return
+        try:
+            tree = ET.parse(str(cfg_file))
+            root = tree.getroot()
+            inp = root.find("input")
+            if inp is not None:
+                add_elem = inp.find("additional-files")
+                if add_elem is not None:
+                    cur_val = add_elem.get("value", "")
+                    if add_file_name in cur_val:
+                        inp.remove(add_elem)
+                        tree.write(str(cfg_file), encoding="utf-8", xml_declaration=True)
+                        logger.info("Detached %s from %s successfully", add_file_name, cfg_file)
+        except Exception as e:
+            logger.warning("Could not detach additional-files from sumocfg: %s", e)

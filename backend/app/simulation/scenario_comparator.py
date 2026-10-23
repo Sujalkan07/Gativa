@@ -40,6 +40,8 @@ class ScenarioComparator:
         selected_fixed_time_plan: Optional[Any] = None,
         engine_transitioned: bool = False,
         baseline_engine_transitioned: bool = False,
+        optimizer_validation_passed: Optional[bool] = None,
+        optimizer_status: Optional[str] = None,
     ) -> ScenarioComparisonResult:
         """
         Produce side-by-side scenario comparison table with genuine empirical variance.
@@ -459,26 +461,67 @@ class ScenarioComparator:
 
         is_validated = False
         optimization_status = "unvalidated"
-        if "native" in engine_mode:
-            if wait_imp and speed_imp and queue_imp:
-                is_validated = True
-                optimization_status = "validated_improvement"
-            elif wait_imp or speed_imp or queue_imp:
-                is_validated = True
-                optimization_status = "validated_tradeoff"
-            else:
-                is_validated = True
-                optimization_status = "validated_neutral_or_regression"
-        elif "fallback" in engine_mode:
+        comparison_status: ComparisonStatus = "completed"
+
+        is_native = ("native" in engine_mode) and (baseline_engine_mode is None or "native" in baseline_engine_mode)
+
+        if (applied_signals_count or 0) == 0 or signal_count == 0:
+            is_validated = False
+            optimization_status = "kinematics_estimate_only" if not is_native else "unsignalized_or_unoptimized"
+            comparison_status = "completed"
+        elif not is_native:
             is_validated = False
             optimization_status = "kinematics_estimate_only"
+            comparison_status = "completed_inconclusive"
+        else:
+            # is_native and applied_signals_count > 0
+            if optimizer_validation_passed is True:
+                if wait_imp and (speed_imp or queue_imp):
+                    is_validated = True
+                    optimization_status = "validated_improvement"
+                    comparison_status = "completed_validated"
+                elif wait_imp or speed_imp or queue_imp:
+                    is_validated = True
+                    optimization_status = "validated_tradeoff"
+                    comparison_status = "completed_validated"
+                else:
+                    is_validated = False
+                    optimization_status = "validated_neutral_or_regression"
+                    comparison_status = "completed_inconclusive"
+            elif optimizer_validation_passed is False or optimizer_status in ("inconclusive", "failed", "all_evaluations_failed"):
+                is_validated = False
+                optimization_status = "optimization_inconclusive_baseline_preserved"
+                comparison_status = "completed_inconclusive"
+            else:
+                is_validated = False
+                optimization_status = "unvalidated"
+                comparison_status = "completed_inconclusive"
 
-        if signal_count == 0:
+        if signal_count == 0 or (applied_signals_count or 0) == 0:
             notes = (
                 f"{disclosures_prefix}Empirical evaluation under {engine_mode} engine over {optimized_metrics.elapsed_seconds:.1f}s elapsed "
                 f"(seed 42, {step_count} simulation steps). "
                 f"Network contains 0 traffic signal controllers. All junctions operate under standard priority right-of-way rules. "
                 f"Actuated signal timing is not applicable to unsignalized intersections."
+            )
+        elif not is_native:
+            notes = (
+                f"{disclosures_prefix}Simulation completed under {engine_mode} internal kinematics engine over {optimized_metrics.elapsed_seconds:.1f}s elapsed "
+                f"(seed 42, {step_count} simulation steps). "
+                f"Fallback kinematics outputs are visual estimations and cannot validate empirical signal control improvements."
+            )
+        elif optimizer_validation_passed is not True:
+            notes = (
+                f"{disclosures_prefix}Empirical evaluation under {engine_mode} engine over {optimized_metrics.elapsed_seconds:.1f}s elapsed "
+                f"(seed 42, {step_count} simulation steps). "
+                f"Candidate signal timing optimization did not pass whole-network baseline validation; baseline signal timing was preserved. "
+                f"Scenario comparison is not validated."
+            )
+        elif is_validated:
+            notes = (
+                f"{disclosures_prefix}Empirical evaluation under {engine_mode} engine over {optimized_metrics.elapsed_seconds:.1f}s elapsed "
+                f"(seed 42, {step_count} simulation steps). "
+                f"Fixed-time signal optimization validated against baseline in native SUMO across {applied_signals_count} signal(s)."
             )
         else:
             notes = (
@@ -492,7 +535,7 @@ class ScenarioComparator:
             analysis_id=analysis_id,
             duration_seconds=duration_seconds,
             engine_mode=engine_mode,
-            comparison_status="completed",
+            comparison_status=comparison_status,
             baseline_strategy=baseline_strategy,
             optimized_strategy=optimized_strategy,
             baseline_metrics=baseline_metrics,

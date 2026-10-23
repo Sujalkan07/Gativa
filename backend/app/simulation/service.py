@@ -5,6 +5,7 @@ to guarantee honest, empirical comparative analytics without synthesized metrics
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import shutil
 import tempfile
@@ -47,12 +48,29 @@ class SimulationService:
         self._baseline_sessions: dict[str, SimulationSession] = {}
         self._base_work_dir = Path(tempfile.gettempdir()) / "gativa_sumo"
         self._base_work_dir.mkdir(parents=True, exist_ok=True)
+        self._in_flight_prepares: dict[str, asyncio.Task[SimulationStatusResponse]] = {}
 
     async def prepare(self, req: SimulationPrepareRequest) -> SimulationStatusResponse:
         """
         Prepare network and trip demand for an existing analysis ID.
         Configures dual independent sessions (Optimized and Baseline) on identical topology.
+        Deduplicates concurrent in-flight prepare requests to avoid redundant builds and simulations.
         """
+        approved_cands_key = tuple(sorted(req.approved_candidate_ids or []))
+        prep_key = f"{req.analysis_id}:{req.duration_seconds}:{req.demand_level}:{req.demand_profile}:{req.manual_vehicle_count}:{req.seed}:{approved_cands_key}"
+
+        if prep_key in self._in_flight_prepares:
+            logger.info("Awaiting in-flight duplicate prepare request for %s", prep_key)
+            return await self._in_flight_prepares[prep_key]
+
+        task = asyncio.create_task(self._do_prepare(req))
+        self._in_flight_prepares[prep_key] = task
+        try:
+            return await task
+        finally:
+            self._in_flight_prepares.pop(prep_key, None)
+
+    async def _do_prepare(self, req: SimulationPrepareRequest) -> SimulationStatusResponse:
         sim_id = str(uuid.uuid4())
         work_dir = self._base_work_dir / sim_id
         opt_dir = work_dir / "optimized"
@@ -138,6 +156,8 @@ class SimulationService:
         # 3. Evaluate & Optimize Fixed-Time Signal Plan on Optimized Scenario
         selected_plan: Optional[TimingPlanEvaluation] = None
         applied_signals_count = build_meta_opt["signal_count"]
+        optimizer_validation_passed: bool = False
+        optimizer_status: str = "none"
 
         if applied_signals_count > 0:
             try:
@@ -146,15 +166,24 @@ class SimulationService:
                     net_file=Path(build_meta_opt["net_file"]),
                     rou_file=Path(build_meta_opt["rou_file"]),
                     cfg_file=Path(build_meta_opt["cfg_file"]),
-                    eval_duration=min(150, req.duration_seconds),
+                    eval_duration=min(45, req.duration_seconds),
                     seed=seed,
+                    target_signal_ids=approved_candidate_ids if approved_candidate_ids else None,
                 )
-                if opt_result and opt_result.evaluated_plans:
-                    for ep in opt_result.evaluated_plans:
-                        if ep.is_selected:
-                            selected_plan = ep
-                            break
-                    logger.info("Fixed-time signal optimization complete: selected %s", opt_result.selected_plan_id)
+                if opt_result:
+                    optimizer_validation_passed = bool(opt_result.validation_passed)
+                    optimizer_status = str(opt_result.status)
+                    if opt_result.evaluated_plans:
+                        for ep in opt_result.evaluated_plans:
+                            if ep.is_selected:
+                                selected_plan = ep
+                                break
+                    logger.info(
+                        "Fixed-time signal optimization complete: selected %s (validation_passed=%s, status=%s)",
+                        opt_result.selected_plan_id,
+                        opt_result.validation_passed,
+                        opt_result.status,
+                    )
             except Exception as e:
                 logger.warning("Fixed-time signal optimization note: %s", e)
 
@@ -200,6 +229,8 @@ class SimulationService:
             approved_signals_count=len(approved_candidate_ids),
             applied_signals_count=applied_signals_count,
             selected_fixed_time_plan=selected_plan,
+            optimizer_validation_passed=optimizer_validation_passed,
+            optimizer_status=optimizer_status,
         )
         opt_session._segment_edge_map = build_meta_opt.get("segment_edge_map", {})
         opt_session._edge_segment_map = build_meta_opt.get("edge_segment_map", {})
@@ -344,6 +375,8 @@ class SimulationService:
             selected_fixed_time_plan=session.selected_fixed_time_plan,
             engine_transitioned=getattr(session, "engine_transitioned", False),
             baseline_engine_transitioned=getattr(base_session, "engine_transitioned", False) if base_session else False,
+            optimizer_validation_passed=getattr(session, "optimizer_validation_passed", None),
+            optimizer_status=getattr(session, "optimizer_status", None),
         )
 
     def get_congestion_summary(self, sim_id: str) -> CongestionSummary:

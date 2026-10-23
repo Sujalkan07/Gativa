@@ -481,7 +481,7 @@ def test_simulation_api_endpoints():
         comp_data = comp_resp.json()
         assert len(comp_data["rows"]) == 4
         assert comp_data["engine_mode"] in ("native_sumo", "fallback")
-        assert comp_data["comparison_status"] == "completed"
+        assert comp_data["comparison_status"] in ("completed", "completed_validated", "completed_inconclusive")
         assert comp_data["baseline_strategy"] != ""
         assert comp_data["optimized_strategy"] != ""
     finally:

@@ -116,6 +116,8 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
   const activeSimIdRef = useRef<string | null>(simId)
   const isSteppingRef = useRef<boolean>(false)
   const lastCongestionRefreshTimeRef = useRef<number>(0)
+  const isPreparingRef = useRef<boolean>(false)
+  const preparedAnalysisIdRef = useRef<string | null>(null)
 
   useEffect(() => {
     currentAnalysisIdRef.current = analysis.analysis_id
@@ -148,6 +150,11 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
       manualCount?: number
       simSeed?: number
     }) => {
+      if (isPreparingRef.current) {
+        console.warn('Simulation preparation is already in flight, ignoring duplicate call.')
+        return
+      }
+      isPreparingRef.current = true
       setIsPreparing(true)
       setError(null)
       setIsPlaying(false)
@@ -180,6 +187,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
           activeSimIdRef.current = res.sim_id
           lastCongestionRefreshTimeRef.current = 0
           setSimStatus(res)
+          isPreparingRef.current = false
           setIsPreparing(false)
 
           // Fetch baseline state, comparison, and signals in parallel
@@ -203,6 +211,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
         .catch((err) => {
           if (currentAnalysisIdRef.current !== targetAnalysisId) return
           setError(getErrorMessage(err))
+          isPreparingRef.current = false
           setIsPreparing(false)
           setSimId(null)
           activeSimIdRef.current = null
@@ -217,8 +226,10 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
   )
 
   useEffect(() => {
+    if (preparedAnalysisIdRef.current === analysis.analysis_id) return
+    preparedAnalysisIdRef.current = analysis.analysis_id
     initSimulation()
-  }, [analysis.analysis_id])
+  }, [analysis.analysis_id, initSimulation])
 
   // ─── Fetch & Manage Traffic Signal Candidates ───────────────────────────────
   const fetchSignalCandidates = useCallback((analysisId: string) => {

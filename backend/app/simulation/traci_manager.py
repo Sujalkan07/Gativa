@@ -101,6 +101,8 @@ class SimulationSession:
         approved_signals_count: int = 0,
         applied_signals_count: int = 0,
         selected_fixed_time_plan: Optional[Any] = None,
+        optimizer_validation_passed: Optional[bool] = None,
+        optimizer_status: Optional[str] = None,
     ):
         self.sim_id = sim_id
         self.analysis_id = analysis_id
@@ -128,6 +130,8 @@ class SimulationSession:
         self.approved_signals_count = approved_signals_count
         self.applied_signals_count = applied_signals_count
         self.selected_fixed_time_plan = selected_fixed_time_plan
+        self.optimizer_validation_passed = optimizer_validation_passed
+        self.optimizer_status = optimizer_status
         self.network_provenance = "synthetic_demo" if is_synthetic_demo else "real_osm"
 
         if not self.road_segments:
@@ -759,8 +763,6 @@ class SimulationSession:
         t = self.elapsed_seconds
 
         # Physics-based visual kinematics estimation without fabricated empirical benefits
-        has_intervention = bool(self.applied_signals_count > 0 or "Optimized" in self.strategy or self.strategy == "actuated_adaptive")
-        is_optimized = has_intervention
         flow_ratio = min(1.2, self.demand_rate_veh_hr / max(1000.0, self.edge_count * 800.0))
         base_speed = max(15.0, 42.0 * (1.0 - flow_ratio * 0.35))
         base_wait = max(4.0, flow_ratio * 32.0)
@@ -879,17 +881,18 @@ class SimulationSession:
                     )
                 )
 
-        # Record kinematics edge telemetry observations for mapped segments
+        # Record neutral kinematics edge telemetry observations for mapped segments
         if self._segment_edge_map:
+            active_per_edge = max(1, int(modeled_active / max(1, len(self._segment_edge_map))))
             for s_id, e_ids in self._segment_edge_map.items():
                 for e_id in e_ids:
                     sample = {
                         "edge_id": e_id,
                         "timestamp": t,
                         "mean_speed_ms": round(cur_speed / 3.6, 3),
-                        "vehicle_count": 1 if is_optimized else 2,
-                        "occupancy_pct": round(min(100.0, 22.0 if is_optimized else 45.0), 2),
-                        "halting_vehicles": 1 if not is_optimized and cur_speed < 10.0 else 0,
+                        "vehicle_count": active_per_edge,
+                        "occupancy_pct": round(min(100.0, (cur_queue / 200.0) * 100.0), 2),
+                        "halting_vehicles": 1 if cur_speed < 5.0 else 0,
                         "waiting_time_s": round(cur_wait * 0.25, 2),
                     }
                     self._accumulate_edge_sample(e_id, sample)
