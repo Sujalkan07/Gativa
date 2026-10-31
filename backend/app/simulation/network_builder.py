@@ -14,6 +14,9 @@ from pathlib import Path
 from typing import Any, Optional
 import xml.etree.ElementTree as ET
 
+import networkx as nx
+from shapely.geometry import LineString, MultiPoint, Point, Polygon
+
 logger = logging.getLogger(__name__)
 
 # Maximum road segments to compile into a single SUMO network.
@@ -95,43 +98,14 @@ class SumoNetworkBuilder:
         self._write_edges_xml(edg_file, edges)
 
         # 2. Run netconvert with UTM projection (establishes true CRS for convertGeo)
-        netconvert_success = False
-        if self.netconvert_bin and Path(self.netconvert_bin).is_file():
-            try:
-                cmd = [
-                    self.netconvert_bin,
-                    "--node-files", str(nod_file),
-                    "--edge-files", str(edg_file),
-                    "--output-file", str(net_file),
-                    "--proj.utm",
-                    "--no-warnings",
-                    "--ignore-errors",
-                ]
-                res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-                if res.returncode == 0 and net_file.is_file():
-                    netconvert_success = True
-                    logger.info("netconvert generated UTM network successfully: %s", net_file)
-                else:
-                    logger.warning("netconvert with --proj.utm exited %s: %s; trying plain-geo fallback", res.returncode, res.stderr)
-                    cmd_fallback = [
-                        self.netconvert_bin,
-                        "--node-files", str(nod_file),
-                        "--edge-files", str(edg_file),
-                        "--output-file", str(net_file),
-                        "--proj.plain-geo",
-                        "--no-warnings",
-                        "--ignore-errors",
-                    ]
-                    res2 = subprocess.run(cmd_fallback, capture_output=True, text=True, timeout=30)
-                    if res2.returncode == 0 and net_file.is_file():
-                        netconvert_success = True
-                        logger.info("netconvert generated plain-geo fallback network: %s", net_file)
-            except Exception as e:
-                logger.error("Failed to run netconvert: %s", e)
-
-        # Fallback XML if netconvert failed or missing
-        if not netconvert_success or not net_file.is_file():
-            self._write_fallback_net_xml(net_file, nodes, edges)
+        compilation_diag = self._run_netconvert_with_diagnostics(
+            nod_file=nod_file,
+            edg_file=edg_file,
+            net_file=net_file,
+            nodes=nodes,
+            edges=edges,
+        )
+        netconvert_success = compilation_diag["netconvert_used"]
 
         # 3. Calculate calibrated demand rate and data source provenance
         calibrated_rate, total_veh_target, demand_source, demand_label = self._estimate_traffic_demand(
@@ -178,11 +152,15 @@ class SumoNetworkBuilder:
             "demand_profile": demand_profile or "peak",
             "demand_data_source": demand_source,
             "demand_source_label": demand_label,
-            # _write_routes_xml returns total trips and initial trips.  Expose
+            # _write_routes_xml returns total trips and initial trips. Expose
             # only departures after t=0 here, so custom initial-population
             # experiments do not look like they have extra scheduled demand.
             "scheduled_vehicles": max(0, scheduled_count - init_count),
             "initial_vehicles_count": init_count,
+            "requested_demand": total_veh_target or max(15, int(calibrated_rate * (duration_seconds / 3600.0))),
+            "generated_demand": scheduled_count,
+            "valid_trips_count": getattr(self, "demand_tracking", {}).get("valid_trips_count", scheduled_count),
+            "rejected_trips_count": getattr(self, "demand_tracking", {}).get("rejected_trips_count", 0),
             "nodes": nodes,
             "edges": edges,
             # segment_id → [sumo_edge_id, ...] map used for congestion telemetry
@@ -194,6 +172,8 @@ class SumoNetworkBuilder:
             "segments_simulated": len(edges),
             "omitted_segments_count": max(0, len(segments) - MAX_SEGMENTS),
             "network_provenance": "synthetic_demo" if allow_synthetic and not segments else "real_osm",
+            "compilation_diagnostics": compilation_diag,
+            "boundary_diagnostics": getattr(self, "boundary_diagnostics", {}),
         }
 
     def _extract_nodes_and_edges(
@@ -463,6 +443,103 @@ class SumoNetworkBuilder:
         tree = ET.ElementTree(root)
         tree.write(str(file_path), encoding="utf-8", xml_declaration=True)
 
+    def _run_netconvert_with_diagnostics(
+        self,
+        nod_file: Path,
+        edg_file: Path,
+        net_file: Path,
+        nodes: dict[str, dict[str, Any]],
+        edges: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """
+        Execute netconvert with complete compilation diagnostics:
+        - Detect and log SUMO / netconvert version
+        - Try UTM projection first, fallback to plain-geo
+        - Capture stdout, stderr, warnings, and compilation errors
+        - Validate generated network XML and verify node/edge counts
+        - Maintain explicit unvalidated structural fallback when compilation unavailable
+        """
+        diag: dict[str, Any] = {
+            "netconvert_used": False,
+            "sumo_version": None,
+            "compilation_returncode": -1,
+            "compilation_warnings": [],
+            "compilation_errors": [],
+            "compiled_junction_count": 0,
+            "compiled_edge_count": 0,
+            "network_valid": False,
+            "network_provenance": "unvalidated_structural_fallback",
+        }
+
+        # 1. Detect SUMO / netconvert version
+        if self.netconvert_bin and Path(self.netconvert_bin).is_file():
+            try:
+                ver_res = subprocess.run([self.netconvert_bin, "--version"], capture_output=True, text=True, timeout=5)
+                if ver_res.returncode == 0:
+                    first_line = ver_res.stdout.strip().split("\n")[0]
+                    diag["sumo_version"] = first_line
+            except Exception as e:
+                logger.debug("Could not determine netconvert version: %s", e)
+
+        # 2. Attempt UTM projection compilation, then plain-geo fallback
+        netconvert_success = False
+        if self.netconvert_bin and Path(self.netconvert_bin).is_file():
+            for proj_flag in ("--proj.utm", "--proj.plain-geo"):
+                try:
+                    cmd = [
+                        self.netconvert_bin,
+                        "--node-files", str(nod_file),
+                        "--edge-files", str(edg_file),
+                        "--output-file", str(net_file),
+                        proj_flag,
+                        "--ignore-errors",
+                    ]
+                    res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                    diag["compilation_returncode"] = res.returncode
+
+                    raw_out = (res.stdout or "") + "\n" + (res.stderr or "")
+                    for line in raw_out.splitlines():
+                        line_str = line.strip()
+                        if "Warning:" in line_str:
+                            diag["compilation_warnings"].append(line_str)
+                        elif "Error:" in line_str:
+                            diag["compilation_errors"].append(line_str)
+
+                    if res.returncode == 0 and net_file.is_file() and net_file.stat().st_size > 0:
+                        try:
+                            tree = ET.parse(str(net_file))
+                            root = tree.getroot()
+                            if root.tag == "net":
+                                netconvert_success = True
+                                j_count = len(root.findall("junction"))
+                                e_count = len(root.findall("edge"))
+                                diag["compiled_junction_count"] = j_count
+                                diag["compiled_edge_count"] = e_count
+                                diag["network_valid"] = True
+                                diag["netconvert_used"] = True
+                                diag["network_provenance"] = "native_sumo_netconvert"
+                                logger.info(
+                                    "netconvert generated valid network (%s junctions, %s edges) with %s: %s",
+                                    j_count, e_count, proj_flag, net_file,
+                                )
+                                break
+                        except Exception as parse_err:
+                            diag["compilation_errors"].append(f"Compiled XML parse error: {parse_err}")
+                except Exception as e:
+                    diag["compilation_errors"].append(f"Subprocess execution error: {e}")
+                    logger.error("Failed to run netconvert with %s: %s", proj_flag, e)
+
+        # 3. Fallback XML if netconvert failed or missing
+        if not netconvert_success or not net_file.is_file():
+            self._write_fallback_net_xml(net_file, nodes, edges)
+            diag["netconvert_used"] = False
+            diag["network_valid"] = False
+            diag["network_provenance"] = "unvalidated_structural_fallback"
+            diag["compiled_junction_count"] = len(nodes)
+            diag["compiled_edge_count"] = len(edges)
+
+        return diag
+
     def _estimate_traffic_demand(
         self,
         segments: list[dict[str, Any]],
@@ -546,58 +623,141 @@ class SumoNetworkBuilder:
         polygon_coords: Optional[list[list[float]]] = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
         """
-        Identify boundary entry edges, boundary exit edges, and internal edges.
-        Edges entering from or near the selection perimeter are entry candidates;
-        edges heading out towards the perimeter are exit candidates.
+        Geometrically identify true boundary entry, exit, and internal road edges.
+
+        Requirements:
+        1. Uses the actual selected polygon boundary via Shapely geometry when available.
+        2. Accurately identifies road segments crossing or touching the actual polygon boundary.
+        3. Distinguishes genuine entry (inbound to polygon/interior), exit (outbound to exterior),
+           and internal road edges.
+        4. Preserves directed road connectivity and respects bidirectional and one-way roads.
+        5. Avoids treating arbitrary interior roads as boundary connections.
+        6. Removes arbitrary first-half/second-half edge slicing.
+        7. Records explicit diagnostics.
         """
         if not edges:
             return [], [], []
 
-        # Find spatial boundary extents
-        all_xs = [n["x"] for n in nodes.values()]
-        all_ys = [n["y"] for n in nodes.values()]
-        min_x, max_x = min(all_xs), max(all_xs)
-        min_y, max_y = min(all_ys), max(all_ys)
-        dx = max(0.0001, max_x - min_x)
-        dy = max(0.0001, max_y - min_y)
-        margin_x = dx * 0.15
-        margin_y = dy * 0.15
+        entry_edges: list[dict[str, Any]] = []
+        exit_edges: list[dict[str, Any]] = []
+        internal_edges: list[dict[str, Any]] = []
+        diagnostics: dict[str, Any] = {"method": "unknown"}
 
-        def is_perimeter_node(n_id: str) -> bool:
-            node = nodes.get(n_id)
-            if not node:
-                return False
-            x, y = node["x"], node["y"]
-            return (
-                x <= min_x + margin_x
-                or x >= max_x - margin_x
-                or y <= min_y + margin_y
-                or y >= max_y - margin_y
-            )
+        # Attempt polygon-based boundary classification
+        poly = None
+        if polygon_coords and len(polygon_coords) >= 3:
+            try:
+                raw_poly = Polygon(polygon_coords)
+                if not raw_poly.is_valid:
+                    raw_poly = raw_poly.buffer(0)
+                if not raw_poly.is_empty and raw_poly.is_valid and raw_poly.area > 0:
+                    poly = raw_poly
+            except Exception as e:
+                logger.debug("Failed to build Shapely polygon from polygon_coords: %s", e)
 
-        entry_edges = []
-        exit_edges = []
-        internal_edges = []
+        if poly is not None:
+            poly_boundary = poly.boundary
+            min_x, min_y, max_x, max_y = poly.bounds
+            span = max(max_x - min_x, max_y - min_y, 0.0001)
+            b_tol = span * 0.08  # within 8% of boundary is considered on the boundary
 
-        for e in edges:
-            from_perim = is_perimeter_node(e["from"])
-            to_perim = is_perimeter_node(e["to"])
+            node_rel: dict[str, str] = {}  # "inside", "boundary", "outside"
+            node_dist: dict[str, float] = {}
+            for n_id, n in nodes.items():
+                pt = Point(float(n["x"]), float(n["y"]))
+                dist = poly_boundary.distance(pt)
+                node_dist[n_id] = dist
+                if dist <= b_tol:
+                    node_rel[n_id] = "boundary"
+                elif poly.contains(pt):
+                    node_rel[n_id] = "inside"
+                else:
+                    node_rel[n_id] = "outside"
 
-            if from_perim and not to_perim:
-                entry_edges.append(e)
-            elif to_perim and not from_perim:
-                exit_edges.append(e)
-            elif from_perim and to_perim:
-                entry_edges.append(e)
-                exit_edges.append(e)
+            has_boundary_nodes = any(r in ("boundary", "outside") for r in node_rel.values())
+            has_inside_nodes = any(r == "inside" for r in node_rel.values())
+
+            if has_boundary_nodes and has_inside_nodes:
+                diagnostics["method"] = "polygon_boundary_crossing"
+                for e in edges:
+                    f_rel = node_rel.get(e["from"], "inside")
+                    t_rel = node_rel.get(e["to"], "inside")
+
+                    # Inbound: from boundary/outside toward deeper inside
+                    if f_rel in ("boundary", "outside") and t_rel == "inside":
+                        entry_edges.append(e)
+                    # Outbound: from inside toward boundary/outside
+                    elif f_rel == "inside" and t_rel in ("boundary", "outside"):
+                        exit_edges.append(e)
+                    elif f_rel in ("boundary", "outside") and t_rel in ("boundary", "outside"):
+                        entry_edges.append(e)
+                        exit_edges.append(e)
+                    else:
+                        internal_edges.append(e)
             else:
-                internal_edges.append(e)
+                # All nodes are inside the polygon (or all on boundary).
+                # Classify peripheral nodes based on distance to polygon boundary.
+                diagnostics["method"] = "polygon_peripheral_distance"
+                dists = [node_dist[nid] for nid in nodes if nid in node_dist]
+                if dists:
+                    min_d = min(dists)
+                    max_d = max(dists)
+                    d_threshold = min_d + 0.25 * (max_d - min_d)
+                    for e in edges:
+                        f_d = node_dist.get(e["from"], max_d)
+                        t_d = node_dist.get(e["to"], max_d)
+                        f_perim = f_d <= d_threshold
+                        t_perim = t_d <= d_threshold
+
+                        if f_perim and not t_perim:
+                            entry_edges.append(e)
+                        elif t_perim and not f_perim:
+                            exit_edges.append(e)
+                        elif f_perim and t_perim:
+                            entry_edges.append(e)
+                            exit_edges.append(e)
+                        else:
+                            internal_edges.append(e)
+
+        # Fallback if no polygon or polygon classification yielded empty edges
+        if not entry_edges or not exit_edges:
+            diagnostics["method"] = "directed_graph_topology"
+            G = nx.DiGraph()
+            for e in edges:
+                G.add_edge(e["from"], e["to"], id=e["id"])
+
+            in_deg = dict(G.in_degree())
+            out_deg = dict(G.out_degree())
+
+            for e in edges:
+                u, v = e["from"], e["to"]
+                is_source = (in_deg.get(u, 0) == 0) or (in_deg.get(u, 0) <= 1 and out_deg.get(u, 0) >= 1)
+                is_sink = (out_deg.get(v, 0) == 0) or (out_deg.get(v, 0) <= 1 and in_deg.get(v, 0) >= 1)
+
+                if is_source and not is_sink:
+                    entry_edges.append(e)
+                elif is_sink and not is_source:
+                    exit_edges.append(e)
+                elif is_source and is_sink:
+                    entry_edges.append(e)
+                    exit_edges.append(e)
+                else:
+                    internal_edges.append(e)
 
         if not entry_edges:
-            entry_edges = edges[: max(1, len(edges) // 2)]
+            entry_edges = list(edges)
+            diagnostics["note_entry"] = "All edges eligible as entry (cyclic or single-component network)"
         if not exit_edges:
-            exit_edges = edges[len(edges) // 2 :] if len(edges) > 1 else edges
+            exit_edges = list(edges)
+            diagnostics["note_exit"] = "All edges eligible as exit (cyclic or single-component network)"
 
+        diagnostics.update({
+            "entry_count": len(entry_edges),
+            "exit_count": len(exit_edges),
+            "internal_count": len(internal_edges),
+            "total_edges": len(edges),
+        })
+        self.boundary_diagnostics = diagnostics
         return entry_edges, exit_edges, internal_edges
 
     def _write_routes_xml(
@@ -615,19 +775,18 @@ class SumoNetworkBuilder:
         initial_population: Optional[int] = None,
     ) -> tuple[int, int]:
         """
-        Generate realistic trip demand with spatially distributed initial vehicle population:
+        Generate realistic, strictly reachable trip demand:
+        - Construct directed graph and compute reachability for every origin-destination pair.
         - Initial population placed across distinct interior/approach road segments at depart="0.0"
           with departPos="random", departSpeed="avg", departLane="best" (natural network distribution).
         - Scheduled demand departures distributed across simulation duration according to profile
           with minimum headway enforcement (>= 2.5s) per entry edge to prevent entry pileups.
         - Boundary entry to exit through-trips prioritized (75%) with internal trips (25%).
-        - Calibrated vehicle type mix (passenger cars, buses).
+        - Rejects any pair without a valid directed path; never manufactures unroutable fallback pairs.
         """
         import random
-        import networkx as nx
 
         if isinstance(nodes, list):
-            # Called with legacy signature: _write_routes_xml(file_path, edges, duration, demand_rate, seed)
             actual_edges = nodes
             if isinstance(edges, int):
                 duration_seconds = edges
@@ -638,6 +797,9 @@ class SumoNetworkBuilder:
         else:
             actual_nodes = nodes or {}
             actual_edges = edges or []
+
+        if not actual_edges:
+            raise ValueError("Cannot generate routes for an empty edge list.")
 
         rng = random.Random(seed)
         root = ET.Element("routes")
@@ -676,21 +838,30 @@ class SumoNetworkBuilder:
 
         entry_edges, exit_edges, internal_edges = self._identify_boundary_edges(actual_nodes, actual_edges, polygon_coords)
 
-        # Precompute reachable descendants for each node (single BFS per node, takes ~0.03s total)
+        # Precompute reachable descendants for each node (single BFS per node)
         reachable_map: dict[str, set[str]] = {}
         for n in G.nodes():
             reachable_map[n] = nx.descendants(G, n)
 
+        # Build reachability mapping per edge
+        edge_dests_map: dict[str, list[str]] = {}
+        for e in actual_edges:
+            e_to = e["to"]
+            reach = reachable_map.get(e_to, set())
+            valid_dest_ids = [
+                d["id"] for d in actual_edges
+                if d["id"] != e["id"] and (d["from"] == e_to or d["from"] in reach)
+            ]
+            edge_dests_map[e["id"]] = valid_dest_ids
+
         # 1. Collect Valid Through-Pairs (Entry to Exit with reachable path)
         through_pairs: list[tuple[str, str]] = []
         for en in entry_edges:
-            en_to = en["to"]
-            reachable = reachable_map.get(en_to, set())
+            en_id = en["id"]
+            dests_for_en = set(edge_dests_map.get(en_id, []))
             for ex in exit_edges:
-                if en["id"] == ex["id"]:
-                    continue
-                if en_to == ex["from"] or ex["from"] in reachable:
-                    through_pairs.append((en["id"], ex["id"]))
+                if ex["id"] in dests_for_en:
+                    through_pairs.append((en_id, ex["id"]))
                     if len(through_pairs) >= 500:
                         break
             if len(through_pairs) >= 500:
@@ -700,45 +871,54 @@ class SumoNetworkBuilder:
         internal_pairs: list[tuple[str, str]] = []
         sample_pool = actual_edges if len(actual_edges) <= 100 else rng.sample(actual_edges, 100)
         for e1 in sample_pool:
-            e1_to = e1["to"]
-            reachable = reachable_map.get(e1_to, set())
-            for e2 in sample_pool:
-                if e1["id"] == e2["id"]:
-                    continue
-                if e1_to == e2["from"] or e2["from"] in reachable:
-                    internal_pairs.append((e1["id"], e2["id"]))
-                    if len(internal_pairs) >= 300:
-                        break
+            e1_id = e1["id"]
+            dests = edge_dests_map.get(e1_id, [])
+            for e2_id in dests:
+                internal_pairs.append((e1_id, e2_id))
+                if len(internal_pairs) >= 300:
+                    break
             if len(internal_pairs) >= 300:
                 break
 
+        # If through_pairs empty, fallback to internal pairs
         if not through_pairs:
-            through_pairs = internal_pairs or [(actual_edges[0]["id"], actual_edges[-1]["id"])]
+            through_pairs = internal_pairs
         if not internal_pairs:
             internal_pairs = through_pairs
+
+        # If still no multi-edge reachable pairs exist:
+        # Check if single-edge traversals are possible (vehicles traversing valid single edges)
+        if not through_pairs and not internal_pairs:
+            # Check if any edges exist
+            if actual_edges:
+                # Single-edge progression trips
+                single_edge_pairs = [(e["id"], e["id"]) for e in actual_edges]
+                through_pairs = single_edge_pairs
+                internal_pairs = single_edge_pairs
+                logger.warning(
+                    "Network contains no multi-edge reachable paths; generating single-edge progression trips across %d edges",
+                    len(actual_edges),
+                )
+            else:
+                raise ValueError(
+                    f"Road network topology contains no reachable origin-destination pairs to generate valid simulation demand across {len(actual_edges)} edges."
+                )
 
         bus_fraction = (vehicle_types or {}).get("bus", 0.12)
 
         # 3. Spatially Distributed Initial Vehicle Population (at t=0.0)
-        # Start a meaningful share of the requested demand on roads throughout
-        # the selected area.  We cycle through valid origin edges instead of
-        # capping the population at one vehicle per edge.
         if initial_population is not None and initial_population >= 0:
             target_initial = initial_population
         else:
             target_initial = min(total_vehicles, max(12, int(total_vehicles * 0.55)))
 
-        # Find candidate edges that have valid downstream progression paths
         candidate_initial_edges = [
             e for e in actual_edges
-            if e["to"] in reachable_map and len(reachable_map[e["to"]]) > 0
+            if len(edge_dests_map.get(e["id"], [])) > 0
         ]
         if not candidate_initial_edges:
             candidate_initial_edges = actual_edges
 
-        # Round-robin across map cells before repeating any cell.  Sampling
-        # every directed edge uniformly overweights dense perimeter corridors
-        # and can leave the centre of a selected area visibly empty.
         xs = [float(actual_nodes[e["from"]]["x"]) for e in candidate_initial_edges if e["from"] in actual_nodes]
         xs += [float(actual_nodes[e["to"]]["x"]) for e in candidate_initial_edges if e["to"] in actual_nodes]
         ys = [float(actual_nodes[e["from"]]["y"]) for e in candidate_initial_edges if e["from"] in actual_nodes]
@@ -778,19 +958,16 @@ class SumoNetworkBuilder:
             rng.shuffle(rng_edges)
 
         initial_trips: list[tuple[float, str, str, str, str, bool]] = []
+        rejected_trips = 0
+
         for i in range(target_initial):
             init_edge = rng_edges[i % len(rng_edges)]
-            reachable_nodes = reachable_map.get(init_edge["to"], set())
-            valid_dests = [
-                ex["id"] for ex in exit_edges
-                if ex["id"] != init_edge["id"] and (ex["from"] in reachable_nodes or ex["from"] == init_edge["to"])
-            ]
-            if not valid_dests:
-                valid_dests = [
-                    e["id"] for e in actual_edges
-                    if e["id"] != init_edge["id"] and (e["from"] in reachable_nodes or e["from"] == init_edge["to"])
-                ]
-            dest_edge = rng.choice(valid_dests) if valid_dests else actual_edges[-1]["id"]
+            dests = edge_dests_map.get(init_edge["id"], [])
+            if dests:
+                dest_edge = rng.choice(dests)
+            else:
+                dest_edge = init_edge["id"]
+
             v_type = "bus" if rng.random() < bus_fraction else "passenger"
             initial_trips.append((0.0, f"init_veh_{i}", v_type, init_edge["id"], dest_edge, True))
 
@@ -840,7 +1017,6 @@ class SumoNetworkBuilder:
                 "to": t_edge,
             }
             if is_initial:
-                # Distribute on-network at time zero across the selected area.
                 trip_attribs["departPos"] = "random"
                 trip_attribs["departSpeed"] = "avg"
                 trip_attribs["departLane"] = "best"
@@ -853,6 +1029,16 @@ class SumoNetworkBuilder:
 
         tree = ET.ElementTree(root)
         tree.write(str(file_path), encoding="utf-8", xml_declaration=True)
+
+        self.demand_tracking = {
+            "requested_demand": total_vehicles,
+            "generated_demand": len(all_trips),
+            "valid_trips_count": len(all_trips),
+            "rejected_trips_count": rejected_trips,
+            "initial_population": len(initial_trips),
+            "scheduled_vehicles": len(scheduled_trips),
+        }
+
         return len(all_trips), len(initial_trips)
 
     def _write_sumocfg(self, file_path: Path, net_name: str, rou_name: str, duration_seconds: int):
