@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from 'react'
+import { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
@@ -127,8 +127,6 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
   useEffect(() => {
     activeSimIdRef.current = simId
   }, [simId])
-
-  const TOMTOM_KEY = import.meta.env.VITE_TOMTOM_API_KEY
 
   const getErrorMessage = (err: unknown): string => {
     let msg = ''
@@ -360,34 +358,51 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
 
   // ─── Trigger Leaflet InvalidateSize on ViewMode Switch ──────────────────────
   useEffect(() => {
-    const timer = setTimeout(() => {
-      if (viewMode === 'single') singleMapRef.current?.invalidateSize()
+    const triggerInvalidation = () => {
+      if (viewMode === 'single') singleMapRef.current?.invalidateSize({ animate: false })
       if (viewMode === 'compare') {
-        baselineMapRef.current?.invalidateSize()
-        optimizedMapRef.current?.invalidateSize()
+        baselineMapRef.current?.invalidateSize({ animate: false })
+        optimizedMapRef.current?.invalidateSize({ animate: false })
       }
-      if (viewMode === 'results') resultsMapRef.current?.invalidateSize()
-    }, 150)
-    return () => clearTimeout(timer)
+      if (viewMode === 'results') resultsMapRef.current?.invalidateSize({ animate: false })
+    }
+
+    requestAnimationFrame(triggerInvalidation)
+    const timer1 = setTimeout(triggerInvalidation, 50)
+    const timer2 = setTimeout(triggerInvalidation, 200)
+    return () => {
+      clearTimeout(timer1)
+      clearTimeout(timer2)
+    }
   }, [viewMode])
+
+  const initialCenter: [number, number] = useMemo(() => {
+    if (analysis.polygon?.coordinates?.[0]?.length) {
+      const ring = analysis.polygon.coordinates[0]
+      const lat = ring.reduce((sum, c) => sum + c[1], 0) / ring.length
+      const lng = ring.reduce((sum, c) => sum + c[0], 0) / ring.length
+      return [lat, lng]
+    }
+    return [26.900, 80.942]
+  }, [analysis.polygon])
+
+  const CARTO_VOYAGER_URL = 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png'
+  const CARTO_ATTRIBUTION =
+    '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions" target="_blank" rel="noopener noreferrer">CARTO</a>'
 
   // ─── Shared Tile Layer & Network Initialization Helper ─────────────────────
   const setupBaseNetwork = useCallback(
     (map: L.Map, segGroup: L.LayerGroup, isInteractiveForCongestion = false) => {
-      // Tile Layer
-      const baseTile = TOMTOM_KEY
-        ? L.tileLayer(
-            `https://{s}.api.tomtom.com/map/1/tile/basic/main/{z}/{x}/{y}.png?key=${TOMTOM_KEY}`,
-            {
-              maxZoom: 19,
-              subdomains: ['a', 'b', 'c', 'd'],
-              attribution: '&copy; TomTom, &copy; OpenStreetMap',
-            },
-          )
-        : L.tileLayer('https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png', {
-            maxZoom: 19,
-            attribution: '&copy; OpenStreetMap contributors',
-          })
+      // Tile Layer: Fastly CDN Edge-cached Voyager street tiles (<50ms response)
+      const baseTile = L.tileLayer(CARTO_VOYAGER_URL, {
+        maxZoom: 20,
+        subdomains: ['a', 'b', 'c', 'd'],
+        keepBuffer: 8,
+        updateWhenIdle: false,
+        updateWhenZooming: false,
+        crossOrigin: true,
+        attribution: CARTO_ATTRIBUTION,
+      })
       baseTile.addTo(map)
 
       // Boundary Polygon
@@ -403,7 +418,10 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
         }).addTo(segGroup)
 
         const bounds = L.latLngBounds(latLngs)
-        map.fitBounds(bounds, { padding: [25, 25] })
+        if (bounds.isValid()) {
+          map.invalidateSize({ animate: false })
+          map.fitBounds(bounds, { padding: [25, 25] })
+        }
       }
 
       // Road Network Segments
@@ -441,14 +459,19 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
         })
       }
     },
-    [analysis.polygon, analysis.segments, TOMTOM_KEY],
+    [analysis.polygon, analysis.segments],
   )
 
   // ─── Initialize Single Map (Mode A) ─────────────────────────────────────────
   useEffect(() => {
     if (!singleMapContainerRef.current || singleMapRef.current) return
 
-    const map = L.map(singleMapContainerRef.current, { zoomControl: false })
+    const map = L.map(singleMapContainerRef.current, {
+      center: initialCenter,
+      zoom: 14,
+      zoomControl: false,
+      preferCanvas: true,
+    })
     L.control.zoom({ position: 'bottomright' }).addTo(map)
 
     const segGroup = L.layerGroup().addTo(map)
@@ -464,11 +487,27 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
 
     setupBaseNetwork(map, segGroup)
 
+    const invalidate = () => map.invalidateSize({ animate: false })
+    requestAnimationFrame(invalidate)
+    const t1 = setTimeout(invalidate, 100)
+    const t2 = setTimeout(invalidate, 300)
+
+    let ro: ResizeObserver | null = null
+    if (typeof ResizeObserver !== 'undefined' && singleMapContainerRef.current) {
+      ro = new ResizeObserver(() => {
+        requestAnimationFrame(invalidate)
+      })
+      ro.observe(singleMapContainerRef.current)
+    }
+
     return () => {
+      clearTimeout(t1)
+      clearTimeout(t2)
+      ro?.disconnect()
       map.remove()
       singleMapRef.current = null
     }
-  }, [setupBaseNetwork])
+  }, [setupBaseNetwork, initialCenter])
 
   // ─── Render Candidate Signal Markers on Single Map ──────────────────────────
   const renderCandidateMarkers = useCallback(() => {
@@ -520,7 +559,12 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
   useEffect(() => {
     if (!baselineMapContainerRef.current || baselineMapRef.current) return
 
-    const map = L.map(baselineMapContainerRef.current, { zoomControl: false })
+    const map = L.map(baselineMapContainerRef.current, {
+      center: initialCenter,
+      zoom: 14,
+      zoomControl: false,
+      preferCanvas: true,
+    })
     L.control.zoom({ position: 'bottomright' }).addTo(map)
 
     const segGroup = L.layerGroup().addTo(map)
@@ -534,17 +578,38 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
 
     setupBaseNetwork(map, segGroup)
 
+    const invalidate = () => map.invalidateSize({ animate: false })
+    requestAnimationFrame(invalidate)
+    const t1 = setTimeout(invalidate, 100)
+    const t2 = setTimeout(invalidate, 300)
+
+    let ro: ResizeObserver | null = null
+    if (typeof ResizeObserver !== 'undefined' && baselineMapContainerRef.current) {
+      ro = new ResizeObserver(() => {
+        requestAnimationFrame(invalidate)
+      })
+      ro.observe(baselineMapContainerRef.current)
+    }
+
     return () => {
+      clearTimeout(t1)
+      clearTimeout(t2)
+      ro?.disconnect()
       map.remove()
       baselineMapRef.current = null
     }
-  }, [setupBaseNetwork])
+  }, [setupBaseNetwork, initialCenter])
 
   // ─── Initialize Optimized Map (Mode B - Right) ──────────────────────────────
   useEffect(() => {
     if (!optimizedMapContainerRef.current || optimizedMapRef.current) return
 
-    const map = L.map(optimizedMapContainerRef.current, { zoomControl: false })
+    const map = L.map(optimizedMapContainerRef.current, {
+      center: initialCenter,
+      zoom: 14,
+      zoomControl: false,
+      preferCanvas: true,
+    })
     L.control.zoom({ position: 'bottomright' }).addTo(map)
 
     const segGroup = L.layerGroup().addTo(map)
@@ -558,17 +623,38 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
 
     setupBaseNetwork(map, segGroup)
 
+    const invalidate = () => map.invalidateSize({ animate: false })
+    requestAnimationFrame(invalidate)
+    const t1 = setTimeout(invalidate, 100)
+    const t2 = setTimeout(invalidate, 300)
+
+    let ro: ResizeObserver | null = null
+    if (typeof ResizeObserver !== 'undefined' && optimizedMapContainerRef.current) {
+      ro = new ResizeObserver(() => {
+        requestAnimationFrame(invalidate)
+      })
+      ro.observe(optimizedMapContainerRef.current)
+    }
+
     return () => {
+      clearTimeout(t1)
+      clearTimeout(t2)
+      ro?.disconnect()
       map.remove()
       optimizedMapRef.current = null
     }
-  }, [setupBaseNetwork])
+  }, [setupBaseNetwork, initialCenter])
 
   // ─── Initialize Results Congestion Map (Mode C) ─────────────────────────────
   useEffect(() => {
     if (!resultsMapContainerRef.current || resultsMapRef.current) return
 
-    const map = L.map(resultsMapContainerRef.current, { zoomControl: false })
+    const map = L.map(resultsMapContainerRef.current, {
+      center: initialCenter,
+      zoom: 14,
+      zoomControl: false,
+      preferCanvas: true,
+    })
     L.control.zoom({ position: 'bottomright' }).addTo(map)
 
     const segGroup = L.layerGroup().addTo(map)
@@ -577,13 +663,29 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
 
     setupBaseNetwork(map, segGroup, true)
 
+    const invalidate = () => map.invalidateSize({ animate: false })
+    requestAnimationFrame(invalidate)
+    const t1 = setTimeout(invalidate, 100)
+    const t2 = setTimeout(invalidate, 300)
+
+    let ro: ResizeObserver | null = null
+    if (typeof ResizeObserver !== 'undefined' && resultsMapContainerRef.current) {
+      ro = new ResizeObserver(() => {
+        requestAnimationFrame(invalidate)
+      })
+      ro.observe(resultsMapContainerRef.current)
+    }
+
     const polylineMap = resultsPolylineMapRef.current
     return () => {
+      clearTimeout(t1)
+      clearTimeout(t2)
+      ro?.disconnect()
       map.remove()
       resultsMapRef.current = null
       polylineMap.clear()
     }
-  }, [setupBaseNetwork])
+  }, [setupBaseNetwork, initialCenter])
 
   // ─── Vehicle Rendering Helper ───────────────────────────────────────────────
   const updateVehicleLayer = useCallback(

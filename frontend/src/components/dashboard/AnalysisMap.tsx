@@ -21,6 +21,36 @@ interface AnalysisMapProps {
   className?: string
 }
 
+const CARTO_VOYAGER_URL = 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png'
+const CARTO_ATTRIBUTION =
+  '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions" target="_blank" rel="noopener noreferrer">CARTO</a>'
+const ESRI_SATELLITE_URL =
+  'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
+const ESRI_ATTRIBUTION =
+  'Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community'
+
+function createAnalysisBaseTileLayer(type: 'streets' | 'satellite') {
+  if (type === 'satellite') {
+    return L.tileLayer(ESRI_SATELLITE_URL, {
+      maxZoom: 19,
+      keepBuffer: 8,
+      updateWhenIdle: false,
+      updateWhenZooming: false,
+      crossOrigin: true,
+      attribution: ESRI_ATTRIBUTION,
+    })
+  }
+  return L.tileLayer(CARTO_VOYAGER_URL, {
+    maxZoom: 20,
+    subdomains: ['a', 'b', 'c', 'd'],
+    keepBuffer: 8,
+    updateWhenIdle: false,
+    updateWhenZooming: false,
+    crossOrigin: true,
+    attribution: CARTO_ATTRIBUTION,
+  })
+}
+
 export default function AnalysisMap({
   polygon,
   segments,
@@ -59,36 +89,29 @@ export default function AnalysisMap({
     if (!containerRef.current) return
     if (mapRef.current) return
 
+    // Derive initial centroid so Leaflet's _loaded is true on frame 0
+    const ring = polygon?.coordinates?.[0]
+    const initialCenter: [number, number] = ring?.length
+      ? [
+          ring.reduce((sum, c) => sum + c[1], 0) / ring.length,
+          ring.reduce((sum, c) => sum + c[0], 0) / ring.length,
+        ]
+      : [26.900, 80.942]
+
     // Create map instance
     const map = L.map(containerRef.current, {
+      center: initialCenter,
+      zoom: 14,
       zoomControl: false,
       attributionControl: true,
+      preferCanvas: true,
     })
 
     // Add zoom control in bottom-right
     L.control.zoom({ position: 'bottomright' }).addTo(map)
 
-    // Base street tile layer: TomTom Map Display if key configured, fallback to OSM HOT
-    const streetTile = TOMTOM_KEY
-      ? L.tileLayer(
-          `https://{s}.api.tomtom.com/map/1/tile/basic/main/{z}/{x}/{y}.png?key=${TOMTOM_KEY}`,
-          {
-            maxZoom: 19,
-            subdomains: ['a', 'b', 'c', 'd'],
-            attribution:
-              '&copy; <a href="https://www.tomtom.com" target="_blank" rel="noopener noreferrer">TomTom</a>, &copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap</a>',
-          },
-        )
-      : L.tileLayer(
-          'https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png',
-          {
-            maxZoom: 19,
-            subdomains: 'abc',
-            attribution:
-              '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap</a> contributors, Tiles style by <a href="https://www.hotosm.org/" target="_blank" rel="noopener noreferrer">HOT</a>',
-          },
-        )
-
+    // Base street tile layer: Fastly CDN edge-cached Voyager (<50ms response)
+    const streetTile = createAnalysisBaseTileLayer('streets')
     streetTile.addTo(map)
     baseTileLayerRef.current = streetTile
     roadsGroupRef.current = L.layerGroup().addTo(map)
@@ -96,11 +119,33 @@ export default function AnalysisMap({
     recommendationsGroupRef.current = L.layerGroup().addTo(map)
     mapRef.current = map
 
+    // Ensure immediate and accurate layout sizing (prevents grey tiles when tab opens or grid computes)
+    const invalidate = () => {
+      map.invalidateSize({ animate: false })
+    }
+    requestAnimationFrame(invalidate)
+    const t1 = setTimeout(invalidate, 100)
+    const t2 = setTimeout(invalidate, 300)
+    const t3 = setTimeout(invalidate, 600)
+
+    let ro: ResizeObserver | null = null
+    if (typeof ResizeObserver !== 'undefined' && containerRef.current) {
+      ro = new ResizeObserver(() => {
+        requestAnimationFrame(invalidate)
+      })
+      ro.observe(containerRef.current)
+    }
+
     return () => {
+      clearTimeout(t1)
+      clearTimeout(t2)
+      clearTimeout(t3)
+      ro?.disconnect()
       map.remove()
       mapRef.current = null
     }
-  }, [TOMTOM_KEY])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   // 2. Switch Base Tile Layer (Streets vs Satellite)
   useEffect(() => {
@@ -111,37 +156,10 @@ export default function AnalysisMap({
       map.removeLayer(baseTileLayerRef.current)
     }
 
-    if (baseLayerType === 'satellite') {
-      baseTileLayerRef.current = L.tileLayer(
-        'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-        {
-          maxZoom: 19,
-          attribution:
-            'Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community',
-        },
-      ).addTo(map)
-    } else {
-      baseTileLayerRef.current = TOMTOM_KEY
-        ? L.tileLayer(
-            `https://{s}.api.tomtom.com/map/1/tile/basic/main/{z}/{x}/{y}.png?key=${TOMTOM_KEY}`,
-            {
-              maxZoom: 19,
-              subdomains: ['a', 'b', 'c', 'd'],
-              attribution:
-                '&copy; <a href="https://www.tomtom.com" target="_blank" rel="noopener noreferrer">TomTom</a>, &copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap</a>',
-            },
-          ).addTo(map)
-        : L.tileLayer(
-            'https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png',
-            {
-              maxZoom: 19,
-              subdomains: 'abc',
-              attribution:
-                '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap</a> contributors, Tiles style by <a href="https://www.hotosm.org/" target="_blank" rel="noopener noreferrer">HOT</a>',
-            },
-          ).addTo(map)
-    }
-  }, [baseLayerType, TOMTOM_KEY])
+    const newLayer = createAnalysisBaseTileLayer(baseLayerType)
+    newLayer.addTo(map)
+    baseTileLayerRef.current = newLayer
+  }, [baseLayerType])
 
   // 2b. TomTom Real-Time Traffic Flow Tile Overlay
   useEffect(() => {
@@ -160,6 +178,10 @@ export default function AnalysisMap({
           maxZoom: 19,
           subdomains: ['a', 'b', 'c', 'd'],
           opacity: 0.82,
+          keepBuffer: 8,
+          updateWhenIdle: false,
+          updateWhenZooming: false,
+          crossOrigin: true,
           attribution:
             '&copy; <a href="https://www.tomtom.com" target="_blank" rel="noopener noreferrer">TomTom Traffic</a>',
         },
@@ -189,6 +211,9 @@ export default function AnalysisMap({
     }).addTo(map)
 
     polygonLayerRef.current = polyLayer
+
+    // Invalidate size first to ensure Leaflet has up-to-date viewport pixels
+    map.invalidateSize({ animate: false })
 
     // Fit map bounds to exact user selected polygon
     try {
@@ -518,7 +543,11 @@ export default function AnalysisMap({
     const map = mapRef.current
     const polyLayer = polygonLayerRef.current
     if (map && polyLayer) {
-      map.fitBounds(polyLayer.getBounds(), { padding: [35, 35] })
+      map.invalidateSize({ animate: false })
+      const bounds = polyLayer.getBounds()
+      if (bounds.isValid()) {
+        map.fitBounds(bounds, { padding: [35, 35] })
+      }
     }
   }, [])
 
@@ -640,7 +669,7 @@ export default function AnalysisMap({
             <span className="material-symbols-outlined text-[14px]">
               {baseLayerType === 'streets' ? 'satellite_alt' : 'streetview'}
             </span>
-            {baseLayerType === 'streets' ? 'Satellite' : TOMTOM_KEY ? 'TomTom Streets' : 'Streets'}
+            {baseLayerType === 'streets' ? 'Satellite' : 'Streets'}
           </button>
 
           <button
