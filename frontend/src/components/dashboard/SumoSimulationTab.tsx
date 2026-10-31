@@ -117,6 +117,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
   const isSteppingRef = useRef<boolean>(false)
   const lastCongestionRefreshTimeRef = useRef<number>(0)
   const isPreparingRef = useRef<boolean>(false)
+  const prepareRequestIdRef = useRef<number>(0)
   const preparedAnalysisIdRef = useRef<string | null>(null)
 
   useEffect(() => {
@@ -160,6 +161,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
       setIsPlaying(false)
       if (timerRef.current) clearInterval(timerRef.current)
 
+      const reqId = ++prepareRequestIdRef.current
       const lvl = customConfig?.level ?? demandLevel
       const prof = customConfig?.profile ?? demandProfile
       const dur = customConfig?.duration ?? durationSeconds
@@ -181,14 +183,12 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
           seed: s,
         })
         .then(async (res) => {
-          if (currentAnalysisIdRef.current !== targetAnalysisId) return
+          if (prepareRequestIdRef.current !== reqId || currentAnalysisIdRef.current !== targetAnalysisId) return
 
           setSimId(res.sim_id)
           activeSimIdRef.current = res.sim_id
           lastCongestionRefreshTimeRef.current = 0
           setSimStatus(res)
-          isPreparingRef.current = false
-          setIsPreparing(false)
 
           // Fetch baseline state, comparison, and signals in parallel
           try {
@@ -198,7 +198,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
               api.getSimulationSignals(res.sim_id),
               api.getCongestionResults(res.sim_id),
             ])
-            if (currentAnalysisIdRef.current !== targetAnalysisId) return
+            if (prepareRequestIdRef.current !== reqId || currentAnalysisIdRef.current !== targetAnalysisId) return
 
             if (baseRes.status === 'fulfilled') setBaselineStatus(baseRes.value)
             if (compRes.status === 'fulfilled') setComparison(compRes.value)
@@ -209,10 +209,8 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
           }
         })
         .catch((err) => {
-          if (currentAnalysisIdRef.current !== targetAnalysisId) return
+          if (prepareRequestIdRef.current !== reqId || currentAnalysisIdRef.current !== targetAnalysisId) return
           setError(getErrorMessage(err))
-          isPreparingRef.current = false
-          setIsPreparing(false)
           setSimId(null)
           activeSimIdRef.current = null
           setSimStatus(null)
@@ -221,12 +219,53 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
           setSignalsList(null)
           setCongestion(null)
         })
+        .finally(() => {
+          if (prepareRequestIdRef.current === reqId) {
+            isPreparingRef.current = false
+            setIsPreparing(false)
+          }
+        })
     },
     [analysis.analysis_id, demandLevel, demandProfile, durationSeconds, manualVehicles, seed],
   )
 
   useEffect(() => {
     if (preparedAnalysisIdRef.current === analysis.analysis_id) return
+
+    // Analysis switched: Stop any running simulation session in the background
+    const prevSimId = activeSimIdRef.current
+    if (prevSimId) {
+      api.stopSimulation(prevSimId).catch((err) => {
+        console.warn('Background simulation stop failed during analysis switch:', err)
+      })
+    }
+
+    // Clear existing vehicle markers and layers
+    singleMarkersMapRef.current.clear()
+    baselineMarkersMapRef.current.clear()
+    optimizedMarkersMapRef.current.clear()
+    singleVehiclesGroupRef.current?.clearLayers()
+    baselineVehiclesGroupRef.current?.clearLayers()
+    optimizedVehiclesGroupRef.current?.clearLayers()
+    singleSignalsGroupRef.current?.clearLayers()
+    baselineSignalsGroupRef.current?.clearLayers()
+    optimizedSignalsGroupRef.current?.clearLayers()
+    resultsPolylineMapRef.current.clear()
+    resultsSegmentsGroupRef.current?.clearLayers()
+
+    // Reset simulation state variables
+    isPreparingRef.current = false
+    setIsPreparing(false)
+    setIsPlaying(false)
+    if (timerRef.current) clearInterval(timerRef.current)
+    activeSimIdRef.current = null
+    setSimId(null)
+    setSimStatus(null)
+    setBaselineStatus(null)
+    setComparison(null)
+    setCongestion(null)
+    setError(null)
+
     preparedAnalysisIdRef.current = analysis.analysis_id
     initSimulation()
   }, [analysis.analysis_id, initSimulation])
@@ -538,10 +577,11 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
 
     setupBaseNetwork(map, segGroup, true)
 
+    const polylineMap = resultsPolylineMapRef.current
     return () => {
       map.remove()
       resultsMapRef.current = null
-      resultsPolylineMapRef.current.clear()
+      polylineMap.clear()
     }
   }, [setupBaseNetwork])
 

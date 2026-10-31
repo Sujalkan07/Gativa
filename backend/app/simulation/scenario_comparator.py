@@ -5,7 +5,7 @@ Calculates honest absolute and percentage variance across core metrics with zero
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 from app.models.schemas import (
     ComparisonStatus,
@@ -42,6 +42,7 @@ class ScenarioComparator:
         baseline_engine_transitioned: bool = False,
         optimizer_validation_passed: Optional[bool] = None,
         optimizer_status: Optional[str] = None,
+        experiment_manifest: Optional[dict[str, Any]] = None,
     ) -> ScenarioComparisonResult:
         """
         Produce side-by-side scenario comparison table with genuine empirical variance.
@@ -128,6 +129,7 @@ class ScenarioComparator:
                 applied_signals_count=applied_signals_count or 0,
                 initial_vehicles_count=initial_vehicles_count or 0,
                 selected_fixed_time_plan=selected_fixed_time_plan,
+                experiment_manifest=experiment_manifest,
             )
 
         if baseline_engine_mode is not None and baseline_engine_mode != engine_mode:
@@ -182,6 +184,7 @@ class ScenarioComparator:
                 applied_signals_count=applied_signals_count or 0,
                 initial_vehicles_count=initial_vehicles_count or 0,
                 selected_fixed_time_plan=selected_fixed_time_plan,
+                experiment_manifest=experiment_manifest,
             )
 
         # 1. Check for Pending state (simulation has not stepped yet)
@@ -233,6 +236,7 @@ class ScenarioComparator:
                 applied_signals_count=applied_signals_count,
                 initial_vehicles_count=initial_vehicles_count,
                 selected_fixed_time_plan=selected_fixed_time_plan,
+                experiment_manifest=experiment_manifest,
             )
 
         # 2. Check for Insufficient Data state
@@ -284,7 +288,13 @@ class ScenarioComparator:
                 applied_signals_count=applied_signals_count,
                 initial_vehicles_count=initial_vehicles_count,
                 selected_fixed_time_plan=selected_fixed_time_plan,
+                experiment_manifest=experiment_manifest,
             )
+
+        is_fallback_mode = (
+            "fallback" in engine_mode
+            or (baseline_engine_mode is not None and "fallback" in baseline_engine_mode)
+        )
 
         # 3. Calculate genuine empirical variances with honest zero-baseline handling
         def calc_metric_variance(
@@ -295,6 +305,17 @@ class ScenarioComparator:
             is_int: bool = False,
         ) -> tuple[Optional[float], float, str, bool]:
             diff = round(opt_val - base_val, 2)
+            if diff == 0.0 or (base_val <= 0.0 and opt_val <= 0.0):
+                val_str = "0" if is_int else "0.0"
+                variance_str = f"{val_str} {unit} (no change)"
+                return 0.0, 0.0, variance_str, False
+
+            if is_fallback_mode:
+                # Under fallback kinematics, no empirical improvement indicators may be emitted
+                diff_str = f"{int(diff):+d}" if is_int else f"{diff:+.1f}"
+                variance_str = f"~{diff_str} {unit} (Estimated visual variance — kinematics fallback)"
+                return None, diff, variance_str, False
+
             if base_val <= 0.0:
                 if opt_val <= 0.0:
                     val_str = "0" if is_int else "0.0"
@@ -456,6 +477,10 @@ class ScenarioComparator:
                 "Internal kinematics engine estimation mode: values are simulated visual estimates, "
                 "not empirical SUMO hardware measurements. Percentage variances must not be presented as empirical improvements."
             )
+        if experiment_manifest is not None and not experiment_manifest.get("parity_verified", True):
+            discrepancies = experiment_manifest.get("discrepancies", [])
+            disc_str = "; ".join(discrepancies) if discrepancies else "Experiment parity check failed"
+            disclosures.append(f"Demand parity failed: {disc_str}")
 
         disclosures_prefix = f"[{' | '.join(disclosures)}] " if disclosures else ""
 
@@ -465,7 +490,11 @@ class ScenarioComparator:
 
         is_native = ("native" in engine_mode) and (baseline_engine_mode is None or "native" in baseline_engine_mode)
 
-        if (applied_signals_count or 0) == 0 or signal_count == 0:
+        if experiment_manifest is not None and not experiment_manifest.get("parity_verified", True):
+            is_validated = False
+            optimization_status = "experiment_parity_failed"
+            comparison_status = "insufficient_data"
+        elif (applied_signals_count or 0) == 0 or signal_count == 0:
             is_validated = False
             optimization_status = "kinematics_estimate_only" if not is_native else "unsignalized_or_unoptimized"
             comparison_status = "completed"
@@ -497,7 +526,12 @@ class ScenarioComparator:
                 optimization_status = "unvalidated"
                 comparison_status = "completed_inconclusive"
 
-        if signal_count == 0 or (applied_signals_count or 0) == 0:
+        if experiment_manifest is not None and not experiment_manifest.get("parity_verified", True):
+            notes = (
+                f"{disclosures_prefix}Scenario comparison invalidated because baseline and optimized experiment parity verification failed. "
+                f"Demand, network, or simulation parameters differed between scenarios. Empirical comparison cannot be established."
+            )
+        elif signal_count == 0 or (applied_signals_count or 0) == 0:
             notes = (
                 f"{disclosures_prefix}Empirical evaluation under {engine_mode} engine over {optimized_metrics.elapsed_seconds:.1f}s elapsed "
                 f"(seed 42, {step_count} simulation steps). "
@@ -550,5 +584,6 @@ class ScenarioComparator:
             selected_fixed_time_plan=selected_fixed_time_plan,
             is_validated=is_validated,
             optimization_status=optimization_status,
+            experiment_manifest=experiment_manifest,
         )
 

@@ -132,6 +132,7 @@ class SimulationSession:
         self.selected_fixed_time_plan = selected_fixed_time_plan
         self.optimizer_validation_passed = optimizer_validation_passed
         self.optimizer_status = optimizer_status
+        self.experiment_manifest: Optional[dict[str, Any]] = None
         self.network_provenance = "synthetic_demo" if is_synthetic_demo else "real_osm"
 
         if not self.road_segments:
@@ -348,7 +349,8 @@ class SimulationSession:
         Genuine Queue-Responsive Actuated Adaptive Signal Control via TraCI.
         Evaluates real-time halting queues on incoming approaches for each green phase,
         extends green when queue is discharging (up to max_green),
-        and executes safe yellow clearance intervals (3.5s) before phase switches.
+        monitors downstream exit lane occupancy to prevent spillback gridlock,
+        and executes safe yellow and all-red clearance intervals before phase switches.
         """
         try:
             tl_ids = conn.trafficlight.getIDList()
@@ -372,6 +374,12 @@ class SimulationSession:
                     green_phase_indices = []
                     yellow_map: dict[int, int] = {}
                     green_lanes_map: dict[int, list[str]] = {}
+                    green_out_lanes_map: dict[int, list[str]] = {}
+
+                    all_red_phases = [
+                        p_idx for p_idx, p in enumerate(phases)
+                        if all(c.lower() in ("r", "s") for c in p.state)
+                    ]
 
                     for p_idx, p in enumerate(phases):
                         state_str = p.state
@@ -380,19 +388,24 @@ class SimulationSession:
                         if has_green and not has_yellow:
                             green_phase_indices.append(p_idx)
                             in_lanes = set()
+                            out_lanes = set()
                             for link_idx, link_tuples in enumerate(controlled_links):
                                 if link_idx < len(state_str) and state_str[link_idx] in ("G", "g"):
                                     for l_tup in link_tuples:
                                         if l_tup and len(l_tup) > 0:
                                             in_lanes.add(l_tup[0])
+                                            if len(l_tup) > 1 and l_tup[1]:
+                                                out_lanes.add(l_tup[1])
                             green_lanes_map[p_idx] = list(in_lanes)
+                            green_out_lanes_map[p_idx] = list(out_lanes)
 
+                    all_red_map: dict[int, Optional[int]] = {}
                     for g_idx in green_phase_indices:
                         # Use the next genuine clearance phase, never assume
                         # adjacent phase indices are yellow in every SUMO
-                        # program.  Conflicting movements remain red while a
+                        # program. Conflicting movements remain red while a
                         # direction is clearing.
-                        yellow_map[g_idx] = next(
+                        y_idx = next(
                             (
                                 (g_idx + offset) % len(phases)
                                 for offset in range(1, len(phases))
@@ -400,6 +413,20 @@ class SimulationSession:
                             ),
                             g_idx,
                         )
+                        yellow_map[g_idx] = y_idx
+                        # Look for an all-red phase immediately following yellow
+                        if all_red_phases and y_idx != g_idx:
+                            all_red_cand = next(
+                                (
+                                    (y_idx + offset) % len(phases)
+                                    for offset in range(1, len(phases))
+                                    if (y_idx + offset) % len(phases) in all_red_phases
+                                ),
+                                None,
+                            )
+                            all_red_map[g_idx] = all_red_cand
+                        else:
+                            all_red_map[g_idx] = None
 
                     current_p = conn.trafficlight.getPhase(tl_id)
                     curr_green = current_p if current_p in green_phase_indices else (green_phase_indices[0] if green_phase_indices else 0)
@@ -408,14 +435,19 @@ class SimulationSession:
                         "current_green_phase": curr_green,
                         "phase_start_time": current_time,
                         "is_yellow": False,
+                        "is_all_red": False,
                         "yellow_start": 0.0,
                         "yellow_duration": 3.5,
+                        "all_red_start": 0.0,
+                        "all_red_duration": 1.5,
                         "target_green_phase": curr_green,
                         "min_green": 10.0,
                         "max_green": 50.0,
                         "green_phases": green_phase_indices,
                         "yellow_map": yellow_map,
+                        "all_red_map": all_red_map,
                         "green_lanes": green_lanes_map,
+                        "green_out_lanes": green_out_lanes_map,
                     }
 
                 ctrl = self._signal_controllers[tl_id]
@@ -423,12 +455,31 @@ class SimulationSession:
                 if len(green_phases) < 2:
                     continue
 
-                if ctrl["is_yellow"]:
+                if ctrl.get("is_yellow"):
                     # In yellow clearance interval
                     if current_time - ctrl["yellow_start"] >= ctrl["yellow_duration"]:
+                        all_red_p = ctrl.get("all_red_map", {}).get(ctrl["current_green_phase"])
+                        if all_red_p is not None:
+                            conn.trafficlight.setPhase(tl_id, all_red_p)
+                            conn.trafficlight.setPhaseDuration(tl_id, ctrl.get("all_red_duration", 1.5))
+                            ctrl["is_yellow"] = False
+                            ctrl["is_all_red"] = True
+                            ctrl["all_red_start"] = current_time
+                        else:
+                            target_p = ctrl["target_green_phase"]
+                            conn.trafficlight.setPhase(tl_id, target_p)
+                            ctrl["is_yellow"] = False
+                            ctrl["is_all_red"] = False
+                            ctrl["current_green_phase"] = target_p
+                            ctrl["phase_start_time"] = current_time
+                    continue
+
+                if ctrl.get("is_all_red"):
+                    # In all-red clearance interval
+                    if current_time - ctrl["all_red_start"] >= ctrl.get("all_red_duration", 1.5):
                         target_p = ctrl["target_green_phase"]
                         conn.trafficlight.setPhase(tl_id, target_p)
-                        ctrl["is_yellow"] = False
+                        ctrl["is_all_red"] = False
                         ctrl["current_green_phase"] = target_p
                         ctrl["phase_start_time"] = current_time
                     continue
@@ -439,6 +490,17 @@ class SimulationSession:
 
                 if time_in_green < ctrl["min_green"]:
                     continue
+
+                # Check downstream exit lane saturation (spillback check)
+                out_lanes = ctrl.get("green_out_lanes", {}).get(current_green, [])
+                downstream_spillback = False
+                if out_lanes:
+                    try:
+                        avg_out_occ = sum(conn.lane.getLastStepOccupancy(l) for l in out_lanes) / len(out_lanes)
+                        if avg_out_occ >= 0.85:
+                            downstream_spillback = True
+                    except Exception:
+                        pass
 
                 # Evaluate queues on current green lanes vs competing green phases
                 curr_lanes = ctrl["green_lanes"].get(current_green, [])
@@ -461,7 +523,10 @@ class SimulationSession:
                         best_competing_phase = cand_p
 
                 should_switch = False
-                if best_competing_phase is not None and max_competing_demand >= 2.0:
+                if downstream_spillback and best_competing_phase is not None:
+                    # Spillback prevention: downstream exit lanes are backed up
+                    should_switch = True
+                elif best_competing_phase is not None and max_competing_demand >= 2.0:
                     if curr_queue <= 1:
                         should_switch = True
                     elif time_in_green >= ctrl["max_green"]:
@@ -472,6 +537,7 @@ class SimulationSession:
                     conn.trafficlight.setPhase(tl_id, yellow_p)
                     conn.trafficlight.setPhaseDuration(tl_id, ctrl["yellow_duration"])
                     ctrl["is_yellow"] = True
+                    ctrl["is_all_red"] = False
                     ctrl["yellow_start"] = current_time
                     ctrl["target_green_phase"] = best_competing_phase
         except Exception as e:
@@ -499,20 +565,21 @@ class SimulationSession:
 
         st = self._edge_cumulative_stats[edge_id]
         st["total_samples"] += 1
-        st["sum_speed_ms"] += sample["mean_speed_ms"]
-        st["min_speed_ms"] = min(st["min_speed_ms"], sample["mean_speed_ms"])
-        st["max_speed_ms"] = max(st["max_speed_ms"], sample["mean_speed_ms"])
         st["sum_occupancy_pct"] += sample["occupancy_pct"]
         st["peak_occupancy_pct"] = max(st["peak_occupancy_pct"], sample["occupancy_pct"])
         st["sum_halting"] += sample["halting_vehicles"]
         st["peak_halting"] = max(st["peak_halting"], float(sample["halting_vehicles"]))
         st["sum_waiting_s"] += sample["waiting_time_s"]
-        if sample.get("vehicle_count", 0) > 0:
-            st["observed_vehicle_samples"] += 1
         st["last_timestamp"] = sample["timestamp"]
 
-        if sample["halting_vehicles"] >= 2 or sample["occupancy_pct"] >= 40.0 or sample["mean_speed_ms"] < 3.0:
-            st["congested_samples"] += 1
+        veh_count = sample.get("vehicle_count", 0)
+        if veh_count > 0:
+            st["observed_vehicle_samples"] += 1
+            st["sum_speed_ms"] += sample["mean_speed_ms"]
+            st["min_speed_ms"] = min(st["min_speed_ms"], sample["mean_speed_ms"])
+            st["max_speed_ms"] = max(st["max_speed_ms"], sample["mean_speed_ms"])
+            if sample["halting_vehicles"] >= 2 or sample["occupancy_pct"] >= 40.0 or sample["mean_speed_ms"] < 3.0:
+                st["congested_samples"] += 1
 
     def _sample_edge_telemetry(self, conn):
         """Record per-edge speed, occupancy, and queue telemetry from TraCI on each step."""
@@ -1021,7 +1088,7 @@ class SimulationSession:
                 except Exception as e:
                     logger.debug("TraCI close note: %s", e)
                 self.is_connected = False
-            self.state = "ready" if self.state == "paused" else self.state
+            self.state = "stopped"
 
     def get_status(self) -> dict[str, Any]:
         """Return the current complete session state."""
@@ -1183,33 +1250,50 @@ class SimulationSession:
                 length_factor = min(1.2, max(0.8, length_m / 150.0))
 
                 if cum_total_samples > 0:
-                    avg_spd = round((cum_sum_speed_ms / cum_total_samples) * 3.6, 1)
+                    veh_samples = sum(
+                        self._edge_cumulative_stats[eid].get(
+                            "observed_vehicle_samples", self._edge_cumulative_stats[eid]["total_samples"]
+                        )
+                        for eid in edge_ids if eid in self._edge_cumulative_stats
+                    )
+                    if veh_samples > 0:
+                        avg_spd = round((cum_sum_speed_ms / veh_samples) * 3.6, 1)
+                        min_spd = round(cum_min_speed_ms * 3.6, 1) if cum_min_speed_ms != float("inf") else round(avg_spd * 0.8, 1)
+                    else:
+                        avg_spd = ref_speed_kmh
+                        min_spd = ref_speed_kmh
+
                     occ = round(cum_sum_occupancy / cum_total_samples, 1)
                     halt = round(cum_sum_halting / cum_total_samples, 1)
                     avg_wait = round(cum_sum_waiting / cum_total_samples, 1)
-                    min_spd = round(cum_min_speed_ms * 3.6, 1) if cum_min_speed_ms != float("inf") else round(avg_spd * 0.8, 1)
                     peak_occ = round(cum_peak_occupancy, 1)
                     peak_halt = round(cum_peak_halting, 1)
                     samp_cnt = cum_total_samples
                 elif combined_samples:
-                    speeds_ms = [s["mean_speed_ms"] for s in combined_samples]
+                    veh_combined = [s for s in combined_samples if s.get("vehicle_count", 0) > 0]
+                    if veh_combined:
+                        speeds_ms = [s["mean_speed_ms"] for s in veh_combined]
+                        avg_spd = round((sum(speeds_ms) / len(speeds_ms)) * 3.6, 1)
+                        min_spd = round(min(speeds_ms) * 3.6, 1)
+                    else:
+                        avg_spd = ref_speed_kmh
+                        min_spd = ref_speed_kmh
+
                     occupancies = [s["occupancy_pct"] for s in combined_samples]
                     haltings = [s["halting_vehicles"] for s in combined_samples]
                     waitings = [s["waiting_time_s"] for s in combined_samples]
-                    avg_spd = round((sum(speeds_ms) / len(speeds_ms)) * 3.6, 1)
                     occ = round(sum(occupancies) / len(occupancies), 1)
                     halt = round(sum(haltings) / len(haltings), 1)
                     avg_wait = round(sum(waitings) / len(waitings), 1)
-                    min_spd = round(min(speeds_ms) * 3.6, 1)
                     peak_occ = round(max(occupancies), 1)
                     peak_halt = round(max(haltings), 1)
                     samp_cnt = len(combined_samples)
                 else:
-                    base_spd = max(10.0, (28.0 if is_opt else 19.5) * road_factor * (1.0 - seg_hash * 0.25))
+                    base_spd = max(10.0, 22.0 * road_factor * (1.0 - seg_hash * 0.25))
                     avg_spd = round(min(ref_speed_kmh, base_spd), 1)
-                    occ = round(min(90.0, (22.0 if is_opt else 45.0) * length_factor + seg_hash * 12), 1)
-                    halt = round(max(0.0, (1.2 if is_opt else 3.8) * length_factor + (seg_hash - 0.1) * 3), 1)
-                    avg_wait = round(18.0 if is_opt else 42.0, 1)
+                    occ = round(min(90.0, 32.0 * length_factor + seg_hash * 12), 1)
+                    halt = round(max(0.0, 2.5 * length_factor + (seg_hash - 0.1) * 3), 1)
+                    avg_wait = round(30.0, 1)
                     min_spd = round(avg_spd * 0.8, 1)
                     peak_occ = round(occ * 1.3, 1)
                     peak_halt = round(halt * 1.5, 1)
@@ -1245,7 +1329,7 @@ class SimulationSession:
                     avg_waiting_s=avg_wait,
                     congestion_score=score,
                     severity=sev,
-                    congested_duration_s=round(self.elapsed_seconds * (0.15 if self.strategy == "actuated_adaptive" else 0.4), 1) if score > 0.4 else 0.0,
+                    congested_duration_s=round(self.elapsed_seconds * 0.25, 1) if score > 0.4 else 0.0,
                     congested_pct=round(score * 100, 1) if score > 0.4 else 0.0,
                     sample_count=max(self.step_count, samp_cnt),
                     data_quality=quality,
@@ -1314,18 +1398,26 @@ class SimulationSession:
                 if eid in self._edge_cumulative_stats and self._edge_cumulative_stats[eid]["total_samples"] > 0:
                     cst = self._edge_cumulative_stats[eid]
                     n = cst["total_samples"]
+                    veh_n = cst.get("observed_vehicle_samples") if cst.get("observed_vehicle_samples") is not None else n
+                    if veh_n > 0:
+                        edge_mean_spd = cst["sum_speed_ms"] / veh_n
+                        edge_min_spd = cst["min_speed_ms"]
+                    else:
+                        edge_mean_spd = ref_speed_ms
+                        edge_min_spd = ref_speed_ms
+
                     edge_stats.append({
                         "edge_id": eid,
                         "samples": n,
-                        "mean_speed_ms": cst["sum_speed_ms"] / n,
-                        "min_speed_ms": cst["min_speed_ms"],
+                        "mean_speed_ms": edge_mean_spd,
+                        "min_speed_ms": edge_min_spd,
                         "mean_occupancy": cst["sum_occupancy_pct"] / n,
                         "peak_occupancy": cst["peak_occupancy_pct"],
                         "mean_halting": cst["sum_halting"] / n,
                         "peak_halting": cst["peak_halting"],
                         "mean_waiting": cst["sum_waiting_s"] / n,
                         "congested_samples": cst["congested_samples"],
-                        "observed_vehicle_samples": cst.get("observed_vehicle_samples", n),
+                        "observed_vehicle_samples": veh_n,
                     })
 
             if edge_stats:
@@ -1356,29 +1448,37 @@ class SimulationSession:
                 edge_stats = []
 
                 for eid, samples in edge_groups.items():
-                    s_speeds = [s["mean_speed_ms"] for s in samples]
+                    veh_samples_in_group = [s for s in samples if s.get("vehicle_count", 0) > 0]
+                    if veh_samples_in_group:
+                        s_speeds = [s["mean_speed_ms"] for s in veh_samples_in_group]
+                        e_mean_spd = sum(s_speeds) / len(s_speeds)
+                        e_min_spd = min(s_speeds)
+                    else:
+                        e_mean_spd = ref_speed_ms
+                        e_min_spd = ref_speed_ms
+
                     s_occ = [s["occupancy_pct"] for s in samples]
                     s_halt = [s["halting_vehicles"] for s in samples]
                     s_wait = [s["waiting_time_s"] for s in samples]
-                    edge_means_speed.append(sum(s_speeds) / len(s_speeds))
+                    edge_means_speed.append(e_mean_spd)
                     edge_means_occ.append(sum(s_occ) / len(s_occ))
                     edge_means_halt.append(sum(s_halt) / len(s_halt))
                     edge_means_wait.append(sum(s_wait) / len(s_wait))
-                    all_mins.append(min(s_speeds))
+                    all_mins.append(e_min_spd)
                     all_peak_occ.append(max(s_occ))
                     all_peak_halt.append(max(s_halt))
                     edge_stats.append({
                         "edge_id": eid,
                         "samples": len(samples),
-                        "mean_speed_ms": sum(s_speeds) / len(s_speeds),
-                        "min_speed_ms": min(s_speeds),
+                        "mean_speed_ms": e_mean_spd,
+                        "min_speed_ms": e_min_spd,
                         "mean_occupancy": sum(s_occ) / len(s_occ),
                         "peak_occupancy": max(s_occ),
                         "mean_halting": sum(s_halt) / len(s_halt),
                         "peak_halting": max(s_halt),
                         "mean_waiting": sum(s_wait) / len(s_wait),
-                        "congested_samples": sum(1 for s in samples if s["halting_vehicles"] >= 2 or s["occupancy_pct"] >= 40.0 or s["mean_speed_ms"] < 3.0),
-                        "observed_vehicle_samples": sum(1 for s in samples if s.get("vehicle_count", 0) > 0),
+                        "congested_samples": sum(1 for s in samples if s.get("vehicle_count", 0) > 0 and (s["halting_vehicles"] >= 2 or s["occupancy_pct"] >= 40.0 or s["mean_speed_ms"] < 3.0)),
+                        "observed_vehicle_samples": len(veh_samples_in_group),
                     })
 
                 avg_speed_ms = sum(edge_means_speed) / len(edge_means_speed) if edge_means_speed else 0.0

@@ -6,6 +6,7 @@ to guarantee honest, empirical comparative analytics without synthesized metrics
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import shutil
 import tempfile
@@ -31,6 +32,7 @@ from app.models.schemas import (
     TimingPlanEvaluation,
 )
 from app.services.analysis import get_analysis_by_id
+from app.simulation.manifest import create_experiment_manifest
 from app.simulation.network_builder import SumoNetworkBuilder, find_sumo_binary
 from app.simulation.signal_candidates import generate_signal_candidates
 from app.simulation.scenario_comparator import ScenarioComparator
@@ -57,7 +59,13 @@ class SimulationService:
         Deduplicates concurrent in-flight prepare requests to avoid redundant builds and simulations.
         """
         approved_cands_key = tuple(sorted(req.approved_candidate_ids or []))
-        prep_key = f"{req.analysis_id}:{req.duration_seconds}:{req.demand_level}:{req.demand_profile}:{req.manual_vehicle_count}:{req.seed}:{approved_cands_key}"
+        veh_types_key = tuple(sorted(req.vehicle_types or []))
+        raw_key = (
+            f"{req.analysis_id}|{req.duration_seconds}|{req.demand_level}|{req.demand_profile}|"
+            f"{req.manual_vehicle_count}|{req.initial_population}|{req.demand_rate_veh_hr}|"
+            f"{req.seed}|{req.strategy}|{veh_types_key}|{approved_cands_key}"
+        )
+        prep_key = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
 
         if prep_key in self._in_flight_prepares:
             logger.info("Awaiting in-flight duplicate prepare request for %s", prep_key)
@@ -73,209 +81,241 @@ class SimulationService:
     async def _do_prepare(self, req: SimulationPrepareRequest) -> SimulationStatusResponse:
         sim_id = str(uuid.uuid4())
         work_dir = self._base_work_dir / sim_id
-        opt_dir = work_dir / "optimized"
-        base_dir = work_dir / "baseline"
-        opt_dir.mkdir(parents=True, exist_ok=True)
-        base_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            opt_dir = work_dir / "optimized"
+            base_dir = work_dir / "baseline"
+            opt_dir.mkdir(parents=True, exist_ok=True)
+            base_dir.mkdir(parents=True, exist_ok=True)
 
-        is_demo = getattr(req, "is_synthetic_demo", False)
+            is_demo = getattr(req, "is_synthetic_demo", False)
 
-        # Retrieve analysis details if available
-        analysis = await get_analysis_by_id(req.analysis_id)
-        if not analysis and not is_demo:
-            raise KeyError(f"Analysis '{req.analysis_id}' not found. Cannot prepare real-area simulation.")
+            # Retrieve analysis details if available
+            analysis = await get_analysis_by_id(req.analysis_id)
+            if not analysis and not is_demo:
+                raise KeyError(f"Analysis '{req.analysis_id}' not found. Cannot prepare real-area simulation.")
 
-        segments_dict = []
-        polygon_coords = []
-        if analysis:
-            if analysis.segments:
-                segments_dict = [s.model_dump() for s in analysis.segments]
-            if analysis.polygon and analysis.polygon.coordinates:
-                polygon_coords = analysis.polygon.coordinates[0]
+            segments_dict = []
+            polygon_coords = []
+            if analysis:
+                if analysis.segments:
+                    segments_dict = [s.model_dump() for s in analysis.segments]
+                if analysis.polygon and analysis.polygon.coordinates:
+                    polygon_coords = analysis.polygon.coordinates[0]
 
-        if not segments_dict and not is_demo:
-            raise ValueError(f"Analysis '{req.analysis_id}' contains no road network segments for simulation.")
+            if not segments_dict and not is_demo:
+                raise ValueError(f"Analysis '{req.analysis_id}' contains no road network segments for simulation.")
 
-        # Retrieve approved signal candidates (from request or persisted SQLite storage)
-        approved_candidate_ids: set[str] = set()
-        if req.approved_candidate_ids is not None:
-            approved_candidate_ids = set(req.approved_candidate_ids)
-        elif analysis:
-            persisted_decisions = get_candidate_decisions_sync(req.analysis_id)
-            approved_candidate_ids = {cid for cid, st in persisted_decisions.items() if st == "approved"}
+            # Retrieve approved signal candidates (from request or persisted SQLite storage)
+            approved_candidate_ids: set[str] = set()
+            if req.approved_candidate_ids is not None:
+                approved_candidate_ids = set(req.approved_candidate_ids)
+            elif analysis:
+                persisted_decisions = get_candidate_decisions_sync(req.analysis_id)
+                approved_candidate_ids = {cid for cid, st in persisted_decisions.items() if st == "approved"}
 
-        # Decisions made before the shortlist policy may refer to weak or
-        # clustered junctions.  Only currently screened candidates can alter a
-        # simulation network.
-        if analysis:
-            valid_candidate_ids = {candidate.candidate_id for candidate in generate_signal_candidates(analysis)}
-            approved_candidate_ids.intersection_update(valid_candidate_ids)
+            # Decisions made before the shortlist policy may refer to weak or
+            # clustered junctions.  Only currently screened candidates can alter a
+            # simulation network.
+            if analysis:
+                valid_candidate_ids = {candidate.candidate_id for candidate in generate_signal_candidates(analysis)}
+                approved_candidate_ids.intersection_update(valid_candidate_ids)
 
-        seed = req.seed or 42
-        # The custom count is a controlled initial-population experiment.  It
-        # must not be reduced by the automatic initial-demand share.
-        initial_population = req.manual_vehicle_count if req.manual_vehicle_count is not None else req.initial_population
+            seed = req.seed if req.seed is not None else 42
+            # The custom count is a controlled initial-population experiment.  It
+            # must not be reduced by the automatic initial-demand share.
+            initial_population = req.manual_vehicle_count if req.manual_vehicle_count is not None else req.initial_population
 
-        # 1. Build SUMO network files for Baseline Scenario (Preserves original network controls; no approved signals)
-        builder_base = SumoNetworkBuilder(base_dir)
-        build_meta_base = builder_base.build(
-            segments=segments_dict,
-            duration_seconds=req.duration_seconds,
-            demand_rate_veh_hr=req.demand_rate_veh_hr,
-            seed=seed,
-            polygon_coords=polygon_coords,
-            demand_level=req.demand_level or "normal",
-            demand_profile=req.demand_profile or "peak",
-            vehicle_types=req.vehicle_types,
-            manual_vehicle_count=req.manual_vehicle_count,
-            allow_synthetic=is_demo,
-            approved_signal_junctions=None,
-            initial_population=initial_population,
-        )
+            # 1. Build SUMO network files for Baseline Scenario (Preserves original network controls; no approved signals)
+            builder_base = SumoNetworkBuilder(base_dir)
+            build_meta_base = builder_base.build(
+                segments=segments_dict,
+                duration_seconds=req.duration_seconds,
+                demand_rate_veh_hr=req.demand_rate_veh_hr,
+                seed=seed,
+                polygon_coords=polygon_coords,
+                demand_level=req.demand_level or "normal",
+                demand_profile=req.demand_profile or "peak",
+                vehicle_types=req.vehicle_types,
+                manual_vehicle_count=req.manual_vehicle_count,
+                allow_synthetic=is_demo,
+                approved_signal_junctions=None,
+                initial_population=initial_population,
+            )
 
-        # 2. Build SUMO network files for Optimized Scenario (Compiles user-approved candidate junctions as traffic lights)
-        builder_opt = SumoNetworkBuilder(opt_dir)
-        build_meta_opt = builder_opt.build(
-            segments=segments_dict,
-            duration_seconds=req.duration_seconds,
-            demand_rate_veh_hr=req.demand_rate_veh_hr,
-            seed=seed,
-            polygon_coords=polygon_coords,
-            demand_level=req.demand_level or "normal",
-            demand_profile=req.demand_profile or "peak",
-            vehicle_types=req.vehicle_types,
-            manual_vehicle_count=req.manual_vehicle_count,
-            allow_synthetic=is_demo,
-            approved_signal_junctions=approved_candidate_ids,
-            initial_population=initial_population,
-        )
+            # 2. Build SUMO network files for Optimized Scenario (Compiles user-approved candidate junctions as traffic lights)
+            builder_opt = SumoNetworkBuilder(opt_dir)
+            build_meta_opt = builder_opt.build(
+                segments=segments_dict,
+                duration_seconds=req.duration_seconds,
+                demand_rate_veh_hr=req.demand_rate_veh_hr,
+                seed=seed,
+                polygon_coords=polygon_coords,
+                demand_level=req.demand_level or "normal",
+                demand_profile=req.demand_profile or "peak",
+                vehicle_types=req.vehicle_types,
+                manual_vehicle_count=req.manual_vehicle_count,
+                allow_synthetic=is_demo,
+                approved_signal_junctions=approved_candidate_ids,
+                initial_population=initial_population,
+            )
 
-        # Guarantee 100% Demand Parity: Both scenarios execute the EXACT same routes and initial vehicles
-        shutil.copy2(build_meta_opt["rou_file"], base_dir / "routes.rou.xml")
+            # Guarantee 100% Demand Parity: Both scenarios execute the EXACT same routes and initial vehicles
+            shutil.copy2(build_meta_opt["rou_file"], base_dir / "routes.rou.xml")
 
-        # 3. Evaluate & Optimize Fixed-Time Signal Plan on Optimized Scenario
-        selected_plan: Optional[TimingPlanEvaluation] = None
-        applied_signals_count = build_meta_opt["signal_count"]
-        optimizer_validation_passed: bool = False
-        optimizer_status: str = "none"
+            # 3. Evaluate & Optimize Fixed-Time Signal Plan on Optimized Scenario
+            selected_plan: Optional[TimingPlanEvaluation] = None
+            applied_signals_count = build_meta_opt["signal_count"]
+            optimizer_validation_passed: bool = False
+            optimizer_status: str = "none"
 
-        if applied_signals_count > 0:
-            try:
-                optimizer = FixedTimeSignalOptimizer(opt_dir)
-                opt_result = optimizer.optimize(
-                    net_file=Path(build_meta_opt["net_file"]),
-                    rou_file=Path(build_meta_opt["rou_file"]),
-                    cfg_file=Path(build_meta_opt["cfg_file"]),
-                    eval_duration=min(45, req.duration_seconds),
-                    seed=seed,
-                    target_signal_ids=approved_candidate_ids if approved_candidate_ids else None,
-                )
-                if opt_result:
-                    optimizer_validation_passed = bool(opt_result.validation_passed)
-                    optimizer_status = str(opt_result.status)
-                    if opt_result.evaluated_plans:
-                        for ep in opt_result.evaluated_plans:
-                            if ep.is_selected:
-                                selected_plan = ep
-                                break
-                    logger.info(
-                        "Fixed-time signal optimization complete: selected %s (validation_passed=%s, status=%s)",
-                        opt_result.selected_plan_id,
-                        opt_result.validation_passed,
-                        opt_result.status,
+            if applied_signals_count > 0:
+                try:
+                    optimizer = FixedTimeSignalOptimizer(opt_dir)
+                    opt_result = optimizer.optimize(
+                        net_file=Path(build_meta_opt["net_file"]),
+                        rou_file=Path(build_meta_opt["rou_file"]),
+                        cfg_file=Path(build_meta_opt["cfg_file"]),
+                        eval_duration=min(45, req.duration_seconds),
+                        seed=seed,
+                        target_signal_ids=approved_candidate_ids if approved_candidate_ids else None,
                     )
-            except Exception as e:
-                logger.warning("Fixed-time signal optimization note: %s", e)
+                    if opt_result:
+                        optimizer_validation_passed = bool(opt_result.validation_passed)
+                        optimizer_status = str(opt_result.status)
+                        if opt_result.evaluated_plans:
+                            for ep in opt_result.evaluated_plans:
+                                if ep.is_selected:
+                                    selected_plan = ep
+                                    break
+                        logger.info(
+                            "Fixed-time signal optimization complete: selected %s (validation_passed=%s, status=%s)",
+                            opt_result.selected_plan_id,
+                            opt_result.validation_passed,
+                            opt_result.status,
+                        )
+                except Exception as e:
+                    logger.warning("Fixed-time signal optimization note: %s", e)
 
-        # Honest Strategy Labels
-        baseline_strat = (
-            "Baseline (Original Controls - Unsignalized Priority)"
-            if build_meta_base["signal_count"] == 0
-            else "Baseline (Original Signal Timing)"
-        )
-        if applied_signals_count > 0:
-            if selected_plan and getattr(selected_plan, "validation_passed", False):
-                plan_name = selected_plan.name
-                optimized_strat = f"Optimized ({plan_name})"
+            # Honest Strategy Labels
+            baseline_strat = (
+                "Baseline (Original Controls - Unsignalized Priority)"
+                if build_meta_base["signal_count"] == 0
+                else "Baseline (Original Signal Timing)"
+            )
+            if applied_signals_count > 0:
+                if selected_plan and getattr(selected_plan, "validation_passed", False):
+                    plan_name = selected_plan.name
+                    optimized_strat = f"Optimized ({plan_name})"
+                else:
+                    optimized_strat = f"Intervention ({applied_signals_count} Signals Applied - Baseline Timing Preserved)"
             else:
-                optimized_strat = f"Intervention ({applied_signals_count} Signals Applied - Baseline Timing Preserved)"
-        else:
-            optimized_strat = "Intervention (No Signals Approved)"
+                optimized_strat = "Intervention (No Signals Approved)"
 
-        # 1. Primary/Optimized Session (rendered on frontend map)
-        opt_session = SimulationSession(
-            sim_id=sim_id,
-            analysis_id=req.analysis_id,
-            work_dir=opt_dir,
-            cfg_file=Path(build_meta_opt["cfg_file"]),
-            duration_seconds=req.duration_seconds,
-            demand_rate_veh_hr=build_meta_opt["demand_rate_veh_hr"],
-            strategy=optimized_strat,
-            edge_count=build_meta_opt["edge_count"],
-            junction_count=build_meta_opt["junction_count"],
-            signal_count=applied_signals_count,
-            road_segments=segments_dict,
-            netconvert_used=build_meta_opt["netconvert_used"],
-            polygon_coords=polygon_coords,
-            demand_level=build_meta_opt.get("demand_level", "normal"),
-            demand_profile=build_meta_opt.get("demand_profile", "peak"),
-            demand_data_source=build_meta_opt.get("demand_data_source", "road_network_estimation"),
-            demand_source_label=build_meta_opt.get("demand_source_label"),
-            scheduled_vehicles=build_meta_opt.get("scheduled_vehicles", 0),
-            is_synthetic_demo=is_demo,
-            assumptions=build_meta_opt.get("assumptions", []),
-            omitted_segments_count=build_meta_opt.get("omitted_segments_count", 0),
-            initial_vehicles_count=build_meta_opt.get("initial_vehicles_count", 0),
-            approved_signals_count=len(approved_candidate_ids),
-            applied_signals_count=applied_signals_count,
-            selected_fixed_time_plan=selected_plan,
-            optimizer_validation_passed=optimizer_validation_passed,
-            optimizer_status=optimizer_status,
-        )
-        opt_session._segment_edge_map = build_meta_opt.get("segment_edge_map", {})
-        opt_session._edge_segment_map = build_meta_opt.get("edge_segment_map", {})
+            # 1. Primary/Optimized Session (rendered on frontend map)
+            opt_session = SimulationSession(
+                sim_id=sim_id,
+                analysis_id=req.analysis_id,
+                work_dir=opt_dir,
+                cfg_file=Path(build_meta_opt["cfg_file"]),
+                duration_seconds=req.duration_seconds,
+                demand_rate_veh_hr=build_meta_opt["demand_rate_veh_hr"],
+                strategy=optimized_strat,
+                edge_count=build_meta_opt["edge_count"],
+                junction_count=build_meta_opt["junction_count"],
+                signal_count=applied_signals_count,
+                road_segments=segments_dict,
+                netconvert_used=build_meta_opt["netconvert_used"],
+                polygon_coords=polygon_coords,
+                demand_level=build_meta_opt.get("demand_level", "normal"),
+                demand_profile=build_meta_opt.get("demand_profile", "peak"),
+                demand_data_source=build_meta_opt.get("demand_data_source", "road_network_estimation"),
+                demand_source_label=build_meta_opt.get("demand_source_label"),
+                scheduled_vehicles=build_meta_opt.get("scheduled_vehicles", 0),
+                is_synthetic_demo=is_demo,
+                assumptions=build_meta_opt.get("assumptions", []),
+                omitted_segments_count=build_meta_opt.get("omitted_segments_count", 0),
+                initial_vehicles_count=build_meta_opt.get("initial_vehicles_count", 0),
+                approved_signals_count=len(approved_candidate_ids),
+                applied_signals_count=applied_signals_count,
+                selected_fixed_time_plan=selected_plan,
+                optimizer_validation_passed=optimizer_validation_passed,
+                optimizer_status=optimizer_status,
+            )
+            opt_session._segment_edge_map = build_meta_opt.get("segment_edge_map", {})
+            opt_session._edge_segment_map = build_meta_opt.get("edge_segment_map", {})
 
-        # 2. Baseline Session (Fixed-time uncoordinated control on original topology)
-        base_session = SimulationSession(
-            sim_id=f"base_{sim_id}",
-            analysis_id=req.analysis_id,
-            work_dir=base_dir,
-            cfg_file=Path(build_meta_base["cfg_file"]),
-            duration_seconds=req.duration_seconds,
-            demand_rate_veh_hr=build_meta_base["demand_rate_veh_hr"],
-            strategy=baseline_strat,
-            edge_count=build_meta_base["edge_count"],
-            junction_count=build_meta_base["junction_count"],
-            signal_count=build_meta_base["signal_count"],
-            road_segments=segments_dict,
-            netconvert_used=build_meta_base["netconvert_used"],
-            polygon_coords=polygon_coords,
-            demand_level=build_meta_base.get("demand_level", "normal"),
-            demand_profile=build_meta_base.get("demand_profile", "peak"),
-            demand_data_source=build_meta_base.get("demand_data_source", "road_network_estimation"),
-            demand_source_label=build_meta_base.get("demand_source_label"),
-            scheduled_vehicles=build_meta_base.get("scheduled_vehicles", 0),
-            is_synthetic_demo=is_demo,
-            assumptions=build_meta_base.get("assumptions", []),
-            omitted_segments_count=build_meta_base.get("omitted_segments_count", 0),
-            initial_vehicles_count=build_meta_base.get("initial_vehicles_count", 0),
-            approved_signals_count=0,
-            applied_signals_count=build_meta_base["signal_count"],
-            selected_fixed_time_plan=None,
-        )
-        base_session._segment_edge_map = build_meta_base.get("segment_edge_map", {})
-        base_session._edge_segment_map = build_meta_base.get("edge_segment_map", {})
+            # 2. Baseline Session (Fixed-time uncoordinated control on original topology)
+            base_session = SimulationSession(
+                sim_id=f"base_{sim_id}",
+                analysis_id=req.analysis_id,
+                work_dir=base_dir,
+                cfg_file=Path(build_meta_base["cfg_file"]),
+                duration_seconds=req.duration_seconds,
+                demand_rate_veh_hr=build_meta_base["demand_rate_veh_hr"],
+                strategy=baseline_strat,
+                edge_count=build_meta_base["edge_count"],
+                junction_count=build_meta_base["junction_count"],
+                signal_count=build_meta_base["signal_count"],
+                road_segments=segments_dict,
+                netconvert_used=build_meta_base["netconvert_used"],
+                polygon_coords=polygon_coords,
+                demand_level=build_meta_base.get("demand_level", "normal"),
+                demand_profile=build_meta_base.get("demand_profile", "peak"),
+                demand_data_source=build_meta_base.get("demand_data_source", "road_network_estimation"),
+                demand_source_label=build_meta_base.get("demand_source_label"),
+                scheduled_vehicles=build_meta_base.get("scheduled_vehicles", 0),
+                is_synthetic_demo=is_demo,
+                assumptions=build_meta_base.get("assumptions", []),
+                omitted_segments_count=build_meta_base.get("omitted_segments_count", 0),
+                initial_vehicles_count=build_meta_base.get("initial_vehicles_count", 0),
+                approved_signals_count=0,
+                applied_signals_count=build_meta_base["signal_count"],
+                selected_fixed_time_plan=None,
+            )
+            base_session._segment_edge_map = build_meta_base.get("segment_edge_map", {})
+            base_session._edge_segment_map = build_meta_base.get("edge_segment_map", {})
 
-        self._sessions[sim_id] = opt_session
-        self._baseline_sessions[sim_id] = base_session
+            # 3. Create reproducible experiment manifest verifying demand and network parity
+            manifest = create_experiment_manifest(
+                sim_id=sim_id,
+                analysis_id=req.analysis_id,
+                duration_seconds=req.duration_seconds,
+                seed=seed,
+                demand_rate_veh_hr=build_meta_opt["demand_rate_veh_hr"],
+                demand_level=build_meta_opt.get("demand_level", "normal"),
+                demand_profile=build_meta_opt.get("demand_profile", "peak"),
+                scheduled_vehicles=build_meta_opt.get("scheduled_vehicles", 0),
+                initial_vehicles=build_meta_opt.get("initial_vehicles_count", 0),
+                base_dir=base_dir,
+                opt_dir=opt_dir,
+                base_engine_mode=base_session.engine_mode,
+                opt_engine_mode=opt_session.engine_mode,
+                base_strategy=base_session.strategy,
+                opt_strategy=opt_session.strategy,
+                base_signal_count=base_session.signal_count,
+                opt_signal_count=opt_session.signal_count,
+                applied_signals_count=applied_signals_count,
+                approved_signals=list(approved_candidate_ids),
+                vehicle_types=req.vehicle_types,
+                step_length=0.2,
+            )
+            manifest_dict = manifest.model_dump()
+            opt_session.experiment_manifest = manifest_dict
+            base_session.experiment_manifest = manifest_dict
 
-        logger.info(
-            "Prepared paired SUMO simulation %s (mode=%s) for analysis %s",
-            sim_id,
-            opt_session.engine_mode,
-            req.analysis_id,
-        )
-        return SimulationStatusResponse(**opt_session.get_status())
+            self._sessions[sim_id] = opt_session
+            self._baseline_sessions[sim_id] = base_session
+
+            logger.info(
+                "Prepared paired SUMO simulation %s (mode=%s) for analysis %s",
+                sim_id,
+                opt_session.engine_mode,
+                req.analysis_id,
+            )
+            return SimulationStatusResponse(**opt_session.get_status())
+        except Exception:
+            shutil.rmtree(work_dir, ignore_errors=True)
+            raise
 
     def get_session(self, sim_id: str) -> Optional[SimulationSession]:
         return self._sessions.get(sim_id)
@@ -377,6 +417,7 @@ class SimulationService:
             baseline_engine_transitioned=getattr(base_session, "engine_transitioned", False) if base_session else False,
             optimizer_validation_passed=getattr(session, "optimizer_validation_passed", None),
             optimizer_status=getattr(session, "optimizer_status", None),
+            experiment_manifest=getattr(session, "experiment_manifest", None),
         )
 
     def get_congestion_summary(self, sim_id: str) -> CongestionSummary:

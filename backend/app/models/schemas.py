@@ -284,6 +284,7 @@ SimulationState = Literal[
     "completed",
     "failed",
     "cancelled",
+    "stopped",
 ]
 SignalStrategy = Literal["fixed_time", "actuated_adaptive"]
 SimulationEngineMode = Literal["native_sumo", "fallback", "unavailable"]
@@ -433,6 +434,7 @@ class ScenarioComparisonResult(BaseModel):
     selected_fixed_time_plan: Optional[Any] = None
     is_validated: Optional[bool] = False
     optimization_status: Optional[str] = None
+    experiment_manifest: Optional[dict[str, Any]] = None
 
 
 # ─── Traffic Signal Candidates & User Approval ────────────────────────────────

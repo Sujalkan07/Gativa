@@ -612,6 +612,7 @@ class FixedTimeSignalOptimizer:
         # Parse tripinfo output (completed trips + unfinished trips)
         waits: list[float] = []
         speeds: list[float] = []
+        travel_times: list[float] = []
         completed_count = 0
         unfinished_count = 0
 
@@ -624,6 +625,8 @@ class FixedTimeSignalOptimizer:
                     d = float(trip.get("routeLength", "0.0"))
                     dur = float(trip.get("duration", "0.0"))
                     waits.append(w)
+                    if dur > 0.0:
+                        travel_times.append(dur)
                     if dur > 0.0 and d > 0.0:
                         speeds.append((d / dur) * 3.6)
                     completed_count += 1
@@ -646,6 +649,7 @@ class FixedTimeSignalOptimizer:
         # Compute valid metrics
         avg_wait = round(sum(waits) / len(waits), 1) if waits else (round(sum_mean_wait, 1) if sum_mean_wait is not None else 0.0)
         avg_speed = round(sum(speeds) / len(speeds), 1) if speeds else (round(sum_mean_speed, 1) if sum_mean_speed is not None else 25.0)
+        avg_travel_time = round(sum(travel_times) / len(travel_times), 1) if travel_times else 0.0
         throughput = round((completed_count / max(1.0, float(eval_duration))) * 3600.0, 1)
 
         # Measured queue statistics across the entire measurement run:
@@ -653,12 +657,21 @@ class FixedTimeSignalOptimizer:
         max_halting_count = max(haltings) if haltings else halting
         # Time-integrated mean halting vehicles observed across all simulation steps
         mean_halting_count = (sum(haltings) / len(haltings)) if haltings else float(halting)
+        # 95th-percentile halting queue
+        if haltings:
+            sorted_halt = sorted(haltings)
+            p95_idx = int(math.ceil(0.95 * len(sorted_halt))) - 1
+            p95_halting_count = sorted_halt[max(0, min(p95_idx, len(sorted_halt) - 1))]
+        else:
+            p95_halting_count = halting
+
         # Standard SUMO queuing spatial extent (7.5m = 5m vehicle + 2.5m minGap)
         queue_burden = round(mean_halting_count * 7.5, 1)
         max_queue = round(max_halting_count * 7.5, 1)
+        p95_queue = round(p95_halting_count * 7.5, 1)
 
         # Validate numbers are finite
-        for v in (avg_wait, avg_speed, throughput, queue_burden, max_queue):
+        for v in (avg_wait, avg_speed, throughput, queue_burden, max_queue, p95_queue, avg_travel_time):
             if not math.isfinite(v):
                 result["evaluation_status"] = "failed"
                 result["diagnostics"] = "Non-finite metric produced by simulation"
@@ -680,9 +693,11 @@ class FixedTimeSignalOptimizer:
             "diagnostics": None,
             "avg_wait": avg_wait,
             "avg_speed": avg_speed,
+            "avg_travel_time": avg_travel_time,
             "throughput": throughput,
             "queue_burden": queue_burden,
             "max_queue": max_queue,
+            "p95_queue": p95_queue,
             "completed_vehicles": completed_count,
             "unfinished_vehicles": unfinished_count,
             "inserted_vehicles": max(inserted, total_observed),
@@ -702,6 +717,7 @@ class FixedTimeSignalOptimizer:
         seed: int = 42,
         target_signal_ids: Optional[set[str]] = None,
         max_signals_to_optimize: int = 6,
+        validation_seeds: Optional[list[int]] = None,
     ) -> Optional[FixedTimeOptimizationResult]:
         """
         Execute bounded candidate fixed-time evaluations and select the optimal plan.
@@ -920,30 +936,52 @@ class FixedTimeSignalOptimizer:
             }
             self.write_additional_signals_xml(final_add_file, multi_signal_dict)
 
-            # Run network-level validation of combined plan
-            net_eval = self._run_sumo_eval(
-                net_file=net_file,
-                rou_file=rou_file,
-                add_file=final_add_file,
-                eval_duration=eval_duration,
-                seed=seed,
-                run_label="combined_network_validation",
-            )
+            # Run network-level validation of combined plan across validation seeds
+            val_seeds = validation_seeds if validation_seeds else [seed]
+            net_evals = []
+            base_evals = [base_net_eval]
 
-            is_net_validated = (
-                base_net_eval["evaluation_status"] == "success"
-                and math.isfinite(baseline_score)
-                and net_eval["evaluation_status"] == "success"
-                and math.isfinite(net_eval["score"])
-                and net_eval["score"] <= (baseline_score + 0.5)  # Must not significantly regress network
-            )
+            for vs in val_seeds:
+                if vs != seed:
+                    b_eval = self._run_sumo_eval(
+                        net_file=net_file,
+                        rou_file=rou_file,
+                        add_file=None,
+                        eval_duration=eval_duration,
+                        seed=vs,
+                        run_label=f"baseline_val_seed_{vs}",
+                    )
+                    base_evals.append(b_eval)
+
+                r_label = "combined_network_validation" if len(val_seeds) == 1 else f"combined_network_validation_seed_{vs}"
+                n_eval = self._run_sumo_eval(
+                    net_file=net_file,
+                    rou_file=rou_file,
+                    add_file=final_add_file,
+                    eval_duration=eval_duration,
+                    seed=vs,
+                    run_label=r_label,
+                )
+                net_evals.append(n_eval)
+
+            all_base_success = all(b["evaluation_status"] == "success" and math.isfinite(b.get("score", float("inf"))) for b in base_evals)
+            all_net_success = all(n["evaluation_status"] == "success" and math.isfinite(n.get("score", float("inf"))) for n in net_evals)
+
+            if all_base_success and all_net_success:
+                avg_base_score = sum(b["score"] for b in base_evals) / len(base_evals)
+                avg_net_score = sum(n["score"] for n in net_evals) / len(net_evals)
+                is_net_validated = avg_net_score <= (avg_base_score + 0.5)
+            else:
+                avg_base_score = baseline_score
+                avg_net_score = float("inf")
+                is_net_validated = False
 
             if is_net_validated:
                 self._attach_additional_to_sumocfg(cfg_file, "signals.add.xml")
                 primary_win = winning_plans_per_signal.get(primary_tl_id, {})
                 notes = (
                     f"Validated {optimized_count}/{len(tl_logics)} traffic signals across network in native SUMO. "
-                    f"Network-level objective: {net_eval['score']:.2f} (baseline: {baseline_score:.2f})."
+                    f"Network-level objective: {avg_net_score:.2f} (baseline: {avg_base_score:.2f})."
                 )
                 return FixedTimeOptimizationResult(
                     signal_id=primary_tl_id,
@@ -961,11 +999,11 @@ class FixedTimeSignalOptimizer:
                 # Combined plan regressed or failed network validation: clean up and fall back cleanly
                 final_add_file.unlink(missing_ok=True)
                 self._detach_additional_from_sumocfg(cfg_file, "signals.add.xml")
-                eval_diag = net_eval.get("diagnostics")
-                comb_score_str = f"{net_eval['score']:.2f}" if math.isfinite(net_eval.get("score", float("nan"))) else "failed"
+                eval_diag = net_evals[-1].get("diagnostics") if net_evals else None
+                comb_score_str = f"{avg_net_score:.2f}" if math.isfinite(avg_net_score) else "failed"
                 notes = (
                     f"Candidate plans were screened for {optimized_count} signals, but combined whole-network validation "
-                    f"did not beat baseline (combined: {comb_score_str} vs baseline: {baseline_score:.2f}"
+                    f"did not beat baseline (combined: {comb_score_str} vs baseline: {avg_base_score:.2f}"
                     + (f", diagnostics: {eval_diag}" if eval_diag else "")
                     + "). Preserving original network signal timing."
                 )
