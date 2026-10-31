@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
+import { attachBaseTileLayer } from '../../lib/mapLayers'
 import { api, GativaApiError } from '../../api/client'
 import type {
   AnalysisResult,
@@ -386,24 +387,11 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
     return [26.900, 80.942]
   }, [analysis.polygon])
 
-  const CARTO_VOYAGER_URL = 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png'
-  const CARTO_ATTRIBUTION =
-    '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions" target="_blank" rel="noopener noreferrer">CARTO</a>'
-
   // ─── Shared Tile Layer & Network Initialization Helper ─────────────────────
   const setupBaseNetwork = useCallback(
     (map: L.Map, segGroup: L.LayerGroup, isInteractiveForCongestion = false) => {
-      // Tile Layer: Fastly CDN Edge-cached Voyager street tiles (<50ms response)
-      const baseTile = L.tileLayer(CARTO_VOYAGER_URL, {
-        maxZoom: 20,
-        subdomains: ['a', 'b', 'c', 'd'],
-        keepBuffer: 8,
-        updateWhenIdle: false,
-        updateWhenZooming: false,
-        crossOrigin: true,
-        attribution: CARTO_ATTRIBUTION,
-      })
-      baseTile.addTo(map)
+      // Base Street Layer: Fastly CDN Voyager when CARTO key configured, or OpenStreetMap fallback
+      attachBaseTileLayer(map, 'streets')
 
       // Boundary Polygon
       if (analysis.polygon?.coordinates?.[0]?.length) {

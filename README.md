@@ -537,9 +537,19 @@ ENVIRONMENT=development
 # Backend API Base URL
 VITE_API_BASE_URL=http://localhost:8000
 
-# Optional TomTom Map Tile Key
+# 1. CARTO Basemap API Key (Street Basemap Rendering)
+# Required for CARTO Voyager raster tiles (https://carto.com/basemaps/apikey).
+# If omitted or invalid, Gativa seamlessly falls back to OpenStreetMap tiles.
+VITE_CARTO_BASEMAP_API_KEY=your_carto_api_key_here
+
+# 2. TomTom API Key (Live Traffic Flow Overlay)
+# Used specifically for the real-time traffic flow tile overlay (TomTom Traffic API v4).
+# Register key at https://developer.tomtom.com/
+# If omitted, live traffic overlay is disabled without affecting the basemap.
 VITE_TOMTOM_API_KEY=your_tomtom_api_key_here
 ```
+
+> **Note on Client Credentials:** Both `VITE_CARTO_BASEMAP_API_KEY` and `VITE_TOMTOM_API_KEY` are browser-visible client configurations embedded by Vite at build time. Restrict these keys by HTTP Referrer / Domain Origin and quota limits in the respective provider developer consoles. Server-only secrets must never be exposed via `VITE_*` variables.
 
 ---
 

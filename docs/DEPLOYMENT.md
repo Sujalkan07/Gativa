@@ -42,7 +42,7 @@ These are conservative starting values for a single-machine instance and should 
 ## Secrets and configuration
 
 - Keep `TOMTOM_API_KEY`, `OPENWEATHER_API_KEY`, database credentials, and proxy secrets in an ignored local `.env` for development or the deployment platform's secret manager for hosted environments.
-- Never put server-side provider keys in `VITE_*` variables; Vite variables are shipped to browsers. The TomTom map tile key currently used by the frontend is therefore public client configuration and must be restricted by provider-side origin/quota controls. Do not reuse it as a server API credential.
+- Never put server-side provider keys in `VITE_*` variables; Vite variables are shipped to browsers. Frontend client keys (`VITE_CARTO_BASEMAP_API_KEY` for CARTO Voyager basemap tiles and `VITE_TOMTOM_API_KEY` for TomTom live traffic flow tiles) are public client configuration and must be restricted by provider-side origin/HTTP referrer and quota controls. Do not reuse them as server API credentials, and maintain strict independence between basemap and traffic credentials. If `VITE_CARTO_BASEMAP_API_KEY` is not provided, Gativa safely falls back to OpenStreetMap tiles. Note that Vite embeds environment variables at build time, so changing deployment variables requires triggering a fresh frontend build.
 - Use `backend/.env.example` as a template, rotate any credential that may have been committed or exposed, and avoid logging query strings or provider keys.
 - Set explicit `CORS_ORIGINS`, `ENVIRONMENT`, provider keys, and persistent storage paths per environment. Production should fail closed on invalid security configuration.
 

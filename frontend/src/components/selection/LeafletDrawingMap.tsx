@@ -1,6 +1,16 @@
 import { useEffect, useRef, useState } from 'react'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
+import {
+  type BaseLayerType,
+  type BaseMapStatus,
+  type TrafficLayerStatus,
+  type BaseTileLayerHandle,
+  type TrafficLayerHandle,
+  attachBaseTileLayer,
+  attachTomTomTrafficLayer,
+  getTomTomApiKey,
+} from '../../lib/mapLayers'
 
 export interface Point {
   lat: number
@@ -25,36 +35,6 @@ interface LeafletDrawingMapProps {
   searchedLocation?: SearchedLocationTarget | null
 }
 
-const CARTO_VOYAGER_URL = 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png'
-const CARTO_ATTRIBUTION =
-  '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions" target="_blank" rel="noopener noreferrer">CARTO</a>'
-const ESRI_SATELLITE_URL =
-  'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
-const ESRI_ATTRIBUTION =
-  'Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community'
-
-function createBaseTileLayer(type: 'streets' | 'satellite') {
-  if (type === 'satellite') {
-    return L.tileLayer(ESRI_SATELLITE_URL, {
-      maxZoom: 19,
-      keepBuffer: 8,
-      updateWhenIdle: false,
-      updateWhenZooming: false,
-      crossOrigin: true,
-      attribution: ESRI_ATTRIBUTION,
-    })
-  }
-  return L.tileLayer(CARTO_VOYAGER_URL, {
-    maxZoom: 20,
-    subdomains: ['a', 'b', 'c', 'd'],
-    keepBuffer: 8,
-    updateWhenIdle: false,
-    updateWhenZooming: false,
-    crossOrigin: true,
-    attribution: CARTO_ATTRIBUTION,
-  })
-}
-
 export default function LeafletDrawingMap({
   isDrawing,
   draftPoints,
@@ -68,17 +48,44 @@ export default function LeafletDrawingMap({
   const mapRef = useRef<L.Map | null>(null)
 
   // Layers
-  const baseTileRef = useRef<L.TileLayer | null>(null)
-  const trafficTileRef = useRef<L.TileLayer | null>(null)
+  const baseTileHandleRef = useRef<BaseTileLayerHandle | null>(null)
+  const trafficTileHandleRef = useRef<TrafficLayerHandle | null>(null)
   const draftPolylineRef = useRef<L.Polyline | null>(null)
   const draftMarkersGroupRef = useRef<L.LayerGroup | null>(null)
   const completedPolygonRef = useRef<L.Polygon | null>(null)
   const searchMarkerRef = useRef<L.Marker | null>(null)
 
-  const [baseLayerType, setBaseLayerType] = useState<'streets' | 'satellite'>('streets')
+  const [baseLayerType, setBaseLayerType] = useState<BaseLayerType>('streets')
   const [showTraffic, setShowTraffic] = useState(false)
+  const [baseMapStatus, setBaseMapStatus] = useState<BaseMapStatus>({
+    provider: 'osm',
+    displayName: 'OpenStreetMap',
+    isFallback: false,
+    status: 'active',
+  })
+  const [trafficStatus, setTrafficStatus] = useState<TrafficLayerStatus>({
+    enabled: false,
+    status: 'idle',
+    successCount: 0,
+    errorCount: 0,
+  })
 
-  const TOMTOM_KEY = import.meta.env.VITE_TOMTOM_API_KEY
+  const hasTomTomKey = Boolean(getTomTomApiKey())
+
+  const handleToggleTraffic = () => {
+    setShowTraffic((prev) => {
+      const next = !prev
+      if (!next) {
+        setTrafficStatus({
+          enabled: false,
+          status: 'idle',
+          successCount: 0,
+          errorCount: 0,
+        })
+      }
+      return next
+    })
+  }
 
   // 1. Initialize Map
   useEffect(() => {
@@ -97,10 +104,6 @@ export default function LeafletDrawingMap({
     // Custom zoom control
     L.control.zoom({ position: 'bottomright' }).addTo(map)
 
-    // Base Street Layer: Fastly CDN edge-cached Voyager tiles (<50ms response)
-    const streetTile = createBaseTileLayer('streets')
-    streetTile.addTo(map)
-    baseTileRef.current = streetTile
     draftMarkersGroupRef.current = L.layerGroup().addTo(map)
     mapRef.current = map
 
@@ -126,6 +129,14 @@ export default function LeafletDrawingMap({
       clearTimeout(t2)
       clearTimeout(t3)
       ro?.disconnect()
+      if (baseTileHandleRef.current) {
+        baseTileHandleRef.current.cleanup()
+        baseTileHandleRef.current = null
+      }
+      if (trafficTileHandleRef.current) {
+        trafficTileHandleRef.current.cleanup()
+        trafficTileHandleRef.current = null
+      }
       map.remove()
       mapRef.current = null
     }
@@ -136,13 +147,14 @@ export default function LeafletDrawingMap({
     const map = mapRef.current
     if (!map) return
 
-    if (baseTileRef.current) {
-      map.removeLayer(baseTileRef.current)
+    if (baseTileHandleRef.current) {
+      baseTileHandleRef.current.cleanup()
+      baseTileHandleRef.current = null
     }
 
-    const newLayer = createBaseTileLayer(baseLayerType)
-    newLayer.addTo(map)
-    baseTileRef.current = newLayer
+    baseTileHandleRef.current = attachBaseTileLayer(map, baseLayerType, {
+      onStatusChange: (status) => setBaseMapStatus(status),
+    })
   }, [baseLayerType])
 
   // 2b. TomTom Live Traffic Flow Tile Overlay
@@ -150,28 +162,17 @@ export default function LeafletDrawingMap({
     const map = mapRef.current
     if (!map) return
 
-    if (trafficTileRef.current) {
-      map.removeLayer(trafficTileRef.current)
-      trafficTileRef.current = null
+    if (trafficTileHandleRef.current) {
+      trafficTileHandleRef.current.cleanup()
+      trafficTileHandleRef.current = null
     }
 
-    if (showTraffic && TOMTOM_KEY) {
-      trafficTileRef.current = L.tileLayer(
-        `https://{s}.api.tomtom.com/traffic/map/4/tile/flow/relative0/{z}/{x}/{y}.png?key=${TOMTOM_KEY}`,
-        {
-          maxZoom: 19,
-          subdomains: ['a', 'b', 'c', 'd'],
-          opacity: 0.85,
-          keepBuffer: 8,
-          updateWhenIdle: false,
-          updateWhenZooming: false,
-          crossOrigin: true,
-          attribution:
-            '&copy; <a href="https://www.tomtom.com" target="_blank" rel="noopener noreferrer">TomTom Traffic</a>',
-        },
-      ).addTo(map)
+    if (showTraffic && hasTomTomKey) {
+      trafficTileHandleRef.current = attachTomTomTrafficLayer(map, {
+        onStatusChange: (status) => setTrafficStatus(status),
+      })
     }
-  }, [showTraffic, TOMTOM_KEY])
+  }, [showTraffic, hasTomTomKey])
 
   // 3. Map Click & Double Click Event Handling for Drawing
   useEffect(() => {
@@ -384,20 +385,57 @@ export default function LeafletDrawingMap({
 
       {/* Layer Switcher & TomTom Live Traffic */}
       <div className="absolute top-4 right-16 z-[1000] flex items-center gap-1.5 bg-white/95 backdrop-blur-xs rounded-lg shadow-md border border-[#e2e8f0] p-0.5 text-xs font-semibold">
-        {TOMTOM_KEY && (
+        {hasTomTomKey ? (
           <>
             <button
-              onClick={() => setShowTraffic(!showTraffic)}
-              title="Toggle Live TomTom Real-Time Traffic Flow"
+              onClick={handleToggleTraffic}
+              title={
+                trafficStatus.errorMessage
+                  ? `TomTom Traffic: ${trafficStatus.errorMessage}`
+                  : 'Toggle Live TomTom Real-Time Traffic Flow'
+              }
               className={`px-2.5 py-1 rounded transition-colors flex items-center gap-1.5 ${
                 showTraffic
-                  ? 'bg-[#138808] text-white shadow-xs'
+                  ? trafficStatus.status === 'active'
+                    ? 'bg-[#138808] text-white shadow-xs'
+                    : trafficStatus.status === 'error'
+                      ? 'bg-[#ba1a1a] text-white shadow-xs'
+                      : 'bg-[#b45309] text-white shadow-xs'
                   : 'text-[#475569] hover:text-[#0b1c30]'
               }`}
             >
-              <span className={`w-2 h-2 rounded-full ${showTraffic ? 'bg-white animate-pulse' : 'bg-[#138808]'}`}></span>
-              <span>Live Traffic</span>
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  !showTraffic
+                    ? 'bg-[#94a3b8]'
+                    : trafficStatus.status === 'active'
+                      ? 'bg-white animate-pulse'
+                      : trafficStatus.status === 'loading'
+                        ? 'bg-amber-300 animate-pulse'
+                        : 'bg-white'
+                }`}
+              />
+              <span>
+                {!showTraffic
+                  ? 'Live Traffic'
+                  : trafficStatus.status === 'active'
+                    ? 'Live Traffic'
+                    : trafficStatus.status === 'loading'
+                      ? 'Connecting...'
+                      : 'Traffic Error'}
+              </span>
             </button>
+            <div className="w-[1px] h-4 bg-[#cbd5e1]" />
+          </>
+        ) : (
+          <>
+            <div
+              title="TomTom API key not configured (VITE_TOMTOM_API_KEY)"
+              className="px-2.5 py-1 text-[#94a3b8] flex items-center gap-1.5 cursor-not-allowed text-[11px]"
+            >
+              <span className="w-1.5 h-1.5 rounded-full bg-[#cbd5e1]" />
+              <span>Traffic N/A</span>
+            </div>
             <div className="w-[1px] h-4 bg-[#cbd5e1]" />
           </>
         )}
@@ -424,6 +462,41 @@ export default function LeafletDrawingMap({
           <span className="material-symbols-outlined text-[14px]">satellite_alt</span>
           <span>Satellite</span>
         </button>
+      </div>
+
+      {/* Provider Status Indicator */}
+      <div className="absolute bottom-2 left-3 z-[999] pointer-events-none">
+        <div className="bg-white/90 backdrop-blur-xs px-2.5 py-1 rounded shadow-xs border border-[#e2e8f0] text-[10px] text-[#475569] flex items-center gap-1.5">
+          <span
+            className={`w-1.5 h-1.5 rounded-full ${
+              baseMapStatus.isFallback ? 'bg-[#b45309]' : 'bg-[#138808]'
+            }`}
+          />
+          <span className="font-medium text-[#0b1c30]">
+            Basemap: {baseMapStatus.displayName}
+            {baseMapStatus.isFallback ? ' (OSM Fallback)' : ''}
+          </span>
+          {showTraffic && hasTomTomKey && (
+            <>
+              <span className="text-[#cbd5e1]">|</span>
+              <span
+                className={`flex items-center gap-1 ${
+                  trafficStatus.status === 'active'
+                    ? 'text-[#138808] font-medium'
+                    : trafficStatus.status === 'loading'
+                      ? 'text-[#b45309]'
+                      : 'text-[#ba1a1a]'
+                }`}
+              >
+                Traffic: {trafficStatus.status === 'active'
+                  ? 'TomTom Flow Active'
+                  : trafficStatus.status === 'loading'
+                    ? 'Connecting...'
+                    : 'Unavailable'}
+              </span>
+            </>
+          )}
+        </div>
       </div>
     </div>
   )
