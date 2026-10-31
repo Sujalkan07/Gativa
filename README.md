@@ -537,19 +537,19 @@ ENVIRONMENT=development
 # Backend API Base URL
 VITE_API_BASE_URL=http://localhost:8000
 
-# 1. CARTO Basemap API Key (Street Basemap Rendering)
-# Required for CARTO Voyager raster tiles (https://carto.com/basemaps/apikey).
-# If omitted or invalid, Gativa seamlessly falls back to OpenStreetMap tiles.
-VITE_CARTO_BASEMAP_API_KEY=your_carto_api_key_here
-
-# 2. TomTom API Key (Live Traffic Flow Overlay)
-# Used specifically for the real-time traffic flow tile overlay (TomTom Traffic API v4).
+# 1. TomTom API Key (Primary Street Basemap & Live Traffic Flow Overlay)
+# Powers TomTom Map Display API v1 (/map/1/tile/basic/main/...) for complete street cartography
+# and TomTom Traffic Flow API v4 (/traffic/map/4/tile/flow/...) for real-time congestion overlays.
 # Register key at https://developer.tomtom.com/
-# If omitted, live traffic overlay is disabled without affecting the basemap.
+# If omitted or invalid, Gativa seamlessly falls back to OpenStreetMap tiles.
 VITE_TOMTOM_API_KEY=your_tomtom_api_key_here
+
+# 2. CARTO Basemap API Key (Optional Alternative Basemap)
+# Required only if CARTO Voyager raster tiles are explicitly selected (https://carto.com/basemaps/apikey).
+VITE_CARTO_BASEMAP_API_KEY=your_carto_api_key_here
 ```
 
-> **Note on Client Credentials:** Both `VITE_CARTO_BASEMAP_API_KEY` and `VITE_TOMTOM_API_KEY` are browser-visible client configurations embedded by Vite at build time. Restrict these keys by HTTP Referrer / Domain Origin and quota limits in the respective provider developer consoles. Server-only secrets must never be exposed via `VITE_*` variables.
+> **Note on Client Credentials:** Both `VITE_TOMTOM_API_KEY` and `VITE_CARTO_BASEMAP_API_KEY` are browser-visible client configurations embedded by Vite at build time. Restrict these keys by HTTP Referrer / Domain Origin and quota limits in the respective provider developer consoles. Server-only secrets must never be exposed via `VITE_*` variables. To differentiate: `TOMTOM_API_KEY` is backend-only (used for OSMnx live flow speeds and forward geocoding), while `VITE_TOMTOM_API_KEY` powers browser tile layers. Trigger a fresh frontend build after modifying environment variables in production.
 
 ---
 

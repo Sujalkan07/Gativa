@@ -390,7 +390,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
   // ─── Shared Tile Layer & Network Initialization Helper ─────────────────────
   const setupBaseNetwork = useCallback(
     (map: L.Map, segGroup: L.LayerGroup, isInteractiveForCongestion = false) => {
-      // Base Street Layer: Fastly CDN Voyager when CARTO key configured, or OpenStreetMap fallback
+      // Base Street Layer: TomTom Street Basemap with automatic OpenStreetMap fallback
       attachBaseTileLayer(map, 'streets')
 
       // Boundary Polygon

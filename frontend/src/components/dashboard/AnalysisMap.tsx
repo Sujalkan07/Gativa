@@ -55,6 +55,8 @@ export default function AnalysisMap({
   const recommendationsGroupRef = useRef<L.LayerGroup | null>(null)
   const markersMapRef = useRef<Map<string, L.Marker>>(new Map())
 
+  const hasTomTomKey = Boolean(getTomTomApiKey())
+
   // Controls state
   const [baseLayerType, setBaseLayerType] = useState<BaseLayerType>('streets')
   const [showRoads, setShowRoads] = useState(true)
@@ -62,10 +64,10 @@ export default function AnalysisMap({
   const [showRecommendations, setShowRecommendations] = useState(true)
   const [showTomTomTraffic, setShowTomTomTraffic] = useState(true)
   const [baseMapStatus, setBaseMapStatus] = useState<BaseMapStatus>({
-    provider: 'osm',
-    displayName: 'OpenStreetMap',
+    provider: hasTomTomKey ? 'tomtom' : 'osm',
+    displayName: hasTomTomKey ? 'TomTom Streets' : 'OpenStreetMap',
     isFallback: false,
-    status: 'active',
+    status: 'loading',
   })
   const [trafficStatus, setTrafficStatus] = useState<TrafficLayerStatus>({
     enabled: false,
@@ -73,8 +75,6 @@ export default function AnalysisMap({
     successCount: 0,
     errorCount: 0,
   })
-
-  const hasTomTomKey = Boolean(getTomTomApiKey())
 
   const handleToggleTomTomTraffic = () => {
     setShowTomTomTraffic((prev) => {
@@ -567,7 +567,7 @@ export default function AnalysisMap({
             </span>
             <span>
               {baseMapStatus.isFallback
-                ? `${baseMapStatus.displayName} (Fallback)`
+                ? `${baseMapStatus.displayName} (TomTom Fallback)`
                 : baseMapStatus.displayName}{' '}
               · Traffic Analysis
             </span>
@@ -701,15 +701,60 @@ export default function AnalysisMap({
 
           <span className="text-[var(--color-surface-container-high)]">|</span>
 
-          {/* Streets vs Satellite */}
+          {/* Streets vs Satellite / Provider Switcher */}
+          {hasTomTomKey ? (
+            <>
+              <button
+                onClick={() => setBaseLayerType('tomtom')}
+                title="TomTom Street Basemap"
+                className={`px-2 py-1 rounded text-xs font-semibold flex items-center gap-1 transition-colors ${
+                  baseLayerType === 'tomtom' || (baseLayerType === 'streets' && baseMapStatus.provider === 'tomtom')
+                    ? 'bg-[var(--color-secondary-fixed)] text-[var(--color-on-secondary-fixed)] shadow-xs'
+                    : 'text-[var(--color-on-surface-variant)] hover:text-[var(--color-on-surface)]'
+                }`}
+              >
+                <span className="material-symbols-outlined text-[14px]">map</span>
+                TomTom
+              </button>
+              <button
+                onClick={() => setBaseLayerType('osm')}
+                title="OpenStreetMap Basemap"
+                className={`px-2 py-1 rounded text-xs font-semibold flex items-center gap-1 transition-colors ${
+                  baseLayerType === 'osm' || (baseLayerType === 'streets' && baseMapStatus.provider === 'osm')
+                    ? 'bg-[var(--color-secondary-fixed)] text-[var(--color-on-secondary-fixed)] shadow-xs'
+                    : 'text-[var(--color-on-surface-variant)] hover:text-[var(--color-on-surface)]'
+                }`}
+              >
+                <span className="material-symbols-outlined text-[14px]">public</span>
+                OSM
+              </button>
+            </>
+          ) : (
+            <button
+              onClick={() => setBaseLayerType('osm')}
+              title="OpenStreetMap Basemap"
+              className={`px-2 py-1 rounded text-xs font-semibold flex items-center gap-1 transition-colors ${
+                baseLayerType === 'osm' || baseLayerType === 'streets'
+                  ? 'bg-[var(--color-secondary-fixed)] text-[var(--color-on-secondary-fixed)] shadow-xs'
+                  : 'text-[var(--color-on-surface-variant)] hover:text-[var(--color-on-surface)]'
+              }`}
+            >
+              <span className="material-symbols-outlined text-[14px]">map</span>
+              Streets
+            </button>
+          )}
+
           <button
-            onClick={() => setBaseLayerType(baseLayerType === 'streets' ? 'satellite' : 'streets')}
-            className="px-2 py-1 rounded text-xs font-bold bg-[var(--color-secondary-fixed)] text-[var(--color-on-secondary-fixed)] hover:opacity-90 transition-opacity flex items-center gap-1"
+            onClick={() => setBaseLayerType('satellite')}
+            title="Esri World Imagery Satellite Basemap"
+            className={`px-2 py-1 rounded text-xs font-bold transition-all flex items-center gap-1 ${
+              baseLayerType === 'satellite'
+                ? 'bg-[var(--color-secondary-fixed)] text-[var(--color-on-secondary-fixed)] shadow-xs'
+                : 'text-[var(--color-on-surface-variant)] hover:text-[var(--color-on-surface)]'
+            }`}
           >
-            <span className="material-symbols-outlined text-[14px]">
-              {baseLayerType === 'streets' ? 'satellite_alt' : 'streetview'}
-            </span>
-            {baseLayerType === 'streets' ? 'Satellite' : 'Streets'}
+            <span className="material-symbols-outlined text-[14px]">satellite_alt</span>
+            Satellite
           </button>
 
           <button

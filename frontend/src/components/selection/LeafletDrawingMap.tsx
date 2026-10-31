@@ -55,13 +55,15 @@ export default function LeafletDrawingMap({
   const completedPolygonRef = useRef<L.Polygon | null>(null)
   const searchMarkerRef = useRef<L.Marker | null>(null)
 
+  const hasTomTomKey = Boolean(getTomTomApiKey())
+
   const [baseLayerType, setBaseLayerType] = useState<BaseLayerType>('streets')
   const [showTraffic, setShowTraffic] = useState(false)
   const [baseMapStatus, setBaseMapStatus] = useState<BaseMapStatus>({
-    provider: 'osm',
-    displayName: 'OpenStreetMap',
+    provider: hasTomTomKey ? 'tomtom' : 'osm',
+    displayName: hasTomTomKey ? 'TomTom Streets' : 'OpenStreetMap',
     isFallback: false,
-    status: 'active',
+    status: 'loading',
   })
   const [trafficStatus, setTrafficStatus] = useState<TrafficLayerStatus>({
     enabled: false,
@@ -69,8 +71,6 @@ export default function LeafletDrawingMap({
     successCount: 0,
     errorCount: 0,
   })
-
-  const hasTomTomKey = Boolean(getTomTomApiKey())
 
   const handleToggleTraffic = () => {
     setShowTraffic((prev) => {
@@ -440,19 +440,51 @@ export default function LeafletDrawingMap({
           </>
         )}
 
-        <button
-          onClick={() => setBaseLayerType('streets')}
-          className={`px-2.5 py-1 rounded transition-colors flex items-center gap-1 ${
-            baseLayerType === 'streets'
-              ? 'bg-[#0b1c30] text-white shadow-xs'
-              : 'text-[#475569] hover:text-[#0b1c30]'
-          }`}
-        >
-          <span className="material-symbols-outlined text-[14px]">map</span>
-          <span>Streets</span>
-        </button>
+        {hasTomTomKey ? (
+          <>
+            <button
+              onClick={() => setBaseLayerType('tomtom')}
+              title="TomTom Street Basemap"
+              className={`px-2.5 py-1 rounded transition-colors flex items-center gap-1 ${
+                baseLayerType === 'tomtom' || (baseLayerType === 'streets' && baseMapStatus.provider === 'tomtom')
+                  ? 'bg-[#0b1c30] text-white shadow-xs'
+                  : 'text-[#475569] hover:text-[#0b1c30]'
+              }`}
+            >
+              <span className="material-symbols-outlined text-[14px]">map</span>
+              <span>TomTom</span>
+            </button>
+            <button
+              onClick={() => setBaseLayerType('osm')}
+              title="OpenStreetMap Basemap"
+              className={`px-2.5 py-1 rounded transition-colors flex items-center gap-1 ${
+                baseLayerType === 'osm' || (baseLayerType === 'streets' && baseMapStatus.provider === 'osm')
+                  ? 'bg-[#0b1c30] text-white shadow-xs'
+                  : 'text-[#475569] hover:text-[#0b1c30]'
+              }`}
+            >
+              <span className="material-symbols-outlined text-[14px]">public</span>
+              <span>OSM</span>
+            </button>
+          </>
+        ) : (
+          <button
+            onClick={() => setBaseLayerType('osm')}
+            title="OpenStreetMap Basemap"
+            className={`px-2.5 py-1 rounded transition-colors flex items-center gap-1 ${
+              baseLayerType === 'osm' || baseLayerType === 'streets'
+                ? 'bg-[#0b1c30] text-white shadow-xs'
+                : 'text-[#475569] hover:text-[#0b1c30]'
+            }`}
+          >
+            <span className="material-symbols-outlined text-[14px]">map</span>
+            <span>OpenStreetMap</span>
+          </button>
+        )}
+
         <button
           onClick={() => setBaseLayerType('satellite')}
+          title="Esri World Imagery Satellite Basemap"
           className={`px-2.5 py-1 rounded transition-colors flex items-center gap-1 ${
             baseLayerType === 'satellite'
               ? 'bg-[#0b1c30] text-white shadow-xs'
@@ -466,10 +498,24 @@ export default function LeafletDrawingMap({
 
       {/* Provider Status Indicator */}
       <div className="absolute bottom-2 left-3 z-[999] pointer-events-none">
-        <div className="bg-white/90 backdrop-blur-xs px-2.5 py-1 rounded shadow-xs border border-[#e2e8f0] text-[10px] text-[#475569] flex items-center gap-1.5">
+        <div
+          title={
+            baseMapStatus.errorDetails ||
+            (baseMapStatus.isFallback
+              ? `Fallback active: ${baseMapStatus.fallbackReason}`
+              : `${baseMapStatus.displayName} active`)
+          }
+          className="bg-white/90 backdrop-blur-xs px-2.5 py-1 rounded shadow-xs border border-[#e2e8f0] text-[10px] text-[#475569] flex items-center gap-1.5 pointer-events-auto"
+        >
           <span
             className={`w-1.5 h-1.5 rounded-full ${
-              baseMapStatus.isFallback ? 'bg-[#b45309]' : 'bg-[#138808]'
+              baseMapStatus.status === 'active'
+                ? baseMapStatus.isFallback
+                  ? 'bg-[#b45309]'
+                  : 'bg-[#138808]'
+                : baseMapStatus.status === 'loading'
+                  ? 'bg-amber-400 animate-pulse'
+                  : 'bg-[#ba1a1a]'
             }`}
           />
           <span className="font-medium text-[#0b1c30]">
