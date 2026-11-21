@@ -120,28 +120,55 @@ async def get_current_user(request: Request) -> str:
 async def check_rate_limit(request: Request) -> None:
     """
     Sliding window in-memory rate limiter per client IP / forwarded user.
+    Strictly verifies reverse-proxy trust before honoring X-Forwarded-For headers.
+    Bounds tracked client history to prevent memory exhaustion.
     """
     settings = get_settings()
-    client_id = (
-        request.headers.get("x-forwarded-for")
-        or (request.client.host if request.client else "unknown")
-    )
+    has_proxy_secret = bool(settings.proxy_secret and settings.proxy_secret.strip())
+    is_trusted_proxy = False
+    if has_proxy_secret:
+        proxy_secret_val = request.headers.get(settings.trusted_proxy_secret_header.lower())
+        if proxy_secret_val and proxy_secret_val == settings.proxy_secret:
+            is_trusted_proxy = True
+
+    if is_trusted_proxy and request.headers.get("x-forwarded-for"):
+        client_id = request.headers.get("x-forwarded-for").split(",")[0].strip()
+    else:
+        client_id = request.client.host if request.client else "unknown"
+
     now = time.time()
     window_seconds = 60.0
     limit = settings.rate_limit_per_minute
+    max_tracked_clients = 10000
 
     async with _rate_limit_lock:
+        # Periodic pruning to prevent unbounded dictionary growth
+        if len(_client_request_history) > max_tracked_clients:
+            expired_keys = [
+                cid for cid, ts_list in _client_request_history.items()
+                if not ts_list or now - ts_list[-1] >= window_seconds
+            ]
+            for cid in expired_keys:
+                _client_request_history.pop(cid, None)
+
+            if len(_client_request_history) > max_tracked_clients:
+                excess = len(_client_request_history) - max_tracked_clients
+                for cid in list(_client_request_history.keys())[:excess]:
+                    _client_request_history.pop(cid, None)
+
         history = _client_request_history[client_id]
         # Prune timestamps outside window
-        _client_request_history[client_id] = [t for t in history if now - t < window_seconds]
-        if len(_client_request_history[client_id]) >= limit:
+        valid_timestamps = [t for t in history if now - t < window_seconds]
+        if len(valid_timestamps) >= limit:
+            _client_request_history[client_id] = valid_timestamps
             logger.warning("Rate limit exceeded for client %s (%d requests in 60s)", client_id, limit)
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail="Request rate limit exceeded. Please wait before retrying.",
                 headers={"Retry-After": "60"},
             )
-        _client_request_history[client_id].append(now)
+        valid_timestamps.append(now)
+        _client_request_history[client_id] = valid_timestamps
 
 
 def sanitize_exception_detail(exc: Exception, correlation_id: Optional[str] = None) -> str:

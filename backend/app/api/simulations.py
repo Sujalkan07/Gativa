@@ -53,6 +53,8 @@ async def prepare_simulation(
     try:
         async with sem:
             return await simulation_service.prepare(req)
+    except HTTPException:
+        raise
     except KeyError as e:
         logger.warning("Simulation prepare requested for missing resource: %s", e)
         raise HTTPException(
@@ -473,7 +475,7 @@ async def cleanup_simulation_route(
     user: str = Depends(get_current_user),
 ):
     try:
-        return sim_service.cleanup(sim_id)
+        return simulation_service.cleanup(sim_id)
     except KeyError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

@@ -83,6 +83,17 @@ class SimulationService:
             self._in_flight_prepares.pop(prep_key, None)
 
     async def _do_prepare(self, req: SimulationPrepareRequest) -> SimulationStatusResponse:
+        from app.core.config import get_settings
+        from fastapi import HTTPException, status
+
+        settings = get_settings()
+        if len(self._sessions) >= settings.max_active_sessions:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=f"Maximum active simulation capacity reached ({len(self._sessions)}/{settings.max_active_sessions}). Stop or clean up existing simulations before preparing new ones.",
+                headers={"Retry-After": "60"},
+            )
+
         sim_id = str(uuid.uuid4())
         work_dir = self._base_work_dir / sim_id
         try:
@@ -104,7 +115,7 @@ class SimulationService:
                 if analysis.segments:
                     segments_dict = [s.model_dump() for s in analysis.segments]
                 if analysis.polygon and analysis.polygon.coordinates:
-                    polygon_coords = analysis.polygon.coordinates[0]
+                    polygon_coords = analysis.polygon.coordinates
 
             if not segments_dict and not is_demo:
                 raise ValueError(f"Analysis '{req.analysis_id}' contains no road network segments for simulation.")
@@ -326,6 +337,8 @@ class SimulationService:
             return SimulationStatusResponse(**opt_session.get_status())
         except Exception:
             shutil.rmtree(work_dir, ignore_errors=True)
+            self._sessions.pop(sim_id, None)
+            self._baseline_sessions.pop(sim_id, None)
             raise
 
     def get_session(self, sim_id: str) -> Optional[SimulationSession]:

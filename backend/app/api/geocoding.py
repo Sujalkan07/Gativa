@@ -10,9 +10,10 @@ import logging
 import time
 from typing import Any, Optional
 import httpx
-from fastapi import APIRouter, Query, status
+from fastapi import APIRouter, Depends, Query, Request, status
 
 from app.core.config import get_settings
+from app.core.security import get_current_user, check_rate_limit
 from app.models.schemas import GeocodingResult, GeocodingSearchResponse
 
 logger = logging.getLogger(__name__)
@@ -179,9 +180,12 @@ async def _search_nominatim(query: str, limit: int) -> list[GeocodingResult]:
     summary="Search geographic places, cities, landmarks, and roads",
 )
 async def search_locations(
+    request: Request,
     q: str = Query(..., min_length=2, description="Place, city, road, or address search query"),
     limit: int = Query(6, ge=1, le=10, description="Maximum number of suggestions to return"),
+    user: str = Depends(get_current_user),
 ):
+    await check_rate_limit(request)
     query_clean = q.strip()
     if len(query_clean) < 2:
         return GeocodingSearchResponse(query=query_clean, count=0, results=[], provider="none")

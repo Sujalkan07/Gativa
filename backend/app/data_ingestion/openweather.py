@@ -95,8 +95,10 @@ async def fetch_weather(
         )
     except Exception as exc:
         logger.exception("OpenWeather fetch failed for point (%s, %s)", lat, lng)
+        from app.core.security import sanitize_exception_detail
+        sanitized_msg = sanitize_exception_detail(exc)
         return None, DataSourceCoverage(
             source="openweather",
             status="error",
-            message=f"Unexpected error fetching weather data: {exc}",
+            message=f"Error fetching weather data: {sanitized_msg}",
         )

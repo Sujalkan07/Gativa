@@ -102,7 +102,7 @@ async def test_tomtom_flow_parsing_all_extended_fields(monkeypatch):
     assert obs.frc == "FRC1"
     assert obs.coordinates == [[77.2167, 28.6315], [77.2177, 28.6325]]
     assert obs.openlr == "C3...=="
-    assert obs.congestion_level == "moderate"  # 36 / 50 = 0.72
+    assert obs.congestion_level == "free_flow"  # 36 / 50 = 0.72 (SCI B: >= 0.70)
 
 
 @pytest.mark.asyncio
@@ -197,10 +197,12 @@ async def test_road_closure_explicit_classification(monkeypatch):
 
 
 def test_classify_congestion_function():
-    """Unit test _classify_congestion rules."""
+    """Unit test _classify_congestion rules aligned with Speed Condition Index (SCI)."""
     assert _classify_congestion(50, 50, road_closure=False) == "free_flow"
-    assert _classify_congestion(30, 50, road_closure=False) == "moderate"   # ratio 0.60
-    assert _classify_congestion(20, 50, road_closure=False) == "severe"     # ratio 0.40
+    assert _classify_congestion(35, 50, road_closure=False) == "free_flow"  # ratio 0.70 (SCI B boundary)
+    assert _classify_congestion(30, 50, road_closure=False) == "moderate"   # ratio 0.60 (SCI C)
+    assert _classify_congestion(20, 50, road_closure=False) == "moderate"   # ratio 0.40 (SCI D boundary)
+    assert _classify_congestion(15, 50, road_closure=False) == "severe"     # ratio 0.30 (SCI E/F)
     assert _classify_congestion(0, 50, road_closure=True) == "closed"
     assert _classify_congestion(40, 50, road_closure=True) == "closed"       # closure overrides speed
     assert _classify_congestion(None, 50, road_closure=False) == "unknown"

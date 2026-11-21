@@ -8,6 +8,7 @@ from typing import Optional, Any
 import httpx
 
 from app.core.config import get_settings
+from app.core.security import sanitize_exception_detail
 from app.models.schemas import TrafficObservation, TrafficIncident, DataSourceCoverage
 
 logger = logging.getLogger(__name__)
@@ -36,13 +37,31 @@ ICON_CATEGORY_MAP: dict[int, str] = {
 }
 
 # Mapping of TomTom magnitudeOfDelay integers to severity labels
+# 0: Unknown, 1: Minor, 2: Moderate, 3: Major, 4: Indeterminate / Undefined Delay
 MAGNITUDE_OF_DELAY_MAP: dict[int, str] = {
     0: "unknown",
     1: "minor",
     2: "moderate",
     3: "major",
-    4: "undefined",
+    4: "indeterminate delay",
 }
+
+
+def _calculate_linestring_length_m(coords: list[list[float]]) -> float:
+    """Calculate geodesic distance along consecutive coordinate pairs using the Haversine formula."""
+    total_m = 0.0
+    for i in range(len(coords) - 1):
+        lon1, lat1 = coords[i]
+        lon2, lat2 = coords[i + 1]
+        dlat = math.radians(lat2 - lat1)
+        dlon = math.radians(lon2 - lon1)
+        a = (
+            math.sin(dlat / 2.0) ** 2
+            + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2.0) ** 2
+        )
+        c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+        total_m += 6371000.0 * c
+    return total_m
 
 
 def _classify_congestion(
@@ -50,14 +69,19 @@ def _classify_congestion(
     freeflow: Optional[float],
     road_closure: bool = False,
 ) -> str:
+    """
+    Classify congestion tier aligned with Speed Condition Index (SCI):
+    free_flow (SCI A/B: ratio >= 0.70), moderate (SCI C/D: 0.40 <= ratio < 0.70),
+    severe (SCI E/F: ratio < 0.40), or closed.
+    """
     if road_closure:
         return "closed"
     if observed is None or freeflow is None or freeflow <= 0:
         return "unknown"
     ratio = observed / freeflow
-    if ratio >= 0.75:
+    if ratio >= 0.70:
         return "free_flow"
-    elif ratio >= 0.5:
+    elif ratio >= 0.40:
         return "moderate"
     else:
         return "severe"
@@ -82,6 +106,16 @@ async def fetch_flow_for_point(
             message="TOMTOM_API_KEY not configured. Set it in backend/.env",
         )
 
+    if not (math.isfinite(lat) and math.isfinite(lng) and -90 <= lat <= 90 and -180 <= lng <= 180):
+        return None, DataSourceCoverage(
+            source="tomtom_flow",
+            status="error",
+            message="Invalid geographic coordinates provided for flow lookup",
+        )
+
+    # Note: OpenLR binary location referencing is intentionally set to "false".
+    # Gativa utilizes high-precision WGS84 geodesic coordinates and spatial indexing (R-tree / Shapely)
+    # to directly correlate flow telemetry with OpenStreetMap road geometry, eliminating binary decoding overhead.
     params = {
         "key": settings.tomtom_api_key,
         "point": f"{lat},{lng}",
@@ -130,7 +164,7 @@ async def fetch_flow_for_point(
         road_closure = bool(fd.get("roadClosure", False))
 
         # Validate speed values
-        if observed is None or not isinstance(observed, (int, float)) or observed < 0 or observed > 250:
+        if observed is None or not isinstance(observed, (int, float)) or not math.isfinite(observed) or observed < 0 or observed > 250:
             if not (road_closure and observed == 0):
                 return None, DataSourceCoverage(
                     source="tomtom_flow",
@@ -139,7 +173,7 @@ async def fetch_flow_for_point(
                 )
 
         # Do not arbitrarily fallback freeflow to observed; maintain data integrity
-        if freeflow is not None and (not isinstance(freeflow, (int, float)) or freeflow <= 0 or freeflow > 250):
+        if freeflow is not None and (not isinstance(freeflow, (int, float)) or not math.isfinite(freeflow) or freeflow <= 0 or freeflow > 250):
             freeflow = None
 
         reduction = None
@@ -156,9 +190,9 @@ async def fetch_flow_for_point(
         delay_seconds: Optional[float] = None
         delay_percentage: Optional[float] = None
 
-        if cur_tt_raw is not None and isinstance(cur_tt_raw, (int, float)) and cur_tt_raw >= 0:
+        if cur_tt_raw is not None and isinstance(cur_tt_raw, (int, float)) and math.isfinite(cur_tt_raw) and cur_tt_raw >= 0:
             cur_tt_sec = float(cur_tt_raw)
-        if ff_tt_raw is not None and isinstance(ff_tt_raw, (int, float)) and ff_tt_raw >= 0:
+        if ff_tt_raw is not None and isinstance(ff_tt_raw, (int, float)) and math.isfinite(ff_tt_raw) and ff_tt_raw >= 0:
             ff_tt_sec = float(ff_tt_raw)
 
         if cur_tt_sec is not None and ff_tt_sec is not None:
@@ -174,7 +208,7 @@ async def fetch_flow_for_point(
         # Parse Confidence (0.0 to 1.0)
         conf_raw = fd.get("confidence")
         confidence: Optional[float] = None
-        if conf_raw is not None and isinstance(conf_raw, (int, float)):
+        if conf_raw is not None and isinstance(conf_raw, (int, float)) and math.isfinite(conf_raw):
             confidence = max(0.0, min(1.0, float(conf_raw)))
 
         # Parse Road Fragment Coordinates
@@ -189,14 +223,29 @@ async def fetch_flow_for_point(
                         plat = pt.get("latitude") if "latitude" in pt else pt.get("lat")
                         plon = pt.get("longitude") if "longitude" in pt else pt.get("lng") or pt.get("lon")
                         if plat is not None and plon is not None:
-                            parsed_coords.append([round(float(plon), 6), round(float(plat), 6)])
+                            try:
+                                flat, flon = float(plat), float(plon)
+                                if math.isfinite(flat) and math.isfinite(flon) and -90 <= flat <= 90 and -180 <= flon <= 180:
+                                    parsed_coords.append([round(flon, 6), round(flat, 6)])
+                            except (ValueError, TypeError):
+                                pass
                     elif isinstance(pt, (list, tuple)) and len(pt) >= 2:
-                        parsed_coords.append([round(float(pt[0]), 6), round(float(pt[1]), 6)])
+                        try:
+                            flon, flat = float(pt[0]), float(pt[1])
+                            if math.isfinite(flat) and math.isfinite(flon) and -90 <= flat <= 90 and -180 <= flon <= 180:
+                                parsed_coords.append([round(flon, 6), round(flat, 6)])
+                        except (ValueError, TypeError):
+                            pass
         elif isinstance(raw_coords, list):
             parsed_coords = []
             for pt in raw_coords:
                 if isinstance(pt, (list, tuple)) and len(pt) >= 2:
-                    parsed_coords.append([round(float(pt[0]), 6), round(float(pt[1]), 6)])
+                    try:
+                        flon, flat = float(pt[0]), float(pt[1])
+                        if math.isfinite(flat) and math.isfinite(flon) and -90 <= flat <= 90 and -180 <= flon <= 180:
+                            parsed_coords.append([round(flon, 6), round(flat, 6)])
+                    except (ValueError, TypeError):
+                        pass
 
         # Provider observation timestamp: only use when genuinely supplied by provider
         provider_ts = fd.get("timestamp") or fd.get("observationTime")
@@ -214,7 +263,14 @@ async def fetch_flow_for_point(
         geometry_warning: Optional[str] = None
         if freeflow is not None and freeflow > 0 and ff_tt_sec is not None and ff_tt_sec > 0:
             implied_ff_len_m = (freeflow / 3.6) * ff_tt_sec
-            if observed is not None and observed > 0 and cur_tt_sec is not None and cur_tt_sec > 0:
+            if parsed_coords and len(parsed_coords) >= 2:
+                coord_len_m = _calculate_linestring_length_m(parsed_coords)
+                ratio_coords = coord_len_m / implied_ff_len_m if implied_ff_len_m > 0 else 1.0
+                if ratio_coords < 0.25 or ratio_coords > 4.0:
+                    geometry_warning = (
+                        f"Coordinate length ({coord_len_m:.0f}m) departs significantly from implied freeflow length ({implied_ff_len_m:.0f}m)"
+                    )
+            if not geometry_warning and observed is not None and observed > 0 and cur_tt_sec is not None and cur_tt_sec > 0:
                 implied_cur_len_m = (observed / 3.6) * cur_tt_sec
                 ratio = implied_cur_len_m / implied_ff_len_m
                 if ratio < 0.25 or ratio > 4.0:
@@ -255,10 +311,11 @@ async def fetch_flow_for_point(
         )
     except Exception as exc:
         logger.exception("TomTom flow fetch failed for point (%s, %s)", lat, lng)
+        sanitized_msg = sanitize_exception_detail(exc)
         return None, DataSourceCoverage(
             source="tomtom_flow",
             status="error",
-            message=f"Unexpected error fetching TomTom flow data: {exc}",
+            message=f"Error fetching TomTom flow data: {sanitized_msg}",
         )
 
 
@@ -470,8 +527,9 @@ async def fetch_incidents_for_bbox(
         )
     except Exception as exc:
         logger.exception("TomTom incidents fetch failed")
+        sanitized_msg = sanitize_exception_detail(exc)
         return [], DataSourceCoverage(
             source="tomtom_incidents",
             status="error",
-            message=f"Unexpected error: {exc}",
+            message=f"Error fetching TomTom incidents: {sanitized_msg}",
         )

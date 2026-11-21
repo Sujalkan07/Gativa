@@ -25,6 +25,32 @@ MAX_SEGMENTS = 3000
 SIMULATION_STEP_LENGTH_SECONDS = 0.2
 
 
+def _build_shapely_polygon(polygon_coords: Any) -> Optional[Polygon]:
+    """
+    Safely build a Shapely Polygon supporting both single-ring [[lng, lat], ...]
+    and multi-ring GeoJSON [[[lng, lat], ...], [interior_hole, ...]] structures.
+    """
+    if not polygon_coords or len(polygon_coords) == 0:
+        return None
+    try:
+        if (
+            isinstance(polygon_coords, (list, tuple))
+            and len(polygon_coords) > 0
+            and isinstance(polygon_coords[0], (list, tuple))
+            and len(polygon_coords[0]) > 0
+            and isinstance(polygon_coords[0][0], (list, tuple))
+        ):
+            shell = polygon_coords[0]
+            holes = polygon_coords[1:] if len(polygon_coords) > 1 else None
+            return Polygon(shell=shell, holes=holes)
+        elif isinstance(polygon_coords, (list, tuple)) and len(polygon_coords) >= 3:
+            return Polygon(polygon_coords)
+        return None
+    except Exception as e:
+        logger.debug("Failed to construct Shapely Polygon: %s", e)
+        return None
+
+
 def interpret_lane_configuration(
     total_lanes: Optional[int],
     lanes_forward: Optional[int] = None,
@@ -268,7 +294,9 @@ class SumoNetworkBuilder:
             }
 
         try:
-            raw_poly = Polygon(polygon_coords)
+            raw_poly = _build_shapely_polygon(polygon_coords)
+            if raw_poly is None or raw_poly.is_empty:
+                return list(segments), {"buffer_applied": False, "buffer_segments_added": 0}
             if not raw_poly.is_valid:
                 raw_poly = raw_poly.buffer(0)
             if raw_poly.is_empty:
@@ -900,13 +928,14 @@ class SumoNetworkBuilder:
 
         # Attempt polygon-based boundary classification
         poly = None
-        if polygon_coords and len(polygon_coords) >= 3:
+        if polygon_coords:
             try:
-                raw_poly = Polygon(polygon_coords)
-                if not raw_poly.is_valid:
-                    raw_poly = raw_poly.buffer(0)
-                if not raw_poly.is_empty and raw_poly.is_valid and raw_poly.area > 0:
-                    poly = raw_poly
+                raw_poly = _build_shapely_polygon(polygon_coords)
+                if raw_poly is not None:
+                    if not raw_poly.is_valid:
+                        raw_poly = raw_poly.buffer(0)
+                    if not raw_poly.is_empty and raw_poly.is_valid and raw_poly.area > 0:
+                        poly = raw_poly
             except Exception as e:
                 logger.debug("Failed to build Shapely polygon from polygon_coords: %s", e)
 
@@ -1554,7 +1583,8 @@ class SumoNetworkBuilder:
                 })
 
         if polygon_coords:
-            for pc in polygon_coords:
+            flat_coords = polygon_coords[0] if (isinstance(polygon_coords[0], (list, tuple)) and len(polygon_coords[0]) > 0 and isinstance(polygon_coords[0][0], (list, tuple))) else polygon_coords
+            for pc in flat_coords:
                 all_lons.append(pc[0])
                 all_lats.append(pc[1])
 
@@ -1564,13 +1594,14 @@ class SumoNetworkBuilder:
         max_lat = max(all_lats) if all_lats else 0.0
 
         poly_area_km2 = 0.0
-        if polygon_coords and len(polygon_coords) >= 3:
+        if polygon_coords:
             try:
-                poly_obj = Polygon(polygon_coords)
-                if not poly_obj.is_valid:
-                    poly_obj = poly_obj.buffer(0)
-                from app.geospatial.road_network import _compute_geodesic_area_km2
-                poly_area_km2 = round(_compute_geodesic_area_km2(poly_obj), 4)
+                poly_obj = _build_shapely_polygon(polygon_coords)
+                if poly_obj is not None:
+                    if not poly_obj.is_valid:
+                        poly_obj = poly_obj.buffer(0)
+                    from app.geospatial.road_network import _compute_geodesic_area_km2
+                    poly_area_km2 = round(_compute_geodesic_area_km2(poly_obj), 4)
             except Exception:
                 pass
 
@@ -1638,10 +1669,11 @@ class SumoNetworkBuilder:
             },
         }
 
-    def _corridor_from_polygon(self, polygon_coords: list[list[float]]) -> list[dict[str, Any]]:
+    def _corridor_from_polygon(self, polygon_coords: Any) -> list[dict[str, Any]]:
         """Construct representative urban arterial corridor centered on the polygon bounds."""
-        center_lon = sum(c[0] for c in polygon_coords) / len(polygon_coords)
-        center_lat = sum(c[1] for c in polygon_coords) / len(polygon_coords)
+        flat = polygon_coords[0] if (polygon_coords and len(polygon_coords) > 0 and isinstance(polygon_coords[0][0], (list, tuple))) else polygon_coords
+        center_lon = sum(c[0] for c in flat) / len(flat)
+        center_lat = sum(c[1] for c in flat) / len(flat)
         d_lon = 0.004
         d_lat = 0.004
         return [

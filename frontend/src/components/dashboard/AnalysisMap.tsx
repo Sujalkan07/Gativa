@@ -347,13 +347,13 @@ export default function AnalysisMap({
           { sticky: true, opacity: 0.98 }
         )
       } else {
-        const speedObs = seg.traffic?.observed_speed_kmh
+        const speedObs = seg.traffic?.observed_speed_kmh != null
           ? `${seg.traffic.observed_speed_kmh.toFixed(0)} km/h`
           : 'Free Flow'
 
         polyline.bindTooltip(
           `<div class="font-sans text-xs">
-            <p class="font-bold text-[#0b1c30] text-[13px]">${roadTitle}</p>
+            <p class="font-bold text-[#0b1c30] text-[13px]">${escapeHtml(roadTitle)}</p>
             <div class="flex flex-wrap items-center gap-1.5 mt-1 text-[#554336]">
               <span class="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase ${
                 seg.road_type === 'highway'
@@ -361,12 +361,12 @@ export default function AnalysisMap({
                   : seg.road_type === 'arterial'
                   ? 'bg-[#e0e0ff] text-[#2d3b8f]'
                   : 'bg-[#f1f5f9] text-[#475569]'
-              }">${seg.road_type}</span>
-              ${seg.osm_highway ? `<span class="text-[10px] font-mono text-slate-500">osm:${seg.osm_highway}</span>` : ''}
+              }">${escapeHtml(seg.road_type)}</span>
+              ${seg.osm_highway ? `<span class="text-[10px] font-mono text-slate-500">osm:${escapeHtml(seg.osm_highway)}</span>` : ''}
               <span>• ${seg.length_m.toFixed(0)}m</span>
               <span>• ${seg.is_oneway ? '1-way' : '2-way'}</span>
               ${seg.lanes ? `<span>• ${seg.lanes}L</span>` : ''}
-              <span>• Speed: ${speedObs}</span>
+              <span>• Speed: ${escapeHtml(speedObs)}</span>
             </div>
           </div>`,
           { sticky: true, opacity: 0.95 },

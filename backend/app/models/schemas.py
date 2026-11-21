@@ -21,12 +21,16 @@ class GeoJSONPolygon(BaseModel):
     def validate_polygon(cls, v: list[list[list[float]]]) -> list[list[list[float]]]:
         if not v or len(v) == 0:
             raise ValueError("Polygon must have at least one ring")
+        if len(v) > 20:
+            raise ValueError(f"Polygon exceeds maximum allowed rings limit (20, got {len(v)})")
         cleaned_rings: list[list[list[float]]] = []
         for ring_idx, ring in enumerate(v):
             if not ring or len(ring) < 4:
                 raise ValueError(
                     f"Polygon ring {ring_idx} must have at least 4 coordinate pairs (3 points + closing point)"
                 )
+            if len(ring) > 5000:
+                raise ValueError(f"Polygon ring {ring_idx} exceeds maximum vertex limit (5000)")
             cleaned_ring: list[list[float]] = []
             for coord_idx, coord in enumerate(ring):
                 if len(coord) != 2:
@@ -48,21 +52,23 @@ class GeoJSONPolygon(BaseModel):
                 raise ValueError(f"Polygon ring {ring_idx} must be closed (first and last coordinates must match)")
             cleaned_rings.append(cleaned_ring)
 
-        # If interior rings exist, validate geometry with Shapely
-        if len(cleaned_rings) > 1:
+        # Validate geometry topological validity with Shapely for all polygons (including self-intersection)
+        if len(cleaned_rings) >= 1:
             try:
                 from shapely.geometry import Polygon as SPolygon
+                from shapely.validation import explain_validity
                 shell = cleaned_rings[0]
-                holes = cleaned_rings[1:]
+                holes = cleaned_rings[1:] if len(cleaned_rings) > 1 else None
                 poly = SPolygon(shell=shell, holes=holes)
                 if not poly.is_valid:
-                    raise ValueError("Polygon geometry with interior rings (holes) is topologically invalid")
+                    reason = explain_validity(poly)
+                    raise ValueError(f"Polygon geometry is topologically invalid: {reason}")
             except ImportError:
                 pass
             except Exception as e:
                 if isinstance(e, ValueError):
                     raise
-                raise ValueError(f"Invalid polygon geometry with holes: {e}")
+                raise ValueError(f"Invalid polygon geometry: {e}")
 
         return cleaned_rings
 

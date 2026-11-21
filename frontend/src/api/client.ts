@@ -118,6 +118,9 @@ export const api = {
   stopSimulation: async (simId: string): Promise<SimulationStatusResponse> =>
     handleRequest(client.post(`/api/simulations/${simId}/stop`)),
 
+  cleanupSimulation: async (simId: string): Promise<{ sim_id: string; status: string }> =>
+    handleRequest(client.delete(`/api/simulations/${simId}`)),
+
   getSimulationStatus: async (simId: string): Promise<SimulationStatusResponse> =>
     handleRequest(client.get(`/api/simulations/${simId}`)),
 

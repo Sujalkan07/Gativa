@@ -280,9 +280,9 @@ def match_incidents_to_segments(
                         if inc.road_numbers and seg.name:
                             name_match = any(rn.lower() in seg.name.lower() for rn in inc.road_numbers)
 
-                        if dist_m <= 15.0 or name_match:
+                        if dist_m <= 15.0 or (name_match and dist_m <= 20.0):
                             confirmed_ids.add(seg.segment_id)
-                        elif dist_m <= 25.0:
+                        elif dist_m <= 25.0 or (name_match and dist_m <= 35.0):
                             likely_ids.add(seg.segment_id)
                         else:
                             nearby_ids.add(seg.segment_id)
