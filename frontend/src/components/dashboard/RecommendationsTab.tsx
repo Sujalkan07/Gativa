@@ -6,6 +6,7 @@ import type {
   RecommendationsResult,
   RecommendationCategory,
   RecommendationPriority,
+  CongestionCause,
 } from '../../types/api'
 
 interface RecommendationsTabProps {
@@ -21,6 +22,8 @@ export default function RecommendationsTab({
 }: RecommendationsTabProps) {
   const [categoryFilter, setCategoryFilter] = useState<'all' | RecommendationCategory>('all')
   const [priorityFilter, setPriorityFilter] = useState<'all' | RecommendationPriority>('all')
+  const [causeFilter, setCauseFilter] = useState<'all' | CongestionCause>('all')
+  const [confidenceFilter, setConfidenceFilter] = useState<'all' | 'high' | 'medium' | 'low'>('all')
   const [viewMode, setViewMode] = useState<'map' | 'grid'>('map')
   const [selectedRecId, setSelectedRecId] = useState<string | null>(null)
   const [selectedSpec, setSelectedSpec] = useState<Recommendation | null>(null)
@@ -57,8 +60,10 @@ export default function RecommendationsTab({
 
   // Final filtered recommendations
   const filteredRecs = categoryScopedRecs.filter((r) => {
-    if (priorityFilter === 'all') return true
-    return r.priority === priorityFilter
+    if (priorityFilter !== 'all' && r.priority !== priorityFilter) return false
+    if (causeFilter !== 'all' && r.cause !== causeFilter) return false
+    if (confidenceFilter !== 'all' && r.confidence !== confidenceFilter) return false
+    return true
   })
 
   // Format intervention type label
@@ -96,18 +101,51 @@ export default function RecommendationsTab({
     }
   }
 
+  // Format Cause badge
+  const formatCause = (cause?: CongestionCause | null) => {
+    switch (cause) {
+      case 'incident_related':
+        return { label: 'Incident-Related', color: 'bg-red-100 text-red-800 border-red-300' }
+      case 'road_closure':
+        return { label: 'Road Closure', color: 'bg-zinc-900 text-red-400 border-red-500' }
+      case 'junction_approach':
+        return { label: 'Junction Conflict', color: 'bg-amber-100 text-amber-800 border-amber-300' }
+      case 'recurring_corridor':
+        return { label: 'Recurring Corridor', color: 'bg-purple-100 text-purple-800 border-purple-300' }
+      case 'structural_connectivity':
+        return { label: 'Structural Bottleneck', color: 'bg-blue-100 text-blue-800 border-blue-300' }
+      case 'insufficient_evidence':
+        return { label: 'Unverified / Screening', color: 'bg-slate-100 text-slate-700 border-slate-300' }
+      default:
+        return { label: 'Screening Candidate', color: 'bg-slate-100 text-slate-700 border-slate-300' }
+    }
+  }
+
+  // Format Confidence badge
+  const formatConfidence = (conf?: 'high' | 'medium' | 'low') => {
+    switch (conf) {
+      case 'high':
+        return { label: 'High Confidence', color: 'bg-[#138808]/15 text-[#138808] border-[#138808]/30' }
+      case 'medium':
+        return { label: 'Medium Confidence', color: 'bg-amber-500/15 text-amber-700 border-amber-500/30' }
+      case 'low':
+      default:
+        return { label: 'Low Confidence', color: 'bg-slate-200 text-slate-600 border-slate-300' }
+    }
+  }
+
   const isInfrastructureCategory = (category?: RecommendationCategory) =>
     category === 'infrastructure_planning'
 
   return (
     <div className="flex flex-col gap-[var(--spacing-space-md)]">
-      {/* Category Selection Tabs & Primary Metrics */}
+      {/* 1. Category Selection Tabs & Primary Metrics */}
       <div className="w-full bg-[var(--color-surface-container-lowest)] p-3 rounded-xl border border-[var(--color-surface-container-high)] shadow-xs flex flex-col md:flex-row md:items-center justify-between gap-3">
         {/* Category Segmented Control */}
-        <div className="flex items-center gap-1.5 p-1 bg-[var(--color-surface-container-low)] rounded-xl border border-[var(--color-surface-container-high)]">
+        <div className="flex items-center gap-1.5 p-1 bg-[var(--color-surface-container-low)] rounded-xl border border-[var(--color-surface-container-high)] overflow-x-auto">
           <button
             onClick={() => setCategoryFilter('all')}
-            className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${
+            className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 shrink-0 ${
               categoryFilter === 'all'
                 ? 'bg-[var(--color-surface-container-lowest)] text-[var(--color-brand-navy)] shadow-xs border border-[var(--color-surface-container-high)]'
                 : 'text-[var(--color-on-surface-variant)] hover:text-[var(--color-on-surface)]'
@@ -122,7 +160,7 @@ export default function RecommendationsTab({
 
           <button
             onClick={() => setCategoryFilter('traffic_optimization')}
-            className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${
+            className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 shrink-0 ${
               categoryFilter === 'traffic_optimization'
                 ? 'bg-[#006a6a] text-white shadow-xs'
                 : 'text-[var(--color-on-surface-variant)] hover:text-[var(--color-on-surface)]'
@@ -143,7 +181,7 @@ export default function RecommendationsTab({
 
           <button
             onClick={() => setCategoryFilter('infrastructure_planning')}
-            className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${
+            className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 shrink-0 ${
               categoryFilter === 'infrastructure_planning'
                 ? 'bg-[#c2410c] text-white shadow-xs'
                 : 'text-[var(--color-on-surface-variant)] hover:text-[var(--color-on-surface)]'
@@ -166,7 +204,7 @@ export default function RecommendationsTab({
         {/* View Mode & Secondary Telemetry */}
         <div className="flex items-center gap-3">
           <div className="hidden lg:flex items-center gap-2 text-xs">
-            <span className="text-[var(--color-on-surface-variant)]">Avg Impact:</span>
+            <span className="text-[var(--color-on-surface-variant)]">Avg Priority Score:</span>
             <span className="font-mono font-bold text-[#166534]">
               {categoryScopedRecs.length > 0
                 ? (
@@ -206,53 +244,90 @@ export default function RecommendationsTab({
         </div>
       </div>
 
-      {/* Operational Metric & Priority Filter Ribbon */}
+      {/* 2. Operational Metric, Cause, Confidence & Priority Filter Ribbon */}
       <div className="w-full bg-[var(--color-surface-container-lowest)] px-3 py-2 rounded-xl border border-[var(--color-surface-container-high)] shadow-xs flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-3">
-          <span className="text-xs font-bold text-[var(--color-on-surface)]">Priority Filter:</span>
-          <div className="flex items-center gap-1 bg-[var(--color-surface-container-high)] p-0.5 rounded-full">
-            <button
-              onClick={() => setPriorityFilter('all')}
-              className={`px-3 py-0.8 rounded-full text-xs font-semibold transition-colors ${
-                priorityFilter === 'all'
-                  ? 'bg-[var(--color-brand-navy)] text-white shadow-xs'
-                  : 'text-[var(--color-on-surface-variant)] hover:text-[var(--color-on-surface)]'
-              }`}
-            >
-              All ({categoryScopedRecs.length})
-            </button>
-            <button
-              onClick={() => setPriorityFilter('high')}
-              className={`px-3 py-0.8 rounded-full text-xs font-semibold transition-colors ${
-                priorityFilter === 'high'
-                  ? 'bg-[var(--color-brand-navy)] text-white shadow-xs'
-                  : 'text-[var(--color-on-surface-variant)] hover:text-[var(--color-on-surface)]'
-              }`}
-            >
-              High ({highCount})
-            </button>
-            <button
-              onClick={() => setPriorityFilter('medium')}
-              className={`px-3 py-0.8 rounded-full text-xs font-semibold transition-colors ${
-                priorityFilter === 'medium'
-                  ? 'bg-[var(--color-brand-navy)] text-white shadow-xs'
-                  : 'text-[var(--color-on-surface-variant)] hover:text-[var(--color-on-surface)]'
-              }`}
-            >
-              Med ({medCount})
-            </button>
-            {lowCount > 0 && (
+        {/* Filters Group */}
+        <div className="flex flex-wrap items-center gap-3">
+          {/* Priority filter */}
+          <div className="flex items-center gap-1.5">
+            <span className="text-xs font-bold text-[var(--color-on-surface)]">Priority:</span>
+            <div className="flex items-center gap-1 bg-[var(--color-surface-container-high)] p-0.5 rounded-full text-xs">
               <button
-                onClick={() => setPriorityFilter('low')}
-                className={`px-3 py-0.8 rounded-full text-xs font-semibold transition-colors ${
-                  priorityFilter === 'low'
+                onClick={() => setPriorityFilter('all')}
+                className={`px-2.5 py-0.5 rounded-full font-semibold transition-colors ${
+                  priorityFilter === 'all'
                     ? 'bg-[var(--color-brand-navy)] text-white shadow-xs'
                     : 'text-[var(--color-on-surface-variant)] hover:text-[var(--color-on-surface)]'
                 }`}
               >
-                Low ({lowCount})
+                All ({categoryScopedRecs.length})
               </button>
-            )}
+              <button
+                onClick={() => setPriorityFilter('high')}
+                className={`px-2.5 py-0.5 rounded-full font-semibold transition-colors ${
+                  priorityFilter === 'high'
+                    ? 'bg-[var(--color-brand-navy)] text-white shadow-xs'
+                    : 'text-[var(--color-on-surface-variant)] hover:text-[var(--color-on-surface)]'
+                }`}
+              >
+                High ({highCount})
+              </button>
+              <button
+                onClick={() => setPriorityFilter('medium')}
+                className={`px-2.5 py-0.5 rounded-full font-semibold transition-colors ${
+                  priorityFilter === 'medium'
+                    ? 'bg-[var(--color-brand-navy)] text-white shadow-xs'
+                    : 'text-[var(--color-on-surface-variant)] hover:text-[var(--color-on-surface)]'
+                }`}
+              >
+                Med ({medCount})
+              </button>
+              {lowCount > 0 && (
+                <button
+                  onClick={() => setPriorityFilter('low')}
+                  className={`px-2.5 py-0.5 rounded-full font-semibold transition-colors ${
+                    priorityFilter === 'low'
+                      ? 'bg-[var(--color-brand-navy)] text-white shadow-xs'
+                      : 'text-[var(--color-on-surface-variant)] hover:text-[var(--color-on-surface)]'
+                  }`}
+                >
+                  Low ({lowCount})
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Cause Filter Dropdown */}
+          <div className="flex items-center gap-1.5">
+            <span className="text-xs font-bold text-[var(--color-on-surface)]">Cause:</span>
+            <select
+              value={causeFilter}
+              onChange={(e) => setCauseFilter(e.target.value as any)}
+              className="text-xs font-semibold bg-[var(--color-surface-container-low)] text-[var(--color-on-surface)] border border-[var(--color-surface-container-high)] rounded px-2 py-1 outline-hidden"
+            >
+              <option value="all">All Causes</option>
+              <option value="incident_related">Incident-Related</option>
+              <option value="road_closure">Road Closure</option>
+              <option value="junction_approach">Junction Conflict</option>
+              <option value="recurring_corridor">Recurring Corridor</option>
+              <option value="structural_connectivity">Structural Bottleneck</option>
+              <option value="insufficient_evidence">Unverified / Screening</option>
+            </select>
+          </div>
+
+          {/* Confidence Filter Dropdown */}
+          <div className="flex items-center gap-1.5">
+            <span className="text-xs font-bold text-[var(--color-on-surface)]">Confidence:</span>
+            <select
+              value={confidenceFilter}
+              onChange={(e) => setConfidenceFilter(e.target.value as any)}
+              className="text-xs font-semibold bg-[var(--color-surface-container-low)] text-[var(--color-on-surface)] border border-[var(--color-surface-container-high)] rounded px-2 py-1 outline-hidden"
+            >
+              <option value="all">All Confidence</option>
+              <option value="high">High Confidence</option>
+              <option value="medium">Medium Confidence</option>
+              <option value="low">Low Confidence</option>
+            </select>
           </div>
         </div>
 
@@ -304,13 +379,15 @@ export default function RecommendationsTab({
                       filter_alt_off
                     </span>
                     <p className="text-xs text-[var(--color-on-surface-variant)]">
-                      No recommendations match the selected category & priority filters.
+                      No recommendations match the selected filters.
                     </p>
                   </div>
                 ) : (
                   filteredRecs.map((rec, idx) => {
                     const isSelected = selectedRecId === rec.recommendation_id
                     const isInfra = isInfrastructureCategory(rec.category)
+                    const causeInfo = formatCause(rec.cause)
+                    const confInfo = formatConfidence(rec.confidence)
 
                     return (
                       <div
@@ -344,6 +421,12 @@ export default function RecommendationsTab({
                               <span className="px-1.5 py-0.2 rounded text-[9px] font-bold uppercase bg-[var(--color-surface-container-high)] text-[var(--color-on-surface)]">
                                 {formatType(rec.intervention_type)}
                               </span>
+                              <span className={`px-1.5 py-0.2 rounded text-[9px] font-bold uppercase border ${causeInfo.color}`}>
+                                {causeInfo.label}
+                              </span>
+                              <span className={`px-1.5 py-0.2 rounded text-[9px] font-bold uppercase border ${confInfo.color}`}>
+                                {confInfo.label}
+                              </span>
                             </div>
                             <span className="text-xs font-bold text-[var(--color-on-surface)] leading-snug block">
                               S#{idx + 1}: {rec.title}
@@ -369,9 +452,18 @@ export default function RecommendationsTab({
                           {rec.description}
                         </p>
 
+                        {/* Missing evidence highlight tag */}
+                        {rec.missing_evidence && rec.missing_evidence.length > 0 && (
+                          <div className="p-1.5 bg-amber-50 rounded border border-amber-200/80 text-[10px] text-amber-800 flex items-center gap-1">
+                            <span className="material-symbols-outlined text-[12px] text-amber-700">warning</span>
+                            <span className="font-semibold">Survey Needed:</span>
+                            <span className="truncate">{rec.missing_evidence[0]}</span>
+                          </div>
+                        )}
+
                         <div className="flex items-center justify-between pt-1 border-t border-[var(--color-surface-container-high)]/60 text-[11px]">
-                          <div className="flex items-center gap-1 text-[#166534] font-semibold">
-                            <span>Impact:</span>
+                          <div className="flex items-center gap-1 text-[#166534] font-semibold" title="Priority screening score based on multi-criteria analysis (not promised traffic reduction %)">
+                            <span>Priority Score:</span>
                             <span className="font-mono font-bold text-xs">
                               {rec.impact_score.toFixed(1)}/10
                             </span>
@@ -404,11 +496,13 @@ export default function RecommendationsTab({
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-[var(--spacing-space-md)]">
           {filteredRecs.length === 0 ? (
             <div className="col-span-full p-12 text-center text-sm text-[var(--color-on-surface-variant)] bg-[var(--color-surface-container-lowest)] rounded-xl border border-[var(--color-surface-container-high)]">
-              No recommendations match the selected category & priority filter.
+              No recommendations match the selected filters.
             </div>
           ) : (
             filteredRecs.map((rec) => {
               const isInfra = isInfrastructureCategory(rec.category)
+              const causeInfo = formatCause(rec.cause)
+              const confInfo = formatConfidence(rec.confidence)
 
               return (
                 <div
@@ -430,6 +524,9 @@ export default function RecommendationsTab({
                         </span>
                         <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-[#f1f5f9] text-[#334155] uppercase tracking-wide">
                           {formatType(rec.intervention_type)}
+                        </span>
+                        <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold uppercase border ${causeInfo.color}`}>
+                          {causeInfo.label}
                         </span>
                       </div>
                       <span
@@ -469,17 +566,26 @@ export default function RecommendationsTab({
                       {rec.description}
                     </p>
 
+                    {/* Missing evidence highlight tag */}
+                    {rec.missing_evidence && rec.missing_evidence.length > 0 && (
+                      <div className="p-1.5 mb-2 bg-amber-50 rounded border border-amber-200/80 text-[10px] text-amber-800 flex items-center gap-1">
+                        <span className="material-symbols-outlined text-[12px] text-amber-700">warning</span>
+                        <span className="font-semibold">Survey Needed:</span>
+                        <span className="truncate">{rec.missing_evidence[0]}</span>
+                      </div>
+                    )}
+
                     <div className="space-y-2 pt-2 border-t border-[var(--color-surface-container-high)] text-xs">
-                      <div className="flex items-center justify-between">
-                        <span className="text-[var(--color-secondary)] font-medium">Expected Impact:</span>
+                      <div className="flex items-center justify-between" title="Multi-criteria engineering screening score (not promised traffic reduction %)">
+                        <span className="text-[var(--color-secondary)] font-medium">Priority Score:</span>
                         <span className="font-mono font-bold text-[#166534]">
                           {rec.impact_score.toFixed(1)} / 10
                         </span>
                       </div>
                       <div className="flex items-center justify-between">
-                        <span className="text-[var(--color-secondary)] font-medium">Confidence:</span>
-                        <span className="font-semibold capitalize text-[var(--color-on-surface)]">
-                          {rec.confidence}
+                        <span className="text-[var(--color-secondary)] font-medium">Evidence Confidence:</span>
+                        <span className={`px-1.5 py-0.2 rounded text-[10px] font-bold uppercase border ${confInfo.color}`}>
+                          {confInfo.label}
                         </span>
                       </div>
                     </div>
@@ -505,13 +611,13 @@ export default function RecommendationsTab({
         </div>
       )}
 
-      {/* Engineering Specs Modal */}
+      {/* 3. Comprehensive 10-Point Engineering Specs Modal */}
       {selectedSpec && (
         <div className="fixed inset-0 z-50 bg-black/40 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-[var(--color-surface-container-lowest)] rounded-xl max-w-lg w-full p-6 shadow-2xl border border-[var(--color-surface-container-high)] flex flex-col gap-4 max-h-[90vh] overflow-y-auto">
+          <div className="bg-[var(--color-surface-container-lowest)] rounded-xl max-w-xl w-full p-6 shadow-2xl border border-[var(--color-surface-container-high)] flex flex-col gap-4 max-h-[90vh] overflow-y-auto">
             <div className="flex items-start justify-between border-b border-[var(--color-surface-container-high)] pb-3">
               <div>
-                <div className="flex items-center gap-1.5 mb-1">
+                <div className="flex items-center gap-1.5 mb-1 flex-wrap">
                   <span
                     className={`px-1.5 py-0.2 rounded text-[9px] font-bold uppercase tracking-wider ${
                       isInfrastructureCategory(selectedSpec.category)
@@ -525,6 +631,12 @@ export default function RecommendationsTab({
                   </span>
                   <span className="text-[10px] font-bold text-[var(--color-primary-container)] uppercase tracking-wider">
                     {formatType(selectedSpec.intervention_type)}
+                  </span>
+                  <span className={`px-1.5 py-0.2 rounded text-[9px] font-bold uppercase border ${formatCause(selectedSpec.cause).color}`}>
+                    {formatCause(selectedSpec.cause).label}
+                  </span>
+                  <span className={`px-1.5 py-0.2 rounded text-[9px] font-bold uppercase border ${formatConfidence(selectedSpec.confidence).color}`}>
+                    {formatConfidence(selectedSpec.confidence).label}
                   </span>
                 </div>
                 <h3 className="text-lg font-bold text-[var(--color-on-surface)] mt-0.5">
@@ -543,31 +655,98 @@ export default function RecommendationsTab({
             </div>
 
             <div className="space-y-3.5 text-xs text-[var(--color-on-surface)]">
+              {/* Section 1: Problem & Rationale */}
               <div>
                 <h4 className="font-semibold text-[var(--color-secondary)] uppercase text-[10px] mb-1">
-                  Engineering Rationale & Functional Scope
+                  1. Identified Problem & Engineering Rationale
                 </h4>
                 <p className="leading-relaxed text-[var(--color-on-surface-variant)]">
                   {selectedSpec.description}
                 </p>
               </div>
 
+              {/* Section 2: Supporting Evidence */}
               <div>
                 <h4 className="font-semibold text-[var(--color-secondary)] uppercase text-[10px] mb-1">
-                  Supporting Evidence & Sensor Observations
+                  2. Supporting Telemetry & Network Evidence
                 </h4>
-                <ul className="list-disc list-inside space-y-1 text-[var(--color-on-surface-variant)]">
+                <ul className="list-disc list-inside space-y-1 text-[var(--color-on-surface-variant)] bg-[var(--color-surface-container-low)] p-2.5 rounded-lg border border-[var(--color-surface-container-high)]">
                   {selectedSpec.supporting_evidence.map((ev, i) => (
                     <li key={i}>{ev}</li>
                   ))}
                 </ul>
               </div>
 
+              {/* Section 3: Priority Screening Score Breakdown */}
+              {selectedSpec.screening_score_breakdown && (
+                <div>
+                  <h4 className="font-semibold text-[var(--color-secondary)] uppercase text-[10px] mb-1">
+                    3. Priority Screening Score Breakdown ({selectedSpec.impact_score.toFixed(1)} / 10)
+                  </h4>
+                  <div className="grid grid-cols-2 md:grid-cols-3 gap-2 p-2.5 bg-[var(--color-surface-container-low)] rounded-lg border border-[var(--color-surface-container-high)] text-[11px]">
+                    <div>
+                      <span className="text-slate-500 block">Congestion:</span>
+                      <strong className="font-mono">{selectedSpec.screening_score_breakdown.congestion_factor ?? 0} pts</strong>
+                    </div>
+                    <div>
+                      <span className="text-slate-500 block">Delay Impact:</span>
+                      <strong className="font-mono">{selectedSpec.screening_score_breakdown.delay_factor ?? 0} pts</strong>
+                    </div>
+                    <div>
+                      <span className="text-slate-500 block">Road Hierarchy:</span>
+                      <strong className="font-mono">{selectedSpec.screening_score_breakdown.road_importance ?? 0} pts</strong>
+                    </div>
+                    <div>
+                      <span className="text-slate-500 block">Data Quality:</span>
+                      <strong className="font-mono">{selectedSpec.screening_score_breakdown.data_quality ?? 0} pts</strong>
+                    </div>
+                    <div>
+                      <span className="text-slate-500 block">Incident Modifier:</span>
+                      <strong className="font-mono">{selectedSpec.screening_score_breakdown.incident_modifier ?? 0} pts</strong>
+                    </div>
+                  </div>
+                  <p className="text-[10px] text-slate-500 mt-1 italic">
+                    Note: This priority score is a multi-criteria screening heuristic to prioritize capital allocation, not a predicted traffic reduction percentage.
+                  </p>
+                </div>
+              )}
+
+              {/* Section 4: Missing Information & Field Surveys */}
+              {selectedSpec.missing_evidence && selectedSpec.missing_evidence.length > 0 && (
+                <div>
+                  <h4 className="font-semibold text-amber-800 uppercase text-[10px] mb-1 flex items-center gap-1">
+                    <span className="material-symbols-outlined text-[13px]">search</span>
+                    4. Missing Data & Unverified Assumptions (Pre-Design Surveys)
+                  </h4>
+                  <ul className="list-disc list-inside space-y-1 text-amber-900 bg-amber-50/80 p-2.5 rounded-lg border border-amber-200 text-[11px]">
+                    {selectedSpec.missing_evidence.map((item, i) => (
+                      <li key={i}>{item}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {/* Section 5: Engineering Validation Checklist */}
+              {selectedSpec.engineering_validation_required && selectedSpec.engineering_validation_required.length > 0 && (
+                <div>
+                  <h4 className="font-semibold text-blue-800 uppercase text-[10px] mb-1 flex items-center gap-1">
+                    <span className="material-symbols-outlined text-[13px]">rule</span>
+                    5. Mandatory Civil Engineering Validation Checklist
+                  </h4>
+                  <ul className="list-disc list-inside space-y-1 text-blue-900 bg-blue-50/80 p-2.5 rounded-lg border border-blue-200 text-[11px]">
+                    {selectedSpec.engineering_validation_required.map((item, i) => (
+                      <li key={i}>{item}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {/* Section 6: Uncertainty Notes */}
               {selectedSpec.uncertainty_notes && (
                 <div className="p-3 rounded-lg bg-[var(--color-surface-container-low)] border border-[var(--color-surface-container-high)] text-[11px] text-[var(--color-on-surface-variant)]">
                   <div className="flex items-center gap-1.5 text-[var(--color-secondary)] font-bold mb-1">
                     <span className="material-symbols-outlined text-[15px]">info</span>
-                    <span>Civil Investigation & Field Surveys Mandatory:</span>
+                    <span>Screening Boundary & Field Verification Requirement:</span>
                   </div>
                   <p className="leading-relaxed">{selectedSpec.uncertainty_notes}</p>
                 </div>
@@ -576,7 +755,7 @@ export default function RecommendationsTab({
 
             <div className="pt-2 border-t border-[var(--color-surface-container-high)] flex items-center justify-between">
               <span className="text-[11px] font-mono text-[#166534] font-bold">
-                Impact Score: {selectedSpec.impact_score.toFixed(1)} / 10
+                Priority Screening Score: {selectedSpec.impact_score.toFixed(1)} / 10
               </span>
               <button
                 onClick={() => setSelectedSpec(null)}

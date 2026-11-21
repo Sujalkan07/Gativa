@@ -68,7 +68,7 @@ class RoadNetworkMetrics(BaseModel):
 
 # ─── Traffic ──────────────────────────────────────────────────────────────────
 
-CongestionLevel = Literal["free_flow", "moderate", "severe", "unknown"]
+CongestionLevel = Literal["free_flow", "moderate", "severe", "closed", "unknown"]
 JunctionControlType = Literal[
     "traffic_signal", "stop", "yield", "priority", "uncontrolled", "roundabout", "unknown"
 ]
@@ -88,6 +88,18 @@ class TrafficObservation(BaseModel):
     retrieval_timestamp: Optional[str] = None
     is_stale: bool = False
     source: str = "tomtom"
+    # Phase 1 Extended Fields
+    current_travel_time_seconds: Optional[float] = None
+    free_flow_travel_time_seconds: Optional[float] = None
+    delay_seconds: Optional[float] = None
+    delay_percentage: Optional[float] = None
+    confidence: Optional[float] = None
+    road_closure: bool = False
+    frc: Optional[str] = None
+    coordinates: Optional[list[list[float]]] = None
+    openlr: Optional[str] = None
+    match_quality: Optional[str] = None
+    match_distance_m: Optional[float] = None
 
 
 class RoadSegment(BaseModel):
@@ -123,17 +135,54 @@ class TrafficIncident(BaseModel):
     lng: float
     severity: Optional[str] = None
     affected_segment_ids: list[str] = []
+    # Phase 1 Extended Fields
+    icon_category: Optional[int] = None
+    icon_category_name: Optional[str] = None
+    magnitude_of_delay: Optional[int] = None
+    severity_label: Optional[str] = None
+    events: list[dict[str, Any]] = Field(default_factory=list)
+    event_codes: list[int] = Field(default_factory=list)
+    event_descriptions: list[str] = Field(default_factory=list)
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    from_location: Optional[str] = None
+    to_location: Optional[str] = None
+    length_m: Optional[float] = None
+    delay_seconds: Optional[float] = None
+    road_numbers: list[str] = Field(default_factory=list)
+    time_validity: Optional[str] = None
+    probability_of_occurrence: Optional[str] = None
+    number_of_reports: Optional[int] = None
+    last_report_time: Optional[str] = None
+    geometry: Optional[dict[str, Any]] = None
+    match_quality: Optional[str] = None
 
 
 class TrafficSummary(BaseModel):
     avg_observed_speed_kmh: Optional[float] = None
     avg_free_flow_speed_kmh: Optional[float] = None
     avg_speed_reduction: Optional[float] = None
+    avg_travel_time_delay_seconds: Optional[float] = None
+    avg_travel_time_delay_percentage: Optional[float] = None
+    length_weighted_avg_observed_speed_kmh: Optional[float] = None
+    length_weighted_avg_free_flow_speed_kmh: Optional[float] = None
     congested_segments: int = 0
     free_flow_segments: int = 0
     moderate_segments: int = 0
+    closed_segments: int = 0
+    road_closure_count: int = 0
     unknown_segments: int = 0
     total_observed: int = 0
+    total_eligible_segments: int = 0
+    total_sampled_segments: int = 0
+    total_unmatched_segments: int = 0
+    total_failed_requests: int = 0
+    total_unsampled_segments: int = 0
+    network_sample_coverage_pct: Optional[float] = None
+    request_success_rate_pct: Optional[float] = None
+    avg_confidence: Optional[float] = None
+    incident_count: int = 0
+    speed_weighting_method: str = "segment_length_weighted"
     observation_timestamp: Optional[str] = None
 
 
@@ -240,6 +289,14 @@ InterventionType = Literal[
 ]
 RecommendationPriority = Literal["high", "medium", "low"]
 ConfidenceLevel = Literal["high", "medium", "low"]
+CongestionCause = Literal[
+    "incident_related",
+    "road_closure",
+    "junction_approach",
+    "recurring_corridor",
+    "structural_connectivity",
+    "insufficient_evidence",
+]
 
 
 class Recommendation(BaseModel):
@@ -259,6 +316,12 @@ class Recommendation(BaseModel):
     uncertainty_notes: Optional[str] = None
     requires_engineering_review: bool = True
     priority_score: float = 0.0
+    # Phase 3: Evidence-based diagnosis & transparent screening
+    cause: Optional[CongestionCause] = None
+    screening_score_breakdown: Optional[dict[str, float]] = None
+    missing_evidence: list[str] = []
+    engineering_validation_required: list[str] = []
+    data_coverage_note: Optional[str] = None
 
 
 class RecommendationsResult(BaseModel):

@@ -5,6 +5,8 @@ from app.models.schemas import (
     RoadNetworkMetrics,
     RoadSegment,
     GeoJSONLineString,
+    TrafficIncident,
+    Recommendation,
 )
 from app.recommendations.engine import generate_recommendations
 
@@ -311,3 +313,337 @@ def test_signal_optimization_vs_installation_distinction():
     assert rec_unsig.intervention_type == "signal_installation"
     assert rec_unsig.category == "infrastructure_planning"
     assert "Warrant" in rec_unsig.title or "Signal" in rec_unsig.title
+
+
+def test_incident_related_congestion_rejects_permanent_expansion():
+    """Verify that accident or temporary incident congestion generates operational incident management, NOT widening/flyover."""
+    seg = RoadSegment(
+        segment_id="seg_incident_corridor",
+        name="Express Corridor",
+        road_type="highway",
+        osm_highway="motorway",
+        length_m=800.0,
+        lanes=4,
+        geometry=GeoJSONLineString(
+            type="LineString",
+            coordinates=[[77.200, 28.600], [77.210, 28.610]],
+        ),
+    )
+    b = BottleneckCandidate(
+        segment_id="seg_incident_corridor",
+        location_name="Express Corridor at Km 14",
+        lat=28.605,
+        lng=77.205,
+        bottleneck_type="combined",
+        severity="high",
+        evidence=["Active accident reported"],
+    )
+    obs = TrafficObservation(
+        segment_id="seg_incident_corridor",
+        observed_speed_kmh=12.0,
+        free_flow_speed_kmh=80.0,
+        speed_reduction_ratio=0.85,
+        delay_seconds=180.0,
+        congestion_level="severe",
+        has_incident=True,
+    )
+    incident = TrafficIncident(
+        incident_id="inc_001",
+        type="Major Multi-Vehicle Accident",
+        lat=28.605,
+        lng=77.205,
+        severity="Major",
+        severity_label="Major",
+        delay_seconds=180.0,
+        affected_segment_ids=["seg_incident_corridor"],
+    )
+
+    result = generate_recommendations(
+        analysis_id="test_incident_recs",
+        bottlenecks=[b],
+        traffic_by_segment={"seg_incident_corridor": obs},
+        metrics=None,
+        weather=None,
+        segments=[seg],
+        incidents=[incident],
+    )
+
+    # 1. Incident diagnosis
+    rec = result.recommendations[0]
+    assert rec.cause == "incident_related"
+    assert "Incident Traffic Management" in rec.title or "Clearance" in rec.title
+    assert rec.category == "traffic_optimization"
+    assert "permanent infrastructure" in rec.description.lower() or "incident" in rec.description.lower()
+
+    # 2. Strict evidence gate: No flyovers or underpasses or permanent widening generated for accident delay
+    flyovers = [r for r in result.recommendations if r.intervention_type == "flyover"]
+    underpasses = [r for r in result.recommendations if r.intervention_type == "underpass"]
+    widenings = [r for r in result.recommendations if r.intervention_type == "road_widening"]
+    assert len(flyovers) == 0
+    assert len(underpasses) == 0
+    assert len(widenings) == 0
+
+
+def test_road_closure_generates_diversion_guidance():
+    """Verify that physical road closures generate diversion routing rather than structural widening/flyover."""
+    seg = RoadSegment(
+        segment_id="seg_closed_corridor",
+        name="MG Road Trunk",
+        road_type="arterial",
+        osm_highway="primary",
+        length_m=500.0,
+        lanes=4,
+        geometry=GeoJSONLineString(
+            type="LineString",
+            coordinates=[[77.220, 28.620], [77.230, 28.630]],
+        ),
+    )
+    b = BottleneckCandidate(
+        segment_id="seg_closed_corridor",
+        location_name="MG Road Trunk",
+        lat=28.625,
+        lng=77.225,
+        bottleneck_type="traffic_observed",
+        severity="high",
+        evidence=["Road Closed"],
+    )
+    obs = TrafficObservation(
+        segment_id="seg_closed_corridor",
+        observed_speed_kmh=0.0,
+        free_flow_speed_kmh=50.0,
+        speed_reduction_ratio=1.0,
+        delay_seconds=300.0,
+        congestion_level="closed",
+        road_closure=True,
+    )
+
+    result = generate_recommendations(
+        analysis_id="test_closure_recs",
+        bottlenecks=[b],
+        traffic_by_segment={"seg_closed_corridor": obs},
+        metrics=None,
+        weather=None,
+        segments=[seg],
+    )
+
+    rec = result.recommendations[0]
+    assert rec.cause == "road_closure"
+    assert "Diversion" in rec.title or "Closure" in rec.title or "Route Guidance" in rec.title
+    assert rec.category == "traffic_optimization"
+    assert "TTCP" in " ".join(rec.engineering_validation_required) or "Traffic Control" in " ".join(rec.engineering_validation_required)
+
+
+def test_single_snapshot_vs_recurring_congestion():
+    """Verify that single snapshots are NOT diagnosed as recurring corridor congestion."""
+    b = BottleneckCandidate(
+        segment_id="seg_snapshot",
+        location_name="Ring Road East",
+        lat=28.630,
+        lng=77.230,
+        bottleneck_type="traffic_observed",
+        severity="high",
+        evidence=["Observed delay"],
+    )
+    obs = TrafficObservation(
+        segment_id="seg_snapshot",
+        observed_speed_kmh=20.0,
+        free_flow_speed_kmh=50.0,
+        speed_reduction_ratio=0.60,
+        delay_seconds=60.0,
+        congestion_level="severe",
+    )
+
+    # 1. Single snapshot test (default historical_snapshots_count = 1)
+    res_single = generate_recommendations(
+        analysis_id="single_snap",
+        bottlenecks=[b],
+        traffic_by_segment={"seg_snapshot": obs},
+        metrics=None,
+        weather=None,
+        historical_snapshots_count=1,
+    )
+    assert res_single.recommendations[0].cause != "recurring_corridor"
+
+    # 2. Multi-snapshot test (historical_snapshots_count = 5)
+    res_multi = generate_recommendations(
+        analysis_id="multi_snap",
+        bottlenecks=[b],
+        traffic_by_segment={"seg_snapshot": obs},
+        metrics=None,
+        weather=None,
+        historical_snapshots_count=5,
+    )
+    assert res_multi.recommendations[0].cause == "recurring_corridor"
+
+
+def test_low_confidence_and_poor_match_handling():
+    """Verify that low TomTom confidence or poor matching yields low recommendation confidence and survey baseline."""
+    b = BottleneckCandidate(
+        segment_id="seg_poor_match",
+        location_name="Ambiguous Street",
+        lat=28.635,
+        lng=77.235,
+        bottleneck_type="traffic_observed",
+        severity="medium",
+        evidence=["Telemetry available"],
+    )
+    obs = TrafficObservation(
+        segment_id="seg_poor_match",
+        observed_speed_kmh=15.0,
+        free_flow_speed_kmh=40.0,
+        speed_reduction_ratio=0.62,
+        congestion_level="severe",
+        confidence=0.35,  # Low TomTom confidence
+        match_quality="low",  # Dubious match
+        match_distance_m=42.0,
+    )
+
+    res = generate_recommendations(
+        analysis_id="low_conf_test",
+        bottlenecks=[b],
+        traffic_by_segment={"seg_poor_match": obs},
+        metrics=None,
+        weather=None,
+    )
+    rec = res.recommendations[0]
+    assert rec.confidence == "low"
+    assert rec.cause == "insufficient_evidence"
+    assert "Survey" in rec.title or "Verification" in rec.title
+
+
+def test_stale_observations_penalize_confidence():
+    """Verify that stale telemetry is assigned low confidence."""
+    b = BottleneckCandidate(
+        segment_id="seg_stale",
+        location_name="Old Telemetry Junction",
+        lat=28.640,
+        lng=77.240,
+        bottleneck_type="combined",
+        severity="medium",
+        evidence=["Stale telemetry"],
+    )
+    obs = TrafficObservation(
+        segment_id="seg_stale",
+        observed_speed_kmh=18.0,
+        free_flow_speed_kmh=45.0,
+        speed_reduction_ratio=0.60,
+        congestion_level="severe",
+        confidence=0.90,
+        is_stale=True,  # Stale data
+    )
+
+    res = generate_recommendations(
+        analysis_id="stale_test",
+        bottlenecks=[b],
+        traffic_by_segment={"seg_stale": obs},
+        metrics=None,
+        weather=None,
+    )
+    rec = res.recommendations[0]
+    assert rec.confidence == "low"
+
+
+def test_transparent_priority_score_breakdown():
+    """Verify that priority score breakdown contains all 5 factors."""
+    b = BottleneckCandidate(
+        segment_id="seg_breakdown",
+        location_name="Score Test Node",
+        lat=28.645,
+        lng=77.245,
+        bottleneck_type="combined",
+        severity="high",
+        centrality_score=0.12,
+        evidence=["Central node"],
+    )
+    obs = TrafficObservation(
+        segment_id="seg_breakdown",
+        observed_speed_kmh=20.0,
+        free_flow_speed_kmh=60.0,
+        speed_reduction_ratio=0.66,
+        delay_seconds=80.0,
+        congestion_level="severe",
+        confidence=0.85,
+        match_quality="high",
+    )
+
+    res = generate_recommendations(
+        analysis_id="score_test",
+        bottlenecks=[b],
+        traffic_by_segment={"seg_breakdown": obs},
+        metrics=None,
+        weather=None,
+    )
+    rec = res.recommendations[0]
+    bd = rec.screening_score_breakdown
+    assert bd is not None
+    assert "congestion_factor" in bd
+    assert "delay_factor" in bd
+    assert "road_importance" in bd
+    assert "data_quality" in bd
+    assert "incident_modifier" in bd
+    assert bd["congestion_factor"] > 0
+    assert bd["delay_factor"] > 0
+    assert rec.priority_score >= 4.0
+
+
+def test_structured_10_point_explanation_fields():
+    """Verify that all 10 evidence, missing data, and engineering validation fields are populated."""
+    b = BottleneckCandidate(
+        segment_id="seg_explain",
+        location_name="Diagnostic Node",
+        lat=28.650,
+        lng=77.250,
+        bottleneck_type="combined",
+        severity="high",
+        centrality_score=0.15,
+        evidence=["Central corridor junction"],
+    )
+    obs = TrafficObservation(
+        segment_id="seg_explain",
+        observed_speed_kmh=16.0,
+        free_flow_speed_kmh=50.0,
+        speed_reduction_ratio=0.68,
+        delay_seconds=75.0,
+        congestion_level="severe",
+        confidence=0.88,
+        match_quality="high",
+    )
+
+    res = generate_recommendations(
+        analysis_id="explain_test",
+        bottlenecks=[b],
+        traffic_by_segment={"seg_explain": obs},
+        metrics=None,
+        weather=None,
+    )
+    rec = res.recommendations[0]
+
+    assert rec.cause is not None
+    assert len(rec.supporting_evidence) >= 3
+    assert len(rec.missing_evidence) >= 1
+    assert len(rec.engineering_validation_required) >= 1
+    assert rec.uncertainty_notes is not None
+    assert rec.data_coverage_note is not None
+    assert rec.requires_engineering_review is True
+
+
+def test_schema_backward_compatibility():
+    """Verify that Recommendation object can be instantiated and serialized with and without new Phase 3 fields."""
+    # Instantiation without Phase 3 fields
+    legacy_rec = Recommendation(
+        recommendation_id="legacy_01",
+        title="Legacy Signal Recommendation",
+        intervention_type="signal_optimization",
+        description="Legacy description",
+        priority="high",
+        impact_score=7.5,
+    )
+    assert legacy_rec.cause is None
+    assert legacy_rec.missing_evidence == []
+    assert legacy_rec.engineering_validation_required == []
+
+    # Serialization and deserialization
+    data = legacy_rec.model_dump()
+    reconstructed = Recommendation.model_validate(data)
+    assert reconstructed.recommendation_id == "legacy_01"
+    assert reconstructed.priority_score == 0.0

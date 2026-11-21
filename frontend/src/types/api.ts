@@ -73,12 +73,26 @@ export interface GeoJSONLineString {
   coordinates: number[][]
 }
 
+export type CongestionLevel = 'free_flow' | 'moderate' | 'severe' | 'closed' | 'unknown'
+export type MatchQuality = 'high' | 'medium' | 'low' | 'unmatched'
+
 export interface TrafficObservation {
   segment_id: string
   observed_speed_kmh: number | null
   free_flow_speed_kmh: number | null
+  current_travel_time_seconds?: number | null
+  free_flow_travel_time_seconds?: number | null
+  delay_seconds?: number | null
+  delay_percentage?: number | null
+  confidence?: number | null
+  road_closure?: boolean
+  frc?: string | null
+  coordinates?: number[][] | null
+  openlr?: Record<string, unknown> | null
+  match_quality?: MatchQuality | string | null
+  match_distance_m?: number | null
   speed_reduction_ratio: number | null
-  congestion_level: 'free_flow' | 'moderate' | 'severe' | 'unknown'
+  congestion_level: CongestionLevel
   has_incident: boolean
   observation_timestamp: string | null
   retrieval_timestamp?: string | null
@@ -150,38 +164,87 @@ export interface AnalysisResult {
 
 // ─── Traffic Flow ─────────────────────────────────────────────────────────────
 
-export interface TrafficFlowResult {
-  analysis_id: string
-  segments: RoadSegment[]
-  summary: {
-    avg_observed_speed_kmh: number | null
-    avg_free_flow_speed_kmh: number | null
-    avg_speed_reduction: number | null
-    congested_segments: number
-    free_flow_segments: number
-    moderate_segments: number
-    unknown_segments: number
-    total_observed: number
-    observation_timestamp: string | null
-  }
-  incidents: TrafficIncident[]
-  data_source: DataSourceCoverage
+export interface TrafficSummary {
+  avg_observed_speed_kmh: number | null
+  avg_free_flow_speed_kmh: number | null
+  avg_speed_reduction: number | null
+  avg_travel_time_delay_seconds?: number | null
+  avg_travel_time_delay_percentage?: number | null
+  length_weighted_avg_observed_speed_kmh?: number | null
+  length_weighted_avg_free_flow_speed_kmh?: number | null
+  congested_segments: number
+  free_flow_segments: number
+  moderate_segments: number
+  unknown_segments: number
+  closed_segments?: number
+  road_closure_count?: number
+  total_eligible_segments?: number
+  total_sampled_segments?: number
+  total_unmatched_segments?: number
+  total_failed_requests?: number
+  total_unsampled_segments?: number
+  network_sample_coverage_pct?: number | null
+  request_success_rate_pct?: number | null
+  avg_confidence?: number | null
+  incident_count?: number
+  speed_weighting_method?: string
+  total_observed: number
+  observation_timestamp: string | null
 }
 
 export interface TrafficIncident {
   incident_id: string
   type: string
+  icon_category?: number | null
+  icon_category_name?: string | null
+  magnitude_of_delay?: number | null
+  severity_label?: string | null
   description: string | null
+  events?: string[]
+  event_codes?: number[]
+  event_descriptions?: string[]
   lat: number
   lng: number
+  start_time?: string | null
+  end_time?: string | null
+  from_location?: string | null
+  to_location?: string | null
+  length_m?: number | null
+  delay_seconds?: number | null
+  road_numbers?: string[]
+  time_validity?: string | null
+  probability_of_occurrence?: string | null
+  number_of_reports?: number | null
+  last_report_time?: string | null
+  geometry?: {
+    type: 'Point' | 'LineString' | string
+    coordinates: any
+  } | null
+  match_quality?: string | null
   severity: string | null
   affected_segment_ids: string[]
+}
+
+export interface TrafficFlowResult {
+  analysis_id: string
+  segments: RoadSegment[]
+  summary: TrafficSummary
+  incidents: TrafficIncident[]
+  data_source: DataSourceCoverage
 }
 
 // ─── Recommendations ──────────────────────────────────────────────────────────
 
 export type RecommendationCategory = 'traffic_optimization' | 'infrastructure_planning'
 export type RecommendationPriority = 'high' | 'medium' | 'low'
+export type CongestionCause =
+  | 'incident_related'
+  | 'road_closure'
+  | 'junction_approach'
+  | 'recurring_corridor'
+  | 'structural_connectivity'
+  | 'insufficient_evidence'
+
 export type InterventionType =
   | 'signal_optimization'
   | 'roundabout'
@@ -214,6 +277,11 @@ export interface Recommendation {
   uncertainty_notes: string | null
   requires_engineering_review: boolean
   priority_score: number
+  cause?: CongestionCause | null
+  screening_score_breakdown?: Record<string, number> | null
+  missing_evidence?: string[]
+  engineering_validation_required?: string[]
+  data_coverage_note?: string | null
 }
 
 export interface RecommendationsResult {

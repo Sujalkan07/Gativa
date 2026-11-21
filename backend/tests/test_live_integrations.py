@@ -22,7 +22,7 @@ async def test_live_tomtom_flow():
     if coverage.status == "ok":
         assert obs is not None
         assert obs.observed_speed_kmh is not None or obs.free_flow_speed_kmh is not None
-        assert obs.congestion_level in ("free_flow", "moderate", "severe", "unknown")
+        assert obs.congestion_level in ("free_flow", "moderate", "severe", "closed", "unknown")
 
 
 @pytest.mark.asyncio

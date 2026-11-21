@@ -16,6 +16,7 @@ import type {
   RoadSegment,
   BottleneckCandidate,
   Recommendation,
+  TrafficIncident,
 } from '../../types/api'
 
 interface AnalysisMapProps {
@@ -23,11 +24,16 @@ interface AnalysisMapProps {
   segments: RoadSegment[]
   bottlenecks: BottleneckCandidate[]
   recommendations?: Recommendation[]
+  incidents?: TrafficIncident[]
   mode?: 'topology' | 'flow'
   selectedBottleneckId?: string | null
   onSelectBottleneck?: (id: string) => void
   selectedRecommendationId?: string | null
   onSelectRecommendation?: (id: string) => void
+  selectedSegmentId?: string | null
+  onSelectSegment?: (id: string | null) => void
+  selectedIncidentId?: string | null
+  onSelectIncident?: (id: string | null) => void
   className?: string
 }
 
@@ -36,11 +42,16 @@ export default function AnalysisMap({
   segments,
   bottlenecks,
   recommendations = [],
+  incidents = [],
   mode = 'topology',
   selectedBottleneckId,
   onSelectBottleneck,
   selectedRecommendationId,
   onSelectRecommendation,
+  selectedSegmentId,
+  onSelectSegment,
+  selectedIncidentId,
+  onSelectIncident,
   className = 'w-full h-[520px]',
 }: AnalysisMapProps) {
   const containerRef = useRef<HTMLDivElement>(null)
@@ -51,16 +62,21 @@ export default function AnalysisMap({
   const trafficTileHandleRef = useRef<TrafficLayerHandle | null>(null)
   const polygonLayerRef = useRef<L.Polygon | null>(null)
   const roadsGroupRef = useRef<L.LayerGroup | null>(null)
+  const incidentsGroupRef = useRef<L.LayerGroup | null>(null)
   const bottlenecksGroupRef = useRef<L.LayerGroup | null>(null)
   const recommendationsGroupRef = useRef<L.LayerGroup | null>(null)
   const markersMapRef = useRef<Map<string, L.Marker>>(new Map())
+  const incidentMarkersMapRef = useRef<Map<string, L.Layer>>(new Map())
+  const segmentLayersMapRef = useRef<Map<string, L.Polyline>>(new Map())
 
   const hasTomTomKey = Boolean(getTomTomApiKey())
 
   // Controls state
   const [baseLayerType, setBaseLayerType] = useState<BaseLayerType>('streets')
   const [showRoads, setShowRoads] = useState(true)
-  const [showBottlenecks, setShowBottlenecks] = useState(true)
+  const [showIncidents, setShowIncidents] = useState(true)
+  const [showClosuresOnly, setShowClosuresOnly] = useState(false)
+  const [showBottlenecks, setShowBottlenecks] = useState(mode !== 'flow')
   const [showRecommendations, setShowRecommendations] = useState(true)
   const [showTomTomTraffic, setShowTomTomTraffic] = useState(true)
   const [baseMapStatus, setBaseMapStatus] = useState<BaseMapStatus>({
@@ -118,6 +134,7 @@ export default function AnalysisMap({
     L.control.zoom({ position: 'bottomright' }).addTo(map)
 
     roadsGroupRef.current = L.layerGroup().addTo(map)
+    incidentsGroupRef.current = L.layerGroup().addTo(map)
     bottlenecksGroupRef.current = L.layerGroup().addTo(map)
     recommendationsGroupRef.current = L.layerGroup().addTo(map)
     mapRef.current = map
@@ -233,51 +250,68 @@ export default function AnalysisMap({
     if (!roadsGroup) return
 
     roadsGroup.clearLayers()
+    segmentLayersMapRef.current.clear()
     if (!showRoads) return
 
     segments.forEach((seg) => {
       if (seg.is_buffer) return // Core analysis map presents the user's selected study area roads
       if (!seg.geometry || !seg.geometry.coordinates || seg.geometry.coordinates.length < 2) return
 
+      const isClosed = seg.traffic?.congestion_level === 'closed' || seg.traffic?.road_closure === true
+      if (showClosuresOnly && !isClosed) return
+
       const latLngs: L.LatLngExpression[] = seg.geometry.coordinates.map((c) => [c[1], c[0]])
+      const isSelected = seg.segment_id === selectedSegmentId
+      const isLowMatch = seg.traffic?.match_quality === 'low' || seg.traffic?.match_quality === 'unmatched'
 
       let color = '#64748b' // default local slate
-      let weight = 2.5
+      let weight = isSelected ? 5.5 : 2.5
       let opacity = 0.75
+      let dashArray: string | undefined = undefined
 
       if (mode === 'flow') {
-        // Congestion / Level of Service flow colors
         const level = seg.traffic?.congestion_level
-        if (level === 'severe') {
+        if (isClosed) {
+          // Closed road: distinct dark charcoal/black with prominent dash
+          color = '#1e1b18'
+          weight = isSelected ? 7 : 5.5
+          opacity = 1.0
+          dashArray = '6, 6'
+        } else if (level === 'severe') {
           color = '#ba1a1a'
-          weight = 5
+          weight = isSelected ? 7 : 5
           opacity = 0.95
         } else if (level === 'moderate') {
           color = '#ff9933'
-          weight = 4
+          weight = isSelected ? 6 : 4
           opacity = 0.9
         } else if (level === 'free_flow') {
           color = '#138808'
-          weight = 3.5
+          weight = isSelected ? 5.5 : 3.5
           opacity = 0.85
         } else {
+          // Unobserved / unknown
           color = '#94a3b8'
-          weight = 2
-          opacity = 0.6
+          weight = isSelected ? 4 : 2
+          opacity = 0.55
+        }
+
+        if (isLowMatch && !isClosed) {
+          dashArray = '4, 4'
         }
       } else {
         // Road classification topology colors
         if (seg.road_type === 'highway') {
           color = '#ff9933' // Orange
-          weight = 5
+          weight = isSelected ? 7 : 5
           opacity = 0.95
         } else if (seg.road_type === 'arterial') {
           color = '#2d3b8f' // Royal Navy
-          weight = 3.5
+          weight = isSelected ? 5.5 : 3.5
           opacity = 0.9
         } else {
           color = '#64748b' // Slate
-          weight = 2
+          weight = isSelected ? 4 : 2
           opacity = 0.65
         }
       }
@@ -286,36 +320,79 @@ export default function AnalysisMap({
         color,
         weight,
         opacity,
+        dashArray,
         lineCap: 'round',
         lineJoin: 'round',
       })
 
-      // Interactive Tooltip showing Real Street Name & Attributes
       const roadTitle = seg.name || (seg.road_type === 'highway' ? 'Highway Corridor' : seg.road_type === 'arterial' ? 'Arterial Corridor' : 'Connecting Street')
-      const speedObs = seg.traffic?.observed_speed_kmh
-        ? `${seg.traffic.observed_speed_kmh.toFixed(0)} km/h`
-        : 'Free Flow'
 
-      polyline.bindTooltip(
-        `<div class="font-sans text-xs">
-          <p class="font-bold text-[#0b1c30] text-[13px]">${roadTitle}</p>
-          <div class="flex flex-wrap items-center gap-1.5 mt-1 text-[#554336]">
-            <span class="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase ${
-              seg.road_type === 'highway'
-                ? 'bg-[#ffeedb] text-[#855400]'
-                : seg.road_type === 'arterial'
-                ? 'bg-[#e0e0ff] text-[#2d3b8f]'
-                : 'bg-[#f1f5f9] text-[#475569]'
-            }">${seg.road_type}</span>
-            ${seg.osm_highway ? `<span class="text-[10px] font-mono text-slate-500">osm:${seg.osm_highway}</span>` : ''}
-            <span>• ${seg.length_m.toFixed(0)}m</span>
-            <span>• ${seg.is_oneway ? '1-way' : '2-way'}</span>
-            ${seg.lanes ? `<span>• ${seg.lanes}L</span>` : ''}
-            <span>• Speed: ${speedObs}</span>
-          </div>
-        </div>`,
-        { sticky: true, opacity: 0.95 },
-      )
+      if (mode === 'flow') {
+        const obs = seg.traffic?.observed_speed_kmh != null ? `${seg.traffic.observed_speed_kmh.toFixed(1)} km/h` : 'Unobserved'
+        const ff = seg.traffic?.free_flow_speed_kmh != null ? `${seg.traffic.free_flow_speed_kmh.toFixed(1)} km/h` : '—'
+        const delayStr = seg.traffic?.delay_seconds != null
+          ? `+${seg.traffic.delay_seconds.toFixed(0)}s (${(seg.traffic.delay_percentage ?? 0).toFixed(0)}%)`
+          : '—'
+        const confStr = seg.traffic?.confidence != null ? `${Math.round(seg.traffic.confidence * 100)}%` : '—'
+        const matchStr = seg.traffic?.match_quality
+          ? `${seg.traffic.match_quality}${seg.traffic.match_distance_m != null ? ` (${seg.traffic.match_distance_m.toFixed(1)}m)` : ''}`
+          : 'osm-midpoint'
+
+        const statusBadge = isClosed
+          ? '<span class="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase bg-zinc-900 text-red-400 border border-red-500">ROAD CLOSED</span>'
+          : seg.traffic?.congestion_level === 'severe'
+          ? '<span class="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase bg-[#ffdad6] text-[#ba1a1a]">Severe Delay</span>'
+          : seg.traffic?.congestion_level === 'moderate'
+          ? '<span class="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase bg-[#ffeedb] text-[#b45309]">Moderate Congestion</span>'
+          : seg.traffic?.congestion_level === 'free_flow'
+          ? '<span class="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase bg-[#e6f4ea] text-[#138808]">Free Flow</span>'
+          : '<span class="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase bg-slate-100 text-slate-600">Unsampled</span>'
+
+        polyline.bindTooltip(
+          `<div class="font-sans text-xs min-w-[210px]">
+            <div class="flex items-center justify-between gap-1 pb-1 mb-1 border-b border-slate-200">
+              <span class="font-bold text-[#0b1c30] text-[13px] truncate">${roadTitle}</span>
+              ${statusBadge}
+            </div>
+            <div class="grid grid-cols-2 gap-x-2 gap-y-1 text-[11px] text-[#334155] my-1">
+              <div><span class="text-slate-500">Observed:</span> <strong>${obs}</strong></div>
+              <div><span class="text-slate-500">Free-Flow:</span> <strong>${ff}</strong></div>
+              <div><span class="text-slate-500">Delay:</span> <strong>${delayStr}</strong></div>
+              <div><span class="text-slate-500">Confidence:</span> <strong>${confStr}</strong></div>
+            </div>
+            <div class="text-[10px] text-slate-500 border-t border-slate-100 pt-1 flex justify-between">
+              <span>${seg.road_type} • ${seg.length_m.toFixed(0)}m</span>
+              <span>Match: ${matchStr}</span>
+            </div>
+          </div>`,
+          { sticky: true, opacity: 0.98 }
+        )
+      } else {
+        const speedObs = seg.traffic?.observed_speed_kmh
+          ? `${seg.traffic.observed_speed_kmh.toFixed(0)} km/h`
+          : 'Free Flow'
+
+        polyline.bindTooltip(
+          `<div class="font-sans text-xs">
+            <p class="font-bold text-[#0b1c30] text-[13px]">${roadTitle}</p>
+            <div class="flex flex-wrap items-center gap-1.5 mt-1 text-[#554336]">
+              <span class="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase ${
+                seg.road_type === 'highway'
+                  ? 'bg-[#ffeedb] text-[#855400]'
+                  : seg.road_type === 'arterial'
+                  ? 'bg-[#e0e0ff] text-[#2d3b8f]'
+                  : 'bg-[#f1f5f9] text-[#475569]'
+              }">${seg.road_type}</span>
+              ${seg.osm_highway ? `<span class="text-[10px] font-mono text-slate-500">osm:${seg.osm_highway}</span>` : ''}
+              <span>• ${seg.length_m.toFixed(0)}m</span>
+              <span>• ${seg.is_oneway ? '1-way' : '2-way'}</span>
+              ${seg.lanes ? `<span>• ${seg.lanes}L</span>` : ''}
+              <span>• Speed: ${speedObs}</span>
+            </div>
+          </div>`,
+          { sticky: true, opacity: 0.95 },
+        )
+      }
 
       polyline.on('mouseover', () => {
         polyline.setStyle({ weight: weight + 2.5, opacity: 1.0 })
@@ -323,10 +400,160 @@ export default function AnalysisMap({
       polyline.on('mouseout', () => {
         polyline.setStyle({ weight, opacity })
       })
+      polyline.on('click', () => {
+        if (onSelectSegment) {
+          onSelectSegment(seg.segment_id)
+        }
+      })
 
+      segmentLayersMapRef.current.set(seg.segment_id, polyline)
       roadsGroup.addLayer(polyline)
     })
-  }, [segments, showRoads, mode])
+  }, [segments, showRoads, showClosuresOnly, mode, selectedSegmentId, onSelectSegment])
+
+  // 4b. Render Traffic Incidents
+  useEffect(() => {
+    const incGroup = incidentsGroupRef.current
+    if (!incGroup) return
+
+    incGroup.clearLayers()
+    incidentMarkersMapRef.current.clear()
+
+    if (!showIncidents || !incidents || incidents.length === 0) return
+
+    incidents.forEach((inc) => {
+      // 1. If geometry is LineString, draw polyline on map
+      if (
+        inc.geometry &&
+        inc.geometry.type === 'LineString' &&
+        Array.isArray(inc.geometry.coordinates) &&
+        inc.geometry.coordinates.length >= 2
+      ) {
+        const lineCoords: L.LatLngExpression[] = inc.geometry.coordinates.map((c: number[]) => [c[1], c[0]])
+        const incLine = L.polyline(lineCoords, {
+          color: '#ba1a1a',
+          weight: 6,
+          opacity: 0.85,
+          dashArray: '6, 4',
+          lineCap: 'round',
+        })
+        incLine.bindTooltip(
+          `<div class="font-sans text-xs">
+            <p class="font-bold text-[#ba1a1a]">${inc.type}</p>
+            <p class="text-[11px] text-slate-700">${inc.description || 'Traffic incident on corridor'}</p>
+            ${inc.delay_seconds ? `<p class="font-bold text-red-700 text-[11px]">Delay: +${Math.round(inc.delay_seconds / 60)} min (${inc.delay_seconds.toFixed(0)}s)</p>` : ''}
+          </div>`,
+          { sticky: true }
+        )
+        incLine.on('click', () => {
+          onSelectIncident?.(inc.incident_id)
+        })
+        incGroup.addLayer(incLine)
+        incidentMarkersMapRef.current.set(`line_${inc.incident_id}`, incLine)
+      }
+
+      // 2. Incident Pin at [inc.lat, inc.lng]
+      const delayBadge =
+        inc.delay_seconds && inc.delay_seconds > 0
+          ? `+${Math.round(inc.delay_seconds / 60)}m`
+          : inc.severity_label || inc.severity || 'Alert'
+
+      const isClosure =
+        inc.type.toLowerCase().includes('closed') ||
+        Boolean(inc.description && inc.description.toLowerCase().includes('closed')) ||
+        Boolean(inc.icon_category_name && inc.icon_category_name.toLowerCase().includes('closure'))
+
+      const pinBg = isClosure ? '#1e1b18' : '#ba1a1a'
+      const pinIcon = isClosure ? 'block' : 'warning'
+
+      const icon = L.divIcon({
+        className: 'custom-incident-pin',
+        iconSize: [30, 30],
+        iconAnchor: [15, 15],
+        popupAnchor: [0, -15],
+        html: `
+          <div class="relative w-7 h-7 flex items-center justify-center cursor-pointer group">
+            <span class="absolute w-7 h-7 rounded-full bg-red-500/30 animate-ping"></span>
+            <div class="relative w-6 h-6 rounded-full flex items-center justify-center shadow-lg border-2 border-white text-white font-bold" style="background-color: ${pinBg};">
+              <span class="material-symbols-outlined text-[13px]">${pinIcon}</span>
+            </div>
+            <span class="absolute -bottom-2 bg-red-950 text-white text-[9px] px-1 py-0.2 rounded font-mono font-bold shadow-xs whitespace-nowrap">
+              ${delayBadge}
+            </span>
+          </div>
+        `,
+      })
+
+      const marker = L.marker([inc.lat, inc.lng], { icon })
+
+      const popupHtml = `
+        <div class="font-sans p-1 text-xs max-w-[280px]">
+          <div class="flex items-center justify-between gap-2 border-b border-[#e2e8f0] pb-1.5 mb-2">
+            <div class="flex items-center gap-1.5">
+              <span class="w-2.5 h-2.5 rounded-full" style="background-color: ${pinBg};"></span>
+              <span class="font-bold text-xs uppercase tracking-tight text-[#ba1a1a]">${inc.type}</span>
+            </div>
+            <span class="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase ${
+              isClosure ? 'bg-zinc-800 text-white' : 'bg-[#ffdad6] text-[#ba1a1a]'
+            }">${inc.severity_label || inc.severity || 'Active'}</span>
+          </div>
+
+          <p class="font-bold text-[#0b1c30] text-sm leading-snug mb-1">${inc.description || 'Active incident impacting traffic corridor.'}</p>
+
+          ${
+            inc.road_numbers && inc.road_numbers.length > 0
+              ? `<p class="text-[11px] text-[#554336] mb-1 font-semibold">Affected Corridor: ${inc.road_numbers.join(', ')}</p>`
+              : ''
+          }
+          ${
+            inc.from_location || inc.to_location
+              ? `<p class="text-[10px] text-slate-500 mb-1.5">Between: ${inc.from_location || '—'} &rarr; ${inc.to_location || '—'}</p>`
+              : ''
+          }
+
+          <div class="bg-[#fef2f2] p-2 rounded border border-[#fecaca] mb-2 space-y-1">
+            ${
+              inc.delay_seconds != null
+                ? `<div class="flex justify-between font-mono text-[11px]">
+                    <span class="text-red-700 font-semibold">Incident Delay:</span>
+                    <span class="font-bold text-red-900">+${inc.delay_seconds.toFixed(0)}s (+${Math.round(inc.delay_seconds / 60)} min)</span>
+                   </div>`
+                : ''
+            }
+            ${
+              inc.length_m != null
+                ? `<div class="flex justify-between font-mono text-[10px] text-slate-600">
+                    <span>Impact Stretch:</span>
+                    <span>${inc.length_m.toFixed(0)}m</span>
+                   </div>`
+                : ''
+            }
+            ${
+              inc.start_time
+                ? `<div class="flex justify-between text-[10px] text-slate-600">
+                    <span>Reported:</span>
+                    <span>${new Date(inc.start_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                   </div>`
+                : ''
+            }
+          </div>
+
+          <div class="flex items-center justify-between text-[10px] text-[#64748b] bg-[#f8fafc] p-1.5 rounded">
+            <span>Correlated Segments: <strong>${inc.affected_segment_ids.length}</strong></span>
+            <span>Match: <strong>${inc.match_quality || 'spatial'}</strong></span>
+          </div>
+        </div>
+      `
+
+      marker.bindPopup(popupHtml, { maxWidth: 300 })
+      marker.on('click', () => {
+        onSelectIncident?.(inc.incident_id)
+      })
+
+      incidentMarkersMapRef.current.set(`marker_${inc.incident_id}`, marker)
+      incGroup.addLayer(marker)
+    })
+  }, [incidents, showIncidents, onSelectIncident])
 
   // 5. Render Problem Markers (Bottlenecks)
   useEffect(() => {
@@ -540,6 +767,43 @@ export default function AnalysisMap({
     }
   }, [selectedRecommendationId, recommendations])
 
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+
+    if (selectedSegmentId) {
+      const seg = segments.find((s) => s.segment_id === selectedSegmentId)
+      if (seg?.geometry?.coordinates?.length) {
+        const latLngs: L.LatLngExpression[] = seg.geometry.coordinates.map((c) => [c[1], c[0]])
+        const bounds = L.latLngBounds(latLngs)
+        if (bounds.isValid()) {
+          map.fitBounds(bounds, { maxZoom: 17, padding: [40, 40] })
+          const polyline = segmentLayersMapRef.current.get(selectedSegmentId)
+          if (polyline) {
+            polyline.openTooltip()
+            polyline.bringToFront()
+          }
+        }
+      }
+    }
+  }, [selectedSegmentId, segments])
+
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+
+    if (selectedIncidentId) {
+      const inc = incidents.find((i) => i.incident_id === selectedIncidentId)
+      if (inc) {
+        map.flyTo([inc.lat, inc.lng], 16, { duration: 0.8 })
+        const marker = incidentMarkersMapRef.current.get(`marker_${inc.incident_id}`) as L.Marker | undefined
+        if (marker && typeof marker.openPopup === 'function') {
+          marker.openPopup()
+        }
+      }
+    }
+  }, [selectedIncidentId, incidents])
+
   // Reset view to polygon
   const handleResetView = useCallback(() => {
     const map = mapRef.current
@@ -553,6 +817,10 @@ export default function AnalysisMap({
     }
   }, [])
 
+  const hasClosures = segments.some(
+    (s) => s.traffic?.congestion_level === 'closed' || s.traffic?.road_closure === true
+  )
+
   return (
     <div className={`relative rounded-xl overflow-hidden shadow-sm border border-[var(--color-surface-container-high)] ${className}`}>
       {/* Map Surface */}
@@ -564,46 +832,71 @@ export default function AnalysisMap({
         <div className="pointer-events-auto bg-[var(--color-surface-container-lowest)]/95 backdrop-blur-md px-3 py-1.5 rounded-lg shadow-md border border-[var(--color-surface-container-high)] flex items-center gap-3 text-xs">
           <div className="flex items-center gap-1.5 font-bold text-[var(--color-on-surface)]">
             <span className="material-symbols-outlined text-[16px] text-[var(--color-primary-container)]">
-              traffic
+              {mode === 'flow' ? 'speed' : 'traffic'}
             </span>
             <span>
               {baseMapStatus.isFallback
                 ? `${baseMapStatus.displayName} (TomTom Fallback)`
                 : baseMapStatus.displayName}{' '}
-              · Traffic Analysis
+              · {mode === 'flow' ? 'Traffic Flow' : 'Traffic Analysis'}
             </span>
           </div>
           <span className="text-[var(--color-surface-container-high)]">|</span>
-          <div className="flex items-center gap-2">
-            <span className="flex items-center gap-1 text-[11px] text-[var(--color-on-surface-variant)]">
-              <span className="w-2.5 h-1.5 rounded-sm bg-[#ff9933]"></span> Selected Area
-            </span>
-            <span className="flex items-center gap-1 text-[11px] text-[var(--color-on-surface-variant)]">
-              <span className="w-2.5 h-1.5 rounded-sm bg-[#2d3b8f]"></span> Roads
-            </span>
-            <span className="flex items-center gap-1 text-[11px] text-[var(--color-error)] font-semibold">
-              <span className="w-2 h-2 rounded-full bg-[#ba1a1a]"></span> Problems ({bottlenecks.length})
-            </span>
-            {recommendations.length > 0 && (
-              <>
-                <span className="flex items-center gap-1 text-[11px] text-[#006a6a] font-semibold">
-                  <span className="w-2 h-2 rounded-full bg-[#006a6a]"></span> Operations (
-                  {
-                    recommendations.filter(
-                      (r) => (r.category ?? 'traffic_optimization') === 'traffic_optimization'
-                    ).length
-                  }
-                  )
+          {mode === 'flow' ? (
+            <div className="flex items-center gap-2">
+              <span className="flex items-center gap-1 text-[11px] text-[#138808] font-semibold">
+                <span className="w-2.5 h-1.5 rounded-sm bg-[#138808]"></span> Free Flow
+              </span>
+              <span className="flex items-center gap-1 text-[11px] text-[#ff9933] font-semibold">
+                <span className="w-2.5 h-1.5 rounded-sm bg-[#ff9933]"></span> Moderate
+              </span>
+              <span className="flex items-center gap-1 text-[11px] text-[#ba1a1a] font-semibold">
+                <span className="w-2.5 h-1.5 rounded-sm bg-[#ba1a1a]"></span> Severe
+              </span>
+              <span className="flex items-center gap-1 text-[11px] text-zinc-900 font-bold">
+                <span className="w-2.5 h-1.5 rounded-sm bg-[#1e1b18] border border-dashed border-red-500"></span> Closed
+              </span>
+              <span className="flex items-center gap-1 text-[11px] text-slate-500">
+                <span className="w-2.5 h-1.5 rounded-sm bg-[#94a3b8]"></span> Unobserved
+              </span>
+              {incidents.length > 0 && (
+                <span className="flex items-center gap-1 text-[11px] text-[var(--color-error)] font-bold">
+                  <span className="w-2 h-2 rounded-full bg-[#ba1a1a]"></span> Incidents ({incidents.length})
                 </span>
-                {recommendations.some((r) => r.category === 'infrastructure_planning') && (
-                  <span className="flex items-center gap-1 text-[11px] text-[#c2410c] font-semibold">
-                    <span className="w-2 h-2 rounded-full bg-[#c2410c]"></span> Infrastructure (
-                    {recommendations.filter((r) => r.category === 'infrastructure_planning').length})
+              )}
+            </div>
+          ) : (
+            <div className="flex items-center gap-2">
+              <span className="flex items-center gap-1 text-[11px] text-[var(--color-on-surface-variant)]">
+                <span className="w-2.5 h-1.5 rounded-sm bg-[#ff9933]"></span> Selected Area
+              </span>
+              <span className="flex items-center gap-1 text-[11px] text-[var(--color-on-surface-variant)]">
+                <span className="w-2.5 h-1.5 rounded-sm bg-[#2d3b8f]"></span> Roads
+              </span>
+              <span className="flex items-center gap-1 text-[11px] text-[var(--color-error)] font-semibold">
+                <span className="w-2 h-2 rounded-full bg-[#ba1a1a]"></span> Problems ({bottlenecks.length})
+              </span>
+              {recommendations.length > 0 && (
+                <>
+                  <span className="flex items-center gap-1 text-[11px] text-[#006a6a] font-semibold">
+                    <span className="w-2 h-2 rounded-full bg-[#006a6a]"></span> Operations (
+                    {
+                      recommendations.filter(
+                        (r) => (r.category ?? 'traffic_optimization') === 'traffic_optimization'
+                      ).length
+                    }
+                    )
                   </span>
-                )}
-              </>
-            )}
-          </div>
+                  {recommendations.some((r) => r.category === 'infrastructure_planning') && (
+                    <span className="flex items-center gap-1 text-[11px] text-[#c2410c] font-semibold">
+                      <span className="w-2 h-2 rounded-full bg-[#c2410c]"></span> Infrastructure (
+                      {recommendations.filter((r) => r.category === 'infrastructure_planning').length})
+                    </span>
+                  )}
+                </>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Right: Active Toggles & Style Switcher */}
@@ -672,20 +965,52 @@ export default function AnalysisMap({
             Roads
           </button>
 
-          <button
-            onClick={() => setShowBottlenecks(!showBottlenecks)}
-            title="Toggle Problem Markers"
-            className={`px-2 py-1 rounded text-xs font-semibold flex items-center gap-1 transition-colors ${
-              showBottlenecks
-                ? 'bg-[#ffdad6] text-[#ba1a1a]'
-                : 'text-[var(--color-on-surface-variant)] opacity-50'
-            }`}
-          >
-            <span className="material-symbols-outlined text-[14px]">warning</span>
-            Problems
-          </button>
+          {mode === 'flow' && hasClosures && (
+            <button
+              onClick={() => setShowClosuresOnly(!showClosuresOnly)}
+              title="Filter to Closed Roads Only"
+              className={`px-2 py-1 rounded text-xs font-semibold flex items-center gap-1 transition-colors ${
+                showClosuresOnly
+                  ? 'bg-zinc-900 text-red-400 border border-red-500'
+                  : 'text-[var(--color-on-surface-variant)] opacity-70'
+              }`}
+            >
+              <span className="material-symbols-outlined text-[14px]">block</span>
+              Closures Only
+            </button>
+          )}
 
-          {recommendations.length > 0 && (
+          {mode === 'flow' && incidents.length > 0 && (
+            <button
+              onClick={() => setShowIncidents(!showIncidents)}
+              title="Toggle Traffic Incidents"
+              className={`px-2 py-1 rounded text-xs font-semibold flex items-center gap-1 transition-colors ${
+                showIncidents
+                  ? 'bg-[#ffdad6] text-[#ba1a1a]'
+                  : 'text-[var(--color-on-surface-variant)] opacity-50'
+              }`}
+            >
+              <span className="material-symbols-outlined text-[14px]">report_problem</span>
+              Incidents ({incidents.length})
+            </button>
+          )}
+
+          {mode !== 'flow' && (
+            <button
+              onClick={() => setShowBottlenecks(!showBottlenecks)}
+              title="Toggle Problem Markers"
+              className={`px-2 py-1 rounded text-xs font-semibold flex items-center gap-1 transition-colors ${
+                showBottlenecks
+                  ? 'bg-[#ffdad6] text-[#ba1a1a]'
+                  : 'text-[var(--color-on-surface-variant)] opacity-50'
+              }`}
+            >
+              <span className="material-symbols-outlined text-[14px]">warning</span>
+              Problems
+            </button>
+          )}
+
+          {mode !== 'flow' && recommendations.length > 0 && (
             <button
               onClick={() => setShowRecommendations(!showRecommendations)}
               title="Toggle Solutions"
@@ -771,7 +1096,17 @@ export default function AnalysisMap({
       {/* Bottom Hint */}
       <div className="absolute bottom-2.5 left-3 z-10 pointer-events-none">
         <div className="bg-[var(--color-surface-container-lowest)]/90 backdrop-blur-sm px-2.5 py-1 rounded text-[11px] text-[var(--color-on-surface-variant)] shadow-sm border border-[var(--color-surface-container-high)]">
-          💡 Click any <span className="font-bold text-[#ba1a1a]">B#</span> or <span className="font-bold text-[#006a6a]">S#</span> pin to inspect problems & civil solutions
+          {mode === 'flow' ? (
+            <span>
+              💡 Click any <span className="font-bold text-[#ba1a1a]">road corridor</span> or{' '}
+              <span className="font-bold text-[#ba1a1a]">incident pin</span> to inspect live telemetry
+            </span>
+          ) : (
+            <span>
+              💡 Click any <span className="font-bold text-[#ba1a1a]">B#</span> or{' '}
+              <span className="font-bold text-[#006a6a]">S#</span> pin to inspect problems & civil solutions
+            </span>
+          )}
         </div>
       </div>
     </div>

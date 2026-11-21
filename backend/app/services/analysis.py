@@ -25,6 +25,7 @@ from app.core.sqlite_store import (
 from app.data_ingestion.tomtom import fetch_flow_for_point, fetch_incidents_for_bbox
 from app.data_ingestion.openweather import fetch_weather
 from app.geospatial.road_network import fetch_road_network
+from app.geospatial.spatial_matching import validate_flow_match, match_incidents_to_segments
 from app.recommendations.engine import generate_recommendations
 from app.models.schemas import (
     AnalysisResult,
@@ -53,6 +54,140 @@ def _bbox(coords: list[list[float]]) -> tuple[float, float, float, float]:
     lats = [c[1] for c in coords]
     lngs = [c[0] for c in coords]
     return min(lats), min(lngs), max(lats), max(lngs)
+
+
+def build_traffic_summary(
+    segments: list[RoadSegment],
+    incidents: list[TrafficIncident],
+    sampled_count: int = 0,
+    failed_count: int = 0,
+    unmatched_count: int = 0,
+) -> TrafficSummary:
+    """
+    Build a comprehensive, mathematically rigorous traffic summary.
+    Distinguishes segment-weighted from road-length-weighted metrics.
+    Explicitly tracks closed roads, unobserved roads, and observation confidence.
+    """
+    total_eligible = len(segments)
+    observed_segments = [s for s in segments if s.traffic is not None]
+    total_observed = len(observed_segments)
+
+    # Filter out unavailable observations (do not treat missing as 0 speed)
+    speeds = [
+        s.traffic.observed_speed_kmh
+        for s in observed_segments
+        if s.traffic.observed_speed_kmh is not None
+    ]
+    ff_speeds = [
+        s.traffic.free_flow_speed_kmh
+        for s in observed_segments
+        if s.traffic.free_flow_speed_kmh is not None and s.traffic.free_flow_speed_kmh > 0
+    ]
+    reductions = [
+        s.traffic.speed_reduction_ratio
+        for s in observed_segments
+        if s.traffic.speed_reduction_ratio is not None
+    ]
+    delays = [
+        s.traffic.delay_seconds
+        for s in observed_segments
+        if s.traffic.delay_seconds is not None
+    ]
+    delay_pcts = [
+        s.traffic.delay_percentage
+        for s in observed_segments
+        if s.traffic.delay_percentage is not None
+    ]
+    confidences = [
+        s.traffic.confidence
+        for s in observed_segments
+        if s.traffic.confidence is not None
+    ]
+
+    # Explicit congestion and road closure categorization
+    congested_count = sum(1 for s in observed_segments if s.traffic.congestion_level == "severe")
+    moderate_count = sum(1 for s in observed_segments if s.traffic.congestion_level == "moderate")
+    free_flow_count = sum(1 for s in observed_segments if s.traffic.congestion_level == "free_flow")
+    closed_count = sum(
+        1 for s in observed_segments if s.traffic.road_closure or s.traffic.congestion_level == "closed"
+    )
+    unknown_count = (total_eligible - total_observed) + sum(
+        1 for s in observed_segments if s.traffic.congestion_level == "unknown"
+    )
+
+    # Road-length weighted averages (distinguished from segment-weighted arithmetic means)
+    valid_obs_segs = [s for s in observed_segments if s.traffic.observed_speed_kmh is not None and s.length_m > 0]
+    total_obs_len = sum(s.length_m for s in valid_obs_segs)
+    length_weighted_obs = (
+        round(sum(s.traffic.observed_speed_kmh * s.length_m for s in valid_obs_segs) / total_obs_len, 1)
+        if total_obs_len > 0
+        else None
+    )
+
+    valid_ff_segs = [
+        s for s in observed_segments
+        if s.traffic.free_flow_speed_kmh is not None and s.traffic.free_flow_speed_kmh > 0 and s.length_m > 0
+    ]
+    total_ff_len = sum(s.length_m for s in valid_ff_segs)
+    length_weighted_ff = (
+        round(sum(s.traffic.free_flow_speed_kmh * s.length_m for s in valid_ff_segs) / total_ff_len, 1)
+        if total_ff_len > 0
+        else None
+    )
+
+    # Arithmetic segment-weighted averages
+    avg_obs = round(sum(speeds) / len(speeds), 1) if speeds else None
+    avg_ff = round(sum(ff_speeds) / len(ff_speeds), 1) if ff_speeds else None
+    avg_red = round(sum(reductions) / len(reductions), 3) if reductions else None
+    avg_delay_sec = round(sum(delays) / len(delays), 1) if delays else None
+    avg_delay_pct = round(sum(delay_pcts) / len(delay_pcts), 1) if delay_pcts else None
+    avg_conf = round(sum(confidences) / len(confidences), 2) if confidences else None
+
+    # Latest observation timestamp
+    latest_ts: Optional[str] = None
+    for s in observed_segments:
+        if s.traffic.observation_timestamp:
+            if latest_ts is None or s.traffic.observation_timestamp > latest_ts:
+                latest_ts = s.traffic.observation_timestamp
+
+    effective_sampled = sampled_count if sampled_count > 0 else total_observed
+    unsampled_count = max(0, total_eligible - effective_sampled)
+    sample_coverage_pct = (
+        round((total_observed / total_eligible) * 100.0, 1) if total_eligible > 0 else None
+    )
+    request_success_rate = (
+        round(((effective_sampled - failed_count) / effective_sampled) * 100.0, 1)
+        if effective_sampled > 0
+        else None
+    )
+
+    return TrafficSummary(
+        avg_observed_speed_kmh=avg_obs,
+        avg_free_flow_speed_kmh=avg_ff,
+        avg_speed_reduction=avg_red,
+        avg_travel_time_delay_seconds=avg_delay_sec,
+        avg_travel_time_delay_percentage=avg_delay_pct,
+        length_weighted_avg_observed_speed_kmh=length_weighted_obs,
+        length_weighted_avg_free_flow_speed_kmh=length_weighted_ff,
+        congested_segments=congested_count,
+        free_flow_segments=free_flow_count,
+        moderate_segments=moderate_count,
+        closed_segments=closed_count,
+        road_closure_count=closed_count,
+        unknown_segments=unknown_count,
+        total_observed=total_observed,
+        total_eligible_segments=total_eligible,
+        total_sampled_segments=effective_sampled,
+        total_unmatched_segments=unmatched_count,
+        total_failed_requests=failed_count,
+        total_unsampled_segments=unsampled_count,
+        network_sample_coverage_pct=sample_coverage_pct,
+        request_success_rate_pct=request_success_rate,
+        avg_confidence=avg_conf,
+        incident_count=len(incidents),
+        speed_weighting_method="segment_length_weighted",
+        observation_timestamp=latest_ts,
+    )
 
 
 async def _reverse_geocode_area_name(lat: float, lng: float, api_key: str) -> Optional[str]:
@@ -175,41 +310,65 @@ async def run_analysis(polygon: GeoJSONPolygon) -> AnalysisResult:
         tasks = [fetch_one(seg) for seg in sample_segs]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
+        failed_requests_count = 0
+        unmatched_count = 0
+        unmatched_observations: list[tuple[str, TrafficObservation, float]] = []
+
         for seg, result in zip(sample_segs, results):
             if isinstance(result, Exception):
+                failed_requests_count += 1
                 logger.warning("Traffic fetch failed for segment %s: %s", seg.segment_id, result)
                 continue
             obs, coverage = result
-            if obs:
-                traffic_by_segment[seg.segment_id] = obs
-                # Annotate segment with traffic
-                for s in segments:
-                    if s.segment_id == seg.segment_id:
-                        s.traffic = obs
             all_traffic_coverages.append(coverage)
+            if coverage.status != "ok":
+                failed_requests_count += 1
+
+            if obs:
+                # Spatial matching validation against OSM segment geometry
+                is_valid, match_quality, match_dist_m = validate_flow_match(obs, seg)
+                obs.match_quality = match_quality
+                obs.match_distance_m = match_dist_m
+                if is_valid:
+                    traffic_by_segment[seg.segment_id] = obs
+                    # Annotate segment with traffic
+                    for s in segments:
+                        if s.segment_id == seg.segment_id:
+                            s.traffic = obs
+                else:
+                    unmatched_count += 1
+                    unmatched_observations.append((seg.segment_id, obs, match_dist_m))
+                    logger.debug(
+                        "Rejected unmatched TomTom observation for segment %s (quality: %s, dist: %.1fm)",
+                        seg.segment_id,
+                        match_quality,
+                        match_dist_m,
+                    )
 
         # Aggregate coverage status: distinguish sampled representative corridors from complete census
         if all_traffic_coverages:
-            ok_count = sum(1 for c in all_traffic_coverages if c.status == "ok")
             sampled_count = len(sample_segs)
             eligible_count = len(segments)
-            sample_pct = round((ok_count / max(1, eligible_count)) * 100.0, 1)
+            observed_count = len(traffic_by_segment)
+            successful_requests = max(0, sampled_count - failed_requests_count)
+            sample_pct = round((observed_count / max(1, eligible_count)) * 100.0, 1)
+            req_success_pct = round((successful_requests / max(1, sampled_count)) * 100.0, 1)
 
-            if ok_count == 0:
+            if observed_count == 0 and failed_requests_count > 0:
                 status = all_traffic_coverages[0].status
                 msg = all_traffic_coverages[0].message or "Traffic observations unavailable for sampled corridors"
-            elif ok_count == sampled_count:
+            elif observed_count == eligible_count and eligible_count > 0:
                 status = "ok"
-                msg = (
-                    f"Traffic flow observed for {ok_count} representative segments "
-                    f"({sample_pct}% network sample coverage; representative corridors, not a full network census)"
-                )
+                msg = f"Traffic flow observed for all {eligible_count} network segments (request success rate: {req_success_pct}%)."
             else:
-                status = "partial"
+                status = "ok" if observed_count > 0 else "partial"
                 msg = (
-                    f"{ok_count}/{sampled_count} traffic samples retrieved "
-                    f"({sample_pct}% of {eligible_count} eligible segments sampled)"
+                    f"Traffic flow observed for {observed_count}/{sampled_count} sampled segments "
+                    f"({sample_pct}% network sample coverage of {eligible_count} eligible segments; "
+                    f"request success rate: {req_success_pct}%). Representative corridors, not a full network census."
                 )
+                if unmatched_count > 0:
+                    msg += f" Note: {unmatched_count} observation(s) rejected due to ambiguous road geometry."
 
             data_sources.append(DataSourceCoverage(
                 source="tomtom_flow",
@@ -221,6 +380,8 @@ async def run_analysis(polygon: GeoJSONPolygon) -> AnalysisResult:
     incidents, incidents_coverage = await fetch_incidents_for_bbox(
         min_lat, min_lng, max_lat, max_lng
     )
+    # Spatially link incidents to affected OSM road segments
+    match_incidents_to_segments(incidents, segments)
     data_sources.append(incidents_coverage)
 
     # Enhance bottlenecks with traffic observations
@@ -270,6 +431,7 @@ async def run_analysis(polygon: GeoJSONPolygon) -> AnalysisResult:
         metrics=road_metrics,
         weather=weather,
         segments=segments,
+        incidents=incidents,
     )
 
     # ─── Compose final result ─────────────────────────────────────────────────
@@ -320,8 +482,19 @@ async def run_analysis(polygon: GeoJSONPolygon) -> AnalysisResult:
     )
 
     # Persist
+    sampling_meta = {
+        "sampled_count": len(sample_segs) if segments else 0,
+        "failed_count": failed_requests_count if segments else 0,
+        "unmatched_count": unmatched_count if segments else 0,
+    }
     await _persist_analysis(analysis_id, result)
-    await _persist_traffic_flow(analysis_id, capped_segments, incidents, traffic_by_segment)
+    await _persist_traffic_flow(
+        analysis_id,
+        capped_segments,
+        incidents,
+        traffic_by_segment,
+        sampling_meta=sampling_meta,
+    )
     await _persist_recommendations(analysis_id, recs_result)
 
     logger.info(
@@ -378,6 +551,7 @@ async def _persist_traffic_flow(
     segments,
     incidents,
     traffic_by_segment: dict,
+    sampling_meta: Optional[dict] = None,
 ) -> None:
     doc = {
         "_id": analysis_id,
@@ -385,6 +559,7 @@ async def _persist_traffic_flow(
         "segments": [s.model_dump() for s in segments[:600]],
         "incidents": [i.model_dump() for i in incidents],
         "traffic_map": {k: v.model_dump() for k, v in traffic_by_segment.items()},
+        "sampling_meta": sampling_meta or {},
     }
     _in_memory_traffic[analysis_id] = doc
 
@@ -479,31 +654,18 @@ async def get_traffic_flow_by_id(analysis_id: str) -> Optional[TrafficFlowResult
 
         segments = [RoadSegment(**s) for s in doc.get("segments", [])]
         incidents = [TrafficIncident(**i) for i in doc.get("incidents", [])]
+        sampling_meta = doc.get("sampling_meta", {}) or {}
+        sampled_count = sampling_meta.get("sampled_count", 0)
+        failed_count = sampling_meta.get("failed_count", 0)
+        unmatched_count = sampling_meta.get("unmatched_count", 0)
 
-        # Compute summary
-        obs_speeds = [
-            s.traffic.observed_speed_kmh
-            for s in segments
-            if s.traffic and s.traffic.observed_speed_kmh is not None
-        ]
-        ff_speeds = [
-            s.traffic.free_flow_speed_kmh
-            for s in segments
-            if s.traffic and s.traffic.free_flow_speed_kmh is not None
-        ]
-        congestion_counts = {"free_flow": 0, "moderate": 0, "severe": 0, "unknown": 0}
-        for s in segments:
-            if s.traffic:
-                congestion_counts[s.traffic.congestion_level] = congestion_counts.get(s.traffic.congestion_level, 0) + 1
-
-        summary = TrafficSummary(
-            avg_observed_speed_kmh=round(sum(obs_speeds) / len(obs_speeds), 1) if obs_speeds else None,
-            avg_free_flow_speed_kmh=round(sum(ff_speeds) / len(ff_speeds), 1) if ff_speeds else None,
-            congested_segments=congestion_counts.get("severe", 0),
-            free_flow_segments=congestion_counts.get("free_flow", 0),
-            moderate_segments=congestion_counts.get("moderate", 0),
-            unknown_segments=congestion_counts.get("unknown", 0),
-            total_observed=sum(1 for s in segments if s.traffic),
+        # Compute summary using comprehensive, length-weighted and closure-aware logic
+        summary = build_traffic_summary(
+            segments=segments,
+            incidents=incidents,
+            sampled_count=sampled_count,
+            failed_count=failed_count,
+            unmatched_count=unmatched_count,
         )
 
         return TrafficFlowResult(
