@@ -23,7 +23,7 @@ class Settings(BaseSettings):
 
     # ─── Application ──────────────────────────────────────────────────────────
     cors_origins: str = Field(
-        default="http://localhost:5173,http://localhost:3000",
+        default="http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173,http://127.0.0.1:3000",
         description="Comma-separated list of allowed CORS origins",
     )
     max_area_km2: float = Field(default=50.0, description="Maximum polygon area in km²")

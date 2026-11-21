@@ -16,6 +16,9 @@ import type {
   GeocodingResult,
   GeocodingSearchResponse,
   ApiError,
+  RoadNetworkGeometryResponse,
+  RoadDetailResponse,
+  JunctionDetailResponse,
 } from '../types/api'
 
 
@@ -110,6 +113,15 @@ export const api = {
 
   getSimulationStatus: async (simId: string): Promise<SimulationStatusResponse> =>
     handleRequest(client.get(`/api/simulations/${simId}`)),
+
+  getRoadNetworkGeometry: async (simId: string): Promise<RoadNetworkGeometryResponse> =>
+    handleRequest(client.get(`/api/simulations/${simId}/network`)),
+
+  getRoadDetail: async (simId: string, edgeId: string): Promise<RoadDetailResponse> =>
+    handleRequest(client.get(`/api/simulations/${simId}/road-detail/${encodeURIComponent(edgeId)}`)),
+
+  getJunctionDetail: async (simId: string, junctionId: string): Promise<JunctionDetailResponse> =>
+    handleRequest(client.get(`/api/simulations/${simId}/junction-detail/${encodeURIComponent(junctionId)}`)),
 
   getScenarioComparison: async (simId: string): Promise<ScenarioComparisonResult> =>
     handleRequest(client.get(`/api/simulations/${simId}/comparison`)),

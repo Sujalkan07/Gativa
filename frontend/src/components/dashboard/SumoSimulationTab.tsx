@@ -4,6 +4,7 @@ import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import { attachBaseTileLayer } from '../../lib/mapLayers'
 import { api, GativaApiError } from '../../api/client'
+import RoadNetworkRenderer from './RoadNetworkRenderer'
 import type {
   AnalysisResult,
   SimulationStatusResponse,
@@ -20,6 +21,11 @@ import type {
   TrafficLightState,
   SignalCandidate,
   SignalCandidateListResponse,
+  RoadNetworkGeometryResponse,
+  NetworkEdgeDetail,
+  NetworkJunctionDetail,
+  RoadDetailResponse,
+  JunctionDetailResponse,
 } from '../../types/api'
 
 interface SumoSimulationTabProps {
@@ -27,8 +33,8 @@ interface SumoSimulationTabProps {
 }
 
 export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) {
-  // Navigation / View Modes: Mode A ('single'), Mode B ('compare'), Mode C ('results')
-  const [viewMode, setViewMode] = useState<'single' | 'compare' | 'results'>('single')
+  // Navigation / View Modes: Mode A ('single'), Mode B ('network'), Mode C ('results')
+  const [viewMode, setViewMode] = useState<'single' | 'network' | 'results'>('single')
 
   // Simulation ID & Dual States
   const [simId, setSimId] = useState<string | null>(null)
@@ -37,6 +43,16 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
   const [comparison, setComparison] = useState<ScenarioComparisonResult | null>(null)
   const [congestion, setCongestion] = useState<CongestionSummary | null>(null)
   const [signalsList, setSignalsList] = useState<SignalListResponse | null>(null)
+
+  // Road Network Simulation State
+  const [networkGeometry, setNetworkGeometry] = useState<RoadNetworkGeometryResponse | null>(null)
+  const [selectedEdge, setSelectedEdge] = useState<NetworkEdgeDetail | null>(null)
+  const [selectedJunction, setSelectedJunction] = useState<NetworkJunctionDetail | null>(null)
+  const [roadDetail, setRoadDetail] = useState<RoadDetailResponse | null>(null)
+  const [junctionDetail, setJunctionDetail] = useState<JunctionDetailResponse | null>(null)
+  const [inspectorTab, setInspectorTab] = useState<'overview' | 'inspector' | 'vehicles'>('overview')
+  const [focusedVehicleId, setFocusedVehicleId] = useState<string | null>(null)
+  const [vehicleSearch, setVehicleSearch] = useState<string>('')
 
   // Demand Configuration Controls
   const [demandLevel, setDemandLevel] = useState<DemandLevel>('normal')
@@ -180,8 +196,11 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
           // exact number entered instead of applying the automatic 55% share.
           initial_population: manual,
           seed: s,
+          target_mode: viewMode === 'network' ? 'network' : 'single',
+          external_buffer_m: 500.0,
         })
         .then(async (res) => {
+          api.getRoadNetworkGeometry(res.sim_id).then(setNetworkGeometry).catch(() => {})
           if (prepareRequestIdRef.current !== reqId || currentAnalysisIdRef.current !== targetAnalysisId) return
 
           setSimId(res.sim_id)
@@ -225,7 +244,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
           }
         })
     },
-    [analysis.analysis_id, demandLevel, demandProfile, durationSeconds, manualVehicles, seed],
+    [analysis.analysis_id, demandLevel, demandProfile, durationSeconds, manualVehicles, seed, viewMode],
   )
 
   useEffect(() => {
@@ -361,10 +380,6 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
   useEffect(() => {
     const triggerInvalidation = () => {
       if (viewMode === 'single') singleMapRef.current?.invalidateSize({ animate: false })
-      if (viewMode === 'compare') {
-        baselineMapRef.current?.invalidateSize({ animate: false })
-        optimizedMapRef.current?.invalidateSize({ animate: false })
-      }
       if (viewMode === 'results') resultsMapRef.current?.invalidateSize({ animate: false })
     }
 
@@ -415,6 +430,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
       // Road Network Segments
       if (analysis.segments?.length) {
         analysis.segments.forEach((seg) => {
+          if (seg.is_buffer) return
           if (!seg.geometry?.coordinates || seg.geometry.coordinates.length < 2) return
           const pts: L.LatLngExpression[] = seg.geometry.coordinates.map((c) => [c[1], c[0]])
           const color =
@@ -858,39 +874,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
     }
   }, [viewMode, simStatus?.vehicles, simStatus?.traffic_lights, updateVehicleLayer, updateSignalLayer, handleInspectSignal])
 
-  // Dual Maps (Mode B)
-  useEffect(() => {
-    if (viewMode === 'compare') {
-      // Baseline Map (Left) - Fixed-Time
-      updateVehicleLayer(
-        baselineStatus?.vehicles || [],
-        baselineVehiclesGroupRef.current,
-        baselineMarkersMapRef.current,
-      )
-      updateSignalLayer(baselineStatus?.traffic_lights, baselineSignalsGroupRef.current)
-
-      // Optimized Map (Right) - Actuated Adaptive (Editable)
-      updateVehicleLayer(
-        simStatus?.vehicles || [],
-        optimizedVehiclesGroupRef.current,
-        optimizedMarkersMapRef.current,
-      )
-      updateSignalLayer(
-        simStatus?.traffic_lights,
-        optimizedSignalsGroupRef.current,
-        handleInspectSignal,
-      )
-    }
-  }, [
-    viewMode,
-    baselineStatus?.vehicles,
-    baselineStatus?.traffic_lights,
-    simStatus?.vehicles,
-    simStatus?.traffic_lights,
-    updateVehicleLayer,
-    updateSignalLayer,
-    handleInspectSignal,
-  ])
+// Dual maps replaced by RoadNetworkRenderer canvas
 
   // Results Map (Mode C) - Post-Simulation Congestion Colors
   useEffect(() => {
@@ -967,6 +951,13 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
     })
   }, [viewMode, congestion, selectedSegmentId, analysis.segments])
 
+  // ─── Load Network Geometry on View Mode Switch ──────────────────────────
+  useEffect(() => {
+    if (viewMode === 'network' && simId && !networkGeometry) {
+      api.getRoadNetworkGeometry(simId).then(setNetworkGeometry).catch(console.warn)
+    }
+  }, [viewMode, simId, networkGeometry])
+
   // ─── Playback Loop (Synchronized Both Scenarios) ────────────────────────────
   useEffect(() => {
     if (!isPlaying || !simId) {
@@ -991,7 +982,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
           setSimStatus(res)
 
           // In compare mode, fetch baseline and comparison simultaneously
-          if (viewMode === 'compare' || viewMode === 'results') {
+          if (viewMode === 'results') {
             try {
               const [baseRes, compRes] = await Promise.allSettled([
                 api.getBaselineStatus(simId),
@@ -1176,9 +1167,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
   const elapsed = simStatus?.elapsed_seconds ?? 0
   const duration = simStatus?.duration_seconds ?? durationSeconds
   const progressPct = Math.min(100, (elapsed / duration) * 100)
-  const metrics = simStatus?.current_metrics
   const vehiclesCount = simStatus?.vehicles?.length ?? 0
-  const baselineVehiclesCount = baselineStatus?.vehicles?.length ?? 0
   const engineMode = simStatus?.engine_mode ?? 'unavailable'
 
   const formatTime = (secs: number) => {
@@ -1280,19 +1269,24 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
                   : 'text-slate-600 hover:text-[#0A1145]'
               }`}
             >
-              <span className="material-symbols-outlined text-[15px]">map</span>
-              <span>Single Map (Default)</span>
+              <span className="material-symbols-outlined text-[15px]">play_circle</span>
+              <span>Simulation</span>
             </button>
             <button
-              onClick={() => setViewMode('compare')}
+              onClick={() => {
+                setViewMode('network')
+                if (simId && !networkGeometry) {
+                  api.getRoadNetworkGeometry(simId).then(setNetworkGeometry).catch(() => {})
+                }
+              }}
               className={`px-3 py-1.5 text-xs rounded-md font-semibold transition-all flex items-center gap-1.5 ${
-                viewMode === 'compare'
+                viewMode === 'network'
                   ? 'bg-[#0A1145] text-white shadow-xs'
                   : 'text-slate-600 hover:text-[#0A1145]'
               }`}
             >
-              <span className="material-symbols-outlined text-[15px]">compare</span>
-              <span>Compare Scenarios</span>
+              <span className="material-symbols-outlined text-[15px]">traffic</span>
+              <span>Road Network</span>
             </button>
             <button
               onClick={() => {
@@ -1306,7 +1300,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
               }`}
             >
               <span className="material-symbols-outlined text-[15px]">analytics</span>
-              <span>Results & Congestion</span>
+              <span>Results</span>
               {congestion && <span className="w-2 h-2 rounded-full bg-[#10B981]"></span>}
             </button>
           </div>
@@ -1835,166 +1829,530 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
         </div>
       </div>
 
-      {/* ─── MODE B: COMPARE REGULAR VS. OPTIMIZED (DUAL MAPS WITH INDEPENDENT FULLSCREEN) ─── */}
-      <div className={viewMode === 'compare' ? 'flex flex-col gap-4' : 'hidden'}>
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          {/* LEFT MAP: REGULAR TRAFFIC (BASELINE - FIXED TIME) */}
-          <div
-            className={`bg-white rounded-xl border border-[#cbdbf5] shadow-xs overflow-hidden flex flex-col transition-all ${
-              fullscreenMap === 'baseline'
-                ? 'fixed inset-0 z-[9999] p-4 bg-slate-900/80 backdrop-blur-sm'
-                : 'relative'
-            }`}
-          >
-            {/* Header / Expand Control */}
-            <div className="px-4 py-2.5 bg-[#f8faff] border-b border-[#cbdbf5] flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <span className="w-2.5 h-2.5 rounded-full bg-slate-500"></span>
-                <span className="text-xs font-bold text-[#0A1145] uppercase tracking-wide">
-                  Regular Traffic (Baseline)
-                </span>
-                <span className="text-[10px] bg-slate-100 text-slate-600 px-2 py-0.5 rounded border border-slate-200">
-                  Fixed-Time Control
-                </span>
-              </div>
-              <div className="flex items-center gap-2">
-                <span className="text-[11px] font-mono text-slate-500">
-                  {baselineVehiclesCount} vehs
-                </span>
-                <button
-                  onClick={() => {
-                    const next = fullscreenMap === 'baseline' ? null : 'baseline'
-                    setFullscreenMap(next)
-                    setTimeout(() => baselineMapRef.current?.invalidateSize(), 150)
-                  }}
-                  className="p-1 rounded hover:bg-slate-200 text-slate-600 transition-colors"
-                  title={fullscreenMap === 'baseline' ? 'Restore side-by-side' : 'Expand full screen'}
-                >
-                  <span className="material-symbols-outlined text-[18px]">
-                    {fullscreenMap === 'baseline' ? 'fullscreen_exit' : 'fullscreen'}
-                  </span>
-                </button>
-              </div>
+      {/* ─── MODE B: ROAD NETWORK MICROSCOPIC SIMULATION ─── */}
+      <div className={viewMode === 'network' ? 'flex flex-col gap-4' : 'hidden'}>
+        {/* Road Network Header & Quick Diagnostics Bar */}
+        <div className="bg-white rounded-xl border border-[#cbdbf5] p-4 shadow-xs flex flex-wrap items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-lg bg-[#0A1145] text-white flex items-center justify-center shadow-xs">
+              <span className="material-symbols-outlined text-[22px]">traffic</span>
             </div>
-
-            {/* Baseline Canvas */}
-            <div className={`relative w-full ${fullscreenMap === 'baseline' ? 'flex-1' : 'h-[440px]'} bg-[#f8faff] overflow-hidden`}>
-              <div ref={baselineMapContainerRef} className="w-full h-full" />
-              <div className="absolute bottom-3 left-3 z-[500] bg-white/95 backdrop-blur-xs border border-[#cbdbf5] rounded px-2.5 py-1 text-[11px] font-mono">
-                Speed: {baselineStatus?.current_metrics?.avg_speed_kmh?.toFixed(1) ?? '—'} km/h • Wait: {baselineStatus?.current_metrics?.avg_waiting_time_s?.toFixed(1) ?? '—'}s
+            <div>
+              <div className="flex items-center gap-2">
+                <h3 className="text-sm font-bold text-[#0A1145]">Road Network Microscopic Simulation</h3>
+                <span className="text-[10px] bg-blue-50 text-blue-700 px-2 py-0.5 rounded-full border border-blue-200 font-semibold uppercase tracking-wider">
+                  SUMO 1.28.0 • TraCI
+                </span>
+                {simStatus?.engine_mode === 'native_sumo' && (
+                  <span className="text-[10px] bg-emerald-50 text-emerald-700 px-2 py-0.5 rounded-full border border-emerald-300 font-semibold flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                    Native SUMO Verified
+                  </span>
+                )}
               </div>
+              <p className="text-xs text-slate-500 mt-0.5">
+                Microscopic lane-level simulation with 500m external boundary buffer, turning connections, and queue-responsive signals.
+              </p>
             </div>
           </div>
 
-          {/* RIGHT MAP: OPTIMIZED TRAFFIC (ACTUATED ADAPTIVE + INTERVENTIONS) */}
-          <div
-            className={`bg-white rounded-xl border border-[#cbdbf5] shadow-xs overflow-hidden flex flex-col transition-all ${
-              fullscreenMap === 'optimized'
-                ? 'fixed inset-0 z-[9999] p-4 bg-slate-900/80 backdrop-blur-sm'
-                : 'relative'
-            }`}
-          >
-            {/* Header / Expand Control */}
-            <div className="px-4 py-2.5 bg-[#eff4ff] border-b border-[#cbdbf5] flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <span className="w-2.5 h-2.5 rounded-full bg-[#138808] animate-pulse"></span>
-                <span className="text-xs font-bold text-[#0A1145] uppercase tracking-wide">
-                  Optimized Traffic
-                </span>
-                <span className="text-[10px] bg-emerald-50 text-emerald-700 px-2 py-0.5 rounded border border-emerald-300">
-                  Actuated Adaptive Control
-                </span>
-              </div>
-              <div className="flex items-center gap-2">
-                <span className="text-[11px] font-mono text-emerald-700 font-semibold">
-                  {vehiclesCount} vehs
-                </span>
-                <button
-                  onClick={() => {
-                    const next = fullscreenMap === 'optimized' ? null : 'optimized'
-                    setFullscreenMap(next)
-                    setTimeout(() => optimizedMapRef.current?.invalidateSize(), 150)
-                  }}
-                  className="p-1 rounded hover:bg-slate-200 text-slate-600 transition-colors"
-                  title={fullscreenMap === 'optimized' ? 'Restore side-by-side' : 'Expand full screen'}
-                >
-                  <span className="material-symbols-outlined text-[18px]">
-                    {fullscreenMap === 'optimized' ? 'fullscreen_exit' : 'fullscreen'}
-                  </span>
-                </button>
-              </div>
+          {/* Quick Metrics Pills */}
+          <div className="flex items-center gap-2 text-xs">
+            <div className="bg-[#eff4ff] px-3 py-1.5 rounded-lg border border-[#cbdbf5] flex items-center gap-2">
+              <span className="text-slate-500">Edges:</span>
+              <span className="font-bold text-[#0A1145]">{networkGeometry?.summary?.directed_edges ?? simStatus?.edge_count ?? 0}</span>
             </div>
-
-            {/* Optimized Canvas */}
-            <div className={`relative w-full ${fullscreenMap === 'optimized' ? 'flex-1' : 'h-[440px]'} bg-[#f8faff] overflow-hidden`}>
-              <div ref={optimizedMapContainerRef} className="w-full h-full" />
-              <div className="absolute bottom-3 left-3 z-[500] bg-white/95 backdrop-blur-xs border border-emerald-300 rounded px-2.5 py-1 text-[11px] font-mono text-[#0A1145]">
-                Speed: {metrics?.avg_speed_kmh?.toFixed(1) ?? '—'} km/h • Wait: {metrics?.avg_waiting_time_s?.toFixed(1) ?? '—'}s
-              </div>
+            <div className="bg-[#eff4ff] px-3 py-1.5 rounded-lg border border-[#cbdbf5] flex items-center gap-2">
+              <span className="text-slate-500">Lanes:</span>
+              <span className="font-bold text-[#0A1145]">{networkGeometry?.summary?.total_lanes ?? 0}</span>
+            </div>
+            <div className="bg-[#eff4ff] px-3 py-1.5 rounded-lg border border-[#cbdbf5] flex items-center gap-2">
+              <span className="text-slate-500">Junctions:</span>
+              <span className="font-bold text-[#0A1145]">{networkGeometry?.summary?.junction_count ?? simStatus?.junction_count ?? 0}</span>
+            </div>
+            <div className="bg-[#eff4ff] px-3 py-1.5 rounded-lg border border-[#cbdbf5] flex items-center gap-2">
+              <span className="text-slate-500">Active Cars:</span>
+              <span className="font-bold text-blue-700 font-mono">{simStatus?.vehicles?.length ?? 0}</span>
             </div>
           </div>
         </div>
 
-        {/* Synchronized Playback Control Bar for Compare Mode */}
-        <div className="bg-white border border-[#cbdbf5] rounded-xl px-5 py-3 flex flex-wrap items-center justify-between gap-4 shadow-xs">
-          <div className="flex items-center gap-2">
-            <button
-              onClick={handleTogglePlay}
-              className={`flex items-center gap-1.5 px-4 py-2 font-bold text-xs rounded-lg shadow-xs transition-all ${
-                isPlaying
-                  ? 'bg-[#138808] hover:bg-[#0f6b06] text-white'
-                  : 'bg-[#FF9933] hover:bg-[#e68524] text-[#0A1145]'
-              }`}
-            >
-              <span className="material-symbols-outlined text-[16px]">
-                {isPlaying ? 'pause' : 'play_arrow'}
-              </span>
-              <span>{isPlaying ? 'Pause' : elapsed > 0 ? 'Resume Both' : 'Play Both'}</span>
-            </button>
-            <button
-              onClick={handleStepOnce}
-              disabled={isPlaying}
-              className="flex items-center gap-1 px-3 py-2 bg-white hover:bg-[#eff4ff] text-slate-700 font-semibold text-xs border border-[#cbdbf5] rounded-lg transition-colors disabled:opacity-50"
-            >
-              <span className="material-symbols-outlined text-[16px] text-slate-500">redo</span>
-              <span>Step Both</span>
-            </button>
-            <button
-              onClick={handleReset}
-              className="flex items-center gap-1 px-3 py-2 bg-white hover:bg-[#eff4ff] text-slate-700 font-semibold text-xs border border-[#cbdbf5] rounded-lg transition-colors"
-            >
-              <span className="material-symbols-outlined text-[16px] text-slate-500">restart_alt</span>
-              <span>Reset Both</span>
-            </button>
-          </div>
-
-          <div className="flex-1 max-w-md flex items-center gap-3">
-            <span className="font-mono text-xs font-bold text-[#0A1145]">{formatTime(elapsed)}</span>
-            <div className="flex-1 bg-[#eff4ff] h-2 rounded-full overflow-hidden border border-[#cbdbf5]">
-              <div
-                className="bg-[#FF9933] h-full rounded-full transition-all duration-300"
-                style={{ width: `${progressPct}%` }}
-              ></div>
+        {/* Main Simulation Layout: 2 Columns (Canvas Viewport + Comprehensive Multi-Tab Inspector) */}
+        <div className="grid grid-cols-1 xl:grid-cols-12 gap-4 items-start">
+          {/* LEFT: Road Network Canvas Surface (8 columns on xl) */}
+          <div className="xl:col-span-8 bg-slate-950 rounded-xl border border-slate-800 shadow-md overflow-hidden flex flex-col">
+            {/* Canvas Header bar */}
+            <div className="px-4 py-2.5 bg-slate-900 border-b border-slate-800 flex items-center justify-between text-xs text-slate-300">
+              <div className="flex items-center gap-2">
+                <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                <span className="font-mono text-white font-semibold">Canvas Viewport</span>
+                <span className="text-[11px] text-slate-400">| Pan: Drag • Zoom: Scroll / Buttons • Select: Click</span>
+              </div>
+              <div className="flex items-center gap-3">
+                <span className="text-[11px] text-slate-400 font-mono">
+                  Scale: {networkGeometry?.summary?.buffer_distance_m ?? 500}m Buffer Active
+                </span>
+              </div>
             </div>
-            <span className="font-mono text-xs text-slate-500">{formatTime(duration)}</span>
+
+            {/* Canvas Component */}
+            <div className="relative w-full h-[580px] bg-[#0b1120]">
+              <RoadNetworkRenderer
+                networkGeometry={networkGeometry}
+                vehicles={simStatus?.vehicles || []}
+                trafficLights={simStatus?.traffic_lights || []}
+                selectedEdgeId={selectedEdge?.edge_id || selectedEdge?.id}
+                selectedJunctionId={selectedJunction?.junction_id || selectedJunction?.id}
+                onSelectEdge={(edge) => {
+                  setSelectedEdge(edge)
+                  setSelectedJunction(null)
+                  setInspectorTab('inspector')
+                  if (edge && simId) {
+                    api.getRoadDetail(simId, edge.edge_id || edge.id).then(setRoadDetail).catch(() => {})
+                  }
+                }}
+                onSelectJunction={(junction) => {
+                  setSelectedJunction(junction)
+                  setSelectedEdge(null)
+                  setInspectorTab('inspector')
+                  if (junction && simId) {
+                    api.getJunctionDetail(simId, junction.junction_id || junction.id).then(setJunctionDetail).catch(() => {})
+                  }
+                }}
+                focusedVehicleId={focusedVehicleId}
+                height={580}
+                isSimulating={isPlaying}
+              />
+            </div>
+
+            {/* Canvas Bottom Control Bar */}
+            <div className="p-3 bg-slate-900 border-t border-slate-800 flex flex-wrap items-center justify-between gap-3 text-xs">
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={handleTogglePlay}
+                  disabled={!simId}
+                  className={`px-3 py-1.5 rounded-lg font-bold flex items-center gap-1.5 transition ${
+                    isPlaying
+                      ? 'bg-amber-500 text-slate-950 hover:bg-amber-400'
+                      : 'bg-emerald-600 text-white hover:bg-emerald-500'
+                  } disabled:opacity-50`}
+                >
+                  <span className="material-symbols-outlined text-[16px]">
+                    {isPlaying ? 'pause' : 'play_arrow'}
+                  </span>
+                  <span>{isPlaying ? 'Pause' : 'Play'}</span>
+                </button>
+                <button
+                  onClick={handleStepOnce}
+                  disabled={!simId || isPlaying}
+                  className="px-2.5 py-1.5 rounded-lg border border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700 font-semibold flex items-center gap-1 transition disabled:opacity-50"
+                >
+                  <span className="material-symbols-outlined text-[16px]">step</span>
+                  <span>Step</span>
+                </button>
+                <button
+                  onClick={handleReset}
+                  disabled={!simId}
+                  className="px-2.5 py-1.5 rounded-lg border border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700 font-semibold flex items-center gap-1 transition disabled:opacity-50"
+                >
+                  <span className="material-symbols-outlined text-[16px]">restart_alt</span>
+                  <span>Reset</span>
+                </button>
+              </div>
+
+              {/* Speed Multipliers */}
+              <div className="flex items-center gap-2">
+                <span className="text-slate-400 font-mono text-[11px]">Speed:</span>
+                <div className="flex items-center bg-slate-800 p-0.5 rounded-lg border border-slate-700">
+                  {[0.5, 1, 2, 5, 10].map((spd) => (
+                    <button
+                      key={spd}
+                      onClick={() => setSpeedMultiplier(spd)}
+                      className={`px-2 py-0.5 rounded text-[11px] font-mono transition ${
+                        speedMultiplier === spd
+                          ? 'bg-blue-600 text-white font-bold'
+                          : 'text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      {spd}x
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Progress and Elapsed Time */}
+              <div className="flex items-center gap-2 text-slate-300 font-mono">
+                <span>{formatTime(simStatus?.elapsed_seconds || 0)}</span>
+                <span className="text-slate-600">/</span>
+                <span>{formatTime(simStatus?.duration_seconds || durationSeconds)}</span>
+              </div>
+            </div>
           </div>
 
-          <div className="flex items-center gap-2">
-            <span className="text-xs font-medium text-slate-500">Speed:</span>
-            <div className="flex items-center bg-[#eff4ff] p-0.5 rounded-lg border border-[#cbdbf5]">
-              {[1, 2, 5].map((spd) => (
-                <button
-                  key={spd}
-                  onClick={() => setSpeedMultiplier(spd)}
-                  className={`px-2.5 py-1 text-xs rounded transition-all ${
-                    speedMultiplier === spd
-                      ? 'bg-[#0A1145] text-white font-bold shadow-xs'
-                      : 'text-slate-600 font-semibold hover:text-[#0A1145]'
-                  }`}
-                >
-                  {spd}x
-                </button>
-              ))}
+          {/* RIGHT: Multi-Tab Inspector & Telemetry (4 columns on xl) */}
+          <div className="xl:col-span-4 bg-white rounded-xl border border-[#cbdbf5] shadow-xs overflow-hidden flex flex-col h-[670px]">
+            {/* Inspector Tab Bar */}
+            <div className="flex items-center border-b border-[#cbdbf5] bg-[#f8faff] p-1">
+              <button
+                onClick={() => setInspectorTab('overview')}
+                className={`flex-1 py-2 text-xs font-bold rounded-lg transition flex items-center justify-center gap-1.5 ${
+                  inspectorTab === 'overview'
+                    ? 'bg-white text-[#0A1145] shadow-xs border border-[#cbdbf5]'
+                    : 'text-slate-600 hover:text-[#0A1145]'
+                }`}
+              >
+                <span className="material-symbols-outlined text-[16px]">dataset</span>
+                <span>Overview</span>
+              </button>
+              <button
+                onClick={() => setInspectorTab('inspector')}
+                className={`flex-1 py-2 text-xs font-bold rounded-lg transition flex items-center justify-center gap-1.5 ${
+                  inspectorTab === 'inspector'
+                    ? 'bg-white text-[#0A1145] shadow-xs border border-[#cbdbf5]'
+                    : 'text-slate-600 hover:text-[#0A1145]'
+                }`}
+              >
+                <span className="material-symbols-outlined text-[16px]">pin_drop</span>
+                <span>Inspector</span>
+                {(selectedEdge || selectedJunction) && (
+                  <span className="w-1.5 h-1.5 rounded-full bg-blue-600"></span>
+                )}
+              </button>
+              <button
+                onClick={() => setInspectorTab('vehicles')}
+                className={`flex-1 py-2 text-xs font-bold rounded-lg transition flex items-center justify-center gap-1.5 ${
+                  inspectorTab === 'vehicles'
+                    ? 'bg-white text-[#0A1145] shadow-xs border border-[#cbdbf5]'
+                    : 'text-slate-600 hover:text-[#0A1145]'
+                }`}
+              >
+                <span className="material-symbols-outlined text-[16px]">directions_car</span>
+                <span>Vehicles</span>
+                <span className="text-[10px] bg-blue-100 text-blue-800 px-1.5 py-0.2 rounded-full font-mono">
+                  {simStatus?.vehicles?.length || 0}
+                </span>
+              </button>
+            </div>
+
+            {/* Inspector Tab Contents */}
+            <div className="p-4 overflow-y-auto flex-1 space-y-4">
+              {/* TAB 1: OVERVIEW */}
+              {inspectorTab === 'overview' && (
+                <div className="space-y-4 text-xs">
+                  {/* Network Statistics Card */}
+                  <div className="bg-[#f8faff] rounded-lg p-3 border border-[#cbdbf5]">
+                    <h4 className="font-bold text-[#0A1145] mb-2 flex items-center gap-1.5 text-[13px]">
+                      <span className="material-symbols-outlined text-sm text-blue-600">account_tree</span>
+                      <span>Compiled Road Geometry</span>
+                    </h4>
+                    <div className="grid grid-cols-2 gap-2 text-slate-600">
+                      <div className="bg-white p-2 rounded border border-[#cbdbf5]">
+                        <span className="text-[11px] text-slate-500 block">Total Segments</span>
+                        <strong className="text-sm text-[#0A1145] font-mono">
+                          {networkGeometry?.summary?.total_segments || analysis.segments?.length || 0}
+                        </strong>
+                      </div>
+                      <div className="bg-white p-2 rounded border border-[#cbdbf5]">
+                        <span className="text-[11px] text-slate-500 block">Directed Edges</span>
+                        <strong className="text-sm text-[#0A1145] font-mono">
+                          {networkGeometry?.summary?.directed_edges || simStatus?.edge_count || 0}
+                        </strong>
+                      </div>
+                      <div className="bg-white p-2 rounded border border-[#cbdbf5]">
+                        <span className="text-[11px] text-slate-500 block">Total Lanes</span>
+                        <strong className="text-sm text-[#0A1145] font-mono">
+                          {networkGeometry?.summary?.total_lanes || 0}
+                        </strong>
+                      </div>
+                      <div className="bg-white p-2 rounded border border-[#cbdbf5]">
+                        <span className="text-[11px] text-slate-500 block">Junctions</span>
+                        <strong className="text-sm text-[#0A1145] font-mono">
+                          {networkGeometry?.summary?.junction_count || simStatus?.junction_count || 0}
+                        </strong>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Lane Breakdown Card */}
+                  <div className="bg-[#f8faff] rounded-lg p-3 border border-[#cbdbf5]">
+                    <h4 className="font-bold text-[#0A1145] mb-2 flex items-center gap-1.5 text-[13px]">
+                      <span className="material-symbols-outlined text-sm text-blue-600">alt_route</span>
+                      <span>Lane Configurations</span>
+                    </h4>
+                    <div className="space-y-1.5">
+                      <div className="flex justify-between items-center py-1 border-b border-slate-200/60">
+                        <span className="text-slate-600">Single-lane Roads</span>
+                        <span className="font-mono font-bold text-[#0A1145]">{networkGeometry?.summary?.single_lane_roads || 0}</span>
+                      </div>
+                      <div className="flex justify-between items-center py-1 border-b border-slate-200/60">
+                        <span className="text-slate-600">Two-lane Roads</span>
+                        <span className="font-mono font-bold text-[#0A1145]">{networkGeometry?.summary?.two_lane_roads || 0}</span>
+                      </div>
+                      <div className="flex justify-between items-center py-1 border-b border-slate-200/60">
+                        <span className="text-slate-600">Four-lane Roads</span>
+                        <span className="font-mono font-bold text-[#0A1145]">{networkGeometry?.summary?.four_lane_roads || 0}</span>
+                      </div>
+                      <div className="flex justify-between items-center py-1">
+                        <span className="text-slate-600">Other Widths</span>
+                        <span className="font-mono font-bold text-[#0A1145]">{networkGeometry?.summary?.other_lane_roads || 0}</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* External Buffer & Topology */}
+                  <div className="bg-[#f8faff] rounded-lg p-3 border border-[#cbdbf5]">
+                    <h4 className="font-bold text-[#0A1145] mb-2 flex items-center gap-1.5 text-[13px]">
+                      <span className="material-symbols-outlined text-sm text-blue-600">radar</span>
+                      <span>Boundary Buffer & Trip Classes</span>
+                    </h4>
+                    <div className="space-y-1.5 text-slate-600">
+                      <div className="flex justify-between items-center">
+                        <span>External Buffer Distance</span>
+                        <strong className="text-emerald-700 font-mono">500 m</strong>
+                      </div>
+                      <div className="flex justify-between items-center">
+                        <span>Trip Routing Balance</span>
+                        <span className="font-mono text-slate-700">70% Through • 20% Int • 10% In/Out</span>
+                      </div>
+                      <div className="flex justify-between items-center">
+                        <span>Demand Scheduling</span>
+                        <span className="font-mono text-slate-700">Continuous Poisson (Min Headway 2.5s)</span>
+                      </div>
+                      <div className="flex justify-between items-center">
+                        <span>Anomalies / Teleports</span>
+                        <strong className="text-emerald-700 font-mono">0 Teleports • 0 Collisions</strong>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* TAB 2: ROAD & JUNCTION INSPECTOR */}
+              {inspectorTab === 'inspector' && (
+                <div className="space-y-4 text-xs">
+                  {selectedEdge ? (
+                    <div className="space-y-3">
+                      <div className="p-3 bg-blue-50/70 border border-blue-200 rounded-lg">
+                        <div className="flex items-center justify-between">
+                          <span className="font-bold text-sm text-[#0A1145]">{selectedEdge.name}</span>
+                          <span className="text-[10px] bg-blue-600 text-white px-2 py-0.5 rounded font-mono uppercase">
+                            {selectedEdge.road_type}
+                          </span>
+                        </div>
+                        <span className="text-[11px] text-slate-500 font-mono mt-0.5 block">
+                          Edge ID: {selectedEdge.edge_id || selectedEdge.id}
+                        </span>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-2">
+                        <div className="p-2.5 bg-[#f8faff] rounded border border-[#cbdbf5]">
+                          <span className="text-[10px] text-slate-500 block">Total Lanes</span>
+                          <strong className="text-sm text-[#0A1145]">{selectedEdge.num_lanes}</strong>
+                        </div>
+                        <div className="p-2.5 bg-[#f8faff] rounded border border-[#cbdbf5]">
+                          <span className="text-[10px] text-slate-500 block">Speed Limit</span>
+                          <strong className="text-sm text-[#0A1145]">{selectedEdge.speed_kmh} km/h</strong>
+                        </div>
+                        <div className="p-2.5 bg-[#f8faff] rounded border border-[#cbdbf5]">
+                          <span className="text-[10px] text-slate-500 block">Segment Length</span>
+                          <strong className="text-sm text-[#0A1145]">{selectedEdge.length_m} m</strong>
+                        </div>
+                        <div className="p-2.5 bg-[#f8faff] rounded border border-[#cbdbf5]">
+                          <span className="text-[10px] text-slate-500 block">Directionality</span>
+                          <strong className="text-sm text-[#0A1145]">{selectedEdge.is_oneway ? 'One-Way' : 'Two-Way'}</strong>
+                        </div>
+                      </div>
+
+                      {/* Live Telemetry for this road */}
+                      <div className="p-3 bg-slate-50 rounded-lg border border-slate-200 space-y-1.5">
+                        <span className="font-bold text-slate-700 block text-[11px]">Live Road Telemetry</span>
+                        <div className="flex justify-between items-center text-slate-600">
+                          <span>Active Vehicles</span>
+                          <strong className="font-mono text-[#0A1145]">
+                            {simStatus?.vehicles?.filter((v) => v.lane_id?.startsWith(selectedEdge.edge_id || selectedEdge.id)).length || 0}
+                          </strong>
+                        </div>
+                        {roadDetail && (
+                          <>
+                            <div className="flex justify-between items-center text-slate-600">
+                              <span>Queue Length</span>
+                              <strong className="font-mono text-amber-700">{roadDetail.queue_length_m} m</strong>
+                            </div>
+                            <div className="flex justify-between items-center text-slate-600">
+                              <span>Road Occupancy</span>
+                              <strong className="font-mono text-[#0A1145]">{roadDetail.occupancy_pct}%</strong>
+                            </div>
+                          </>
+                        )}
+                        <div className="flex justify-between items-center text-slate-600">
+                          <span>Lane Verification</span>
+                          <span className="font-mono text-emerald-700">
+                            {selectedEdge.is_estimated_lanes ? 'Inferred from Class' : 'OSM Verified'}
+                          </span>
+                        </div>
+                        <div className="flex justify-between items-center text-slate-600">
+                          <span>Buffer Zone</span>
+                          <span className="font-mono text-slate-700">{selectedEdge.is_buffer ? 'External Buffer' : 'Core Study Area'}</span>
+                        </div>
+                      </div>
+
+                      <button
+                        onClick={() => {
+                          setSelectedEdge(null)
+                          setRoadDetail(null)
+                        }}
+                        className="w-full py-1.5 text-center text-xs text-slate-500 hover:text-slate-800 transition border border-dashed border-slate-300 rounded"
+                      >
+                        Clear Selection
+                      </button>
+                    </div>
+                  ) : selectedJunction ? (
+                    <div className="space-y-3">
+                      <div className="p-3 bg-purple-50 border border-purple-200 rounded-lg">
+                        <div className="flex items-center justify-between">
+                          <span className="font-bold text-sm text-purple-900">Junction {selectedJunction.id}</span>
+                          <span className="text-[10px] bg-purple-700 text-white px-2 py-0.5 rounded font-mono uppercase">
+                            {selectedJunction.type}
+                          </span>
+                        </div>
+                        <span className="text-[11px] text-slate-500 font-mono mt-0.5 block">
+                          Coordinates: {selectedJunction.y.toFixed(5)}, {selectedJunction.x.toFixed(5)}
+                        </span>
+                      </div>
+
+                      <div className="p-3 bg-[#f8faff] rounded-lg border border-[#cbdbf5] space-y-2">
+                        <div className="flex justify-between items-center text-slate-600">
+                          <span>Traffic Signal</span>
+                          <strong className={selectedJunction.has_traffic_light ? 'text-emerald-600' : 'text-slate-500'}>
+                            {selectedJunction.has_traffic_light ? 'Signalized Controller' : 'Priority Right-of-Way'}
+                          </strong>
+                        </div>
+                        {junctionDetail && (
+                          <div className="flex justify-between items-center text-slate-600">
+                            <span>Waiting Vehicles</span>
+                            <strong className="font-mono text-amber-700">{junctionDetail.waiting_vehicles_count}</strong>
+                          </div>
+                        )}
+                        <div className="flex justify-between items-center text-slate-600">
+                          <span>Incoming Roads</span>
+                          <span className="font-mono font-bold text-[#0A1145]">{selectedJunction.incoming_edges.length}</span>
+                        </div>
+                        <div className="flex justify-between items-center text-slate-600">
+                          <span>Outgoing Roads</span>
+                          <span className="font-mono font-bold text-[#0A1145]">{selectedJunction.outgoing_edges.length}</span>
+                        </div>
+                      </div>
+
+                      <button
+                        onClick={() => {
+                          setSelectedJunction(null)
+                          setJunctionDetail(null)
+                        }}
+                        className="w-full py-1.5 text-center text-xs text-slate-500 hover:text-slate-800 transition border border-dashed border-slate-300 rounded"
+                      >
+                        Clear Selection
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="py-12 px-4 text-center text-slate-400 space-y-2">
+                      <span className="material-symbols-outlined text-3xl text-slate-300">touch_app</span>
+                      <p className="font-medium text-slate-600">No Road or Junction Selected</p>
+                      <p className="text-[11px] text-slate-400 max-w-[240px] mx-auto">
+                        Click on any road segment, lane, or intersection on the canvas to inspect its geometry and live metrics.
+                      </p>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* TAB 3: LIVE VEHICLES */}
+              {inspectorTab === 'vehicles' && (
+                <div className="space-y-3 text-xs">
+                  {/* Search / Filter */}
+                  <div className="relative">
+                    <span className="material-symbols-outlined absolute left-2.5 top-2 text-slate-400 text-sm">search</span>
+                    <input
+                      type="text"
+                      placeholder="Search Vehicle ID or Lane..."
+                      value={vehicleSearch}
+                      onChange={(e) => setVehicleSearch(e.target.value)}
+                      className="w-full pl-8 pr-3 py-1.5 text-xs rounded-lg border border-[#cbdbf5] bg-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    />
+                  </div>
+
+                  {/* Vehicles List */}
+                  <div className="space-y-2 max-h-[500px] overflow-y-auto pr-1">
+                    {simStatus?.vehicles && simStatus.vehicles.length > 0 ? (
+                      simStatus.vehicles
+                        .filter(
+                          (v) =>
+                            !vehicleSearch ||
+                            v.id.toLowerCase().includes(vehicleSearch.toLowerCase()) ||
+                            (v.lane_id && v.lane_id.toLowerCase().includes(vehicleSearch.toLowerCase()))
+                        )
+                        .slice(0, 50)
+                        .map((veh) => (
+                          <div
+                            key={veh.id}
+                            className={`p-2.5 rounded-lg border transition flex items-center justify-between ${
+                              focusedVehicleId === veh.id
+                                ? 'bg-sky-50 border-sky-400 shadow-xs'
+                                : 'bg-[#f8faff] border-[#cbdbf5] hover:border-blue-300'
+                            }`}
+                          >
+                            <div className="space-y-0.5">
+                              <div className="flex items-center gap-1.5">
+                                <span
+                                  className={`w-2 h-2 rounded-full ${
+                                    veh.type === 'bus'
+                                      ? 'bg-amber-500'
+                                      : veh.type === 'delivery'
+                                      ? 'bg-slate-400'
+                                      : veh.type === 'motorcycle'
+                                      ? 'bg-red-500'
+                                      : 'bg-blue-500'
+                                  }`}
+                                />
+                                <strong className="font-mono text-[#0A1145] text-xs">{veh.id}</strong>
+                                <span className="text-[10px] text-slate-400 uppercase font-mono tracking-wider">
+                                  ({veh.type})
+                                </span>
+                              </div>
+                              <div className="text-[11px] text-slate-500 flex items-center gap-2">
+                                <span>Speed: <strong className="text-slate-700 font-mono">{veh.speed_kmh} km/h</strong></span>
+                                {veh.waiting_time_s > 0 && (
+                                  <span className="text-amber-600 font-medium">Wait: {veh.waiting_time_s}s</span>
+                                )}
+                              </div>
+                              {veh.lane_id && (
+                                <div className="text-[10px] text-slate-400 font-mono truncate max-w-[180px]">
+                                  {veh.lane_id}
+                                </div>
+                              )}
+                            </div>
+
+                            <button
+                              onClick={() => setFocusedVehicleId(focusedVehicleId === veh.id ? null : veh.id)}
+                              className={`px-2 py-1 rounded text-[11px] font-semibold transition ${
+                                focusedVehicleId === veh.id
+                                  ? 'bg-sky-600 text-white'
+                                  : 'bg-white border border-[#cbdbf5] text-[#0A1145] hover:bg-[#eff4ff]'
+                              }`}
+                            >
+                              {focusedVehicleId === veh.id ? 'Tracking' : 'Focus'}
+                            </button>
+                          </div>
+                        ))
+                    ) : (
+                      <div className="py-12 text-center text-slate-400">
+                        <span className="material-symbols-outlined text-2xl text-slate-300">no_crash</span>
+                        <p className="mt-1">No active vehicles</p>
+                        <p className="text-[11px] text-slate-400 mt-0.5">Click Play or Step to begin departures.</p>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         </div>

@@ -103,6 +103,9 @@ class SimulationSession:
         selected_fixed_time_plan: Optional[Any] = None,
         optimizer_validation_passed: Optional[bool] = None,
         optimizer_status: Optional[str] = None,
+        target_mode: str = "single",
+        network_geometry: Optional[dict[str, Any]] = None,
+        external_buffer_distance_m: float = 500.0,
     ):
         self.sim_id = sim_id
         self.analysis_id = analysis_id
@@ -132,6 +135,9 @@ class SimulationSession:
         self.selected_fixed_time_plan = selected_fixed_time_plan
         self.optimizer_validation_passed = optimizer_validation_passed
         self.optimizer_status = optimizer_status
+        self.target_mode = target_mode
+        self.network_geometry = network_geometry
+        self.external_buffer_distance_m = external_buffer_distance_m
         self.experiment_manifest: Optional[dict[str, Any]] = None
         self.network_provenance = "synthetic_demo" if is_synthetic_demo else "real_osm"
 
@@ -221,6 +227,13 @@ class SimulationSession:
             can_run_native = TRACI_AVAILABLE and sumo_bin is not None and self.netconvert_used
 
             if not can_run_native:
+                if self.target_mode == "network" and not self.is_synthetic_demo:
+                    self.state = "failed"
+                    self.engine_mode = "unavailable"
+                    self.engine_message = "Native Eclipse SUMO is required for Road Network Simulation."
+                    self.error_message = self.engine_message
+                    logger.error("Simulation %s cannot start native SUMO in network mode.", self.sim_id)
+                    return
                 self.engine_mode = "fallback"
                 self.state = "running"
                 if not TRACI_AVAILABLE:
@@ -251,8 +264,14 @@ class SimulationSession:
                     self.state = "running"
                     logger.info("Started native SUMO simulation %s via TraCI on port %s", self.sim_id, self.port)
                 except Exception as e:
-                    logger.warning("Failed to start native TraCI connection on %s: %s; transitioning to fallback", self.sim_id, e)
+                    logger.warning("Failed to start native TraCI connection on %s: %s", self.sim_id, e)
                     self.is_connected = False
+                    if self.target_mode == "network" and not self.is_synthetic_demo:
+                        self.engine_mode = "unavailable"
+                        self.state = "failed"
+                        self.error_message = f"Native SUMO startup failed ({type(e).__name__}): {e}"
+                        self.engine_message = self.error_message
+                        return
                     self.engine_mode = "fallback"
                     self.engine_message = f"Native SUMO startup failed ({type(e).__name__}); running internal kinematics engine."
                     self.error_message = str(e)
@@ -321,12 +340,18 @@ class SimulationSession:
                     # 3. Extract Vehicles and Instantaneous Metrics
                     self._extract_traci_state(conn)
                 except Exception as e:
-                    logger.warning("TraCI runtime step error on %s: %s; transitioning to fallback kinematics", self.sim_id, e)
+                    logger.warning("TraCI runtime step error on %s: %s", self.sim_id, e)
+                    self.is_connected = False
+                    if self.target_mode == "network" and not self.is_synthetic_demo:
+                        self.engine_mode = "unavailable"
+                        self.state = "failed"
+                        self.error_message = f"TraCI runtime step failure ({type(e).__name__}): {e}"
+                        self.engine_message = self.error_message
+                        return self.get_status()
                     self.engine_transitioned = True
                     self.engine_transition_reason = f"TraCI runtime step failure ({type(e).__name__}): {e}"
                     self.engine_mode = "fallback"
                     self.engine_message = f"Native TraCI runtime failure ({type(e).__name__}); transitioned to fallback kinematics (measurements invalidated for empirical comparison)."
-                    self.is_connected = False
                     self._step_kinematics_fallback(num_steps)
             else:
                 # Deterministic kinematics progression matching real corridor geometry
@@ -691,9 +716,22 @@ class SimulationSession:
                 angle = conn.vehicle.getAngle(v_id)
                 waiting = conn.vehicle.getWaitingTime(v_id)
                 v_type = conn.vehicle.getTypeID(v_id)
+                try:
+                    lane_id = conn.vehicle.getLaneID(v_id)
+                except Exception:
+                    lane_id = None
 
                 speeds.append(speed_kmh)
                 waiting_times.append(waiting)
+
+                if "bus" in v_type:
+                    mapped_vtype = "bus"
+                elif "delivery" in v_type or "truck" in v_type:
+                    mapped_vtype = "delivery"
+                elif "motorcycle" in v_type or "bike" in v_type:
+                    mapped_vtype = "motorcycle"
+                else:
+                    mapped_vtype = "passenger"
 
                 vehicles.append(
                     VehiclePosition(
@@ -702,8 +740,9 @@ class SimulationSession:
                         lng=round(lon, 6),
                         speed_kmh=round(speed_kmh, 1),
                         angle=round(angle, 1),
-                        type="bus" if "bus" in v_type else "passenger",
+                        type=mapped_vtype,
                         waiting_time_s=round(waiting, 1),
+                        lane_id=lane_id,
                     )
                 )
             except Exception:
@@ -1132,6 +1171,8 @@ class SimulationSession:
             "omitted_segments_count": self.omitted_segments_count,
             "engine_transitioned": self.engine_transitioned,
             "engine_transition_reason": self.engine_transition_reason,
+            "target_mode": self.target_mode,
+            "external_buffer_distance_m": self.external_buffer_distance_m,
         }
 
 

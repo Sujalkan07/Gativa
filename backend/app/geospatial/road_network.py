@@ -186,7 +186,7 @@ def _get_polygon_cache_key(poly: Polygon, max_area_km2: float = 25.0) -> str:
         int_strs.sort()
 
     holes_payload = f"|holes:{'#'.join(int_strs)}" if int_strs else ""
-    key_payload = f"poly:{ext_str}{holes_payload}|area_limit:{max_area_km2:.2f}|v:3"
+    key_payload = f"poly:{ext_str}{holes_payload}|area_limit:{max_area_km2:.2f}|v:4"
     return hashlib.sha256(key_payload.encode("utf-8")).hexdigest()[:24]
 
 
@@ -216,6 +216,69 @@ def _get_lanes(data: dict) -> Optional[int]:
         return int(lanes)
     except (ValueError, TypeError):
         return None
+
+
+def _get_int_tag(data: dict, tag_name: str) -> Optional[int]:
+    val = data.get(tag_name)
+    if val is None:
+        return None
+    if isinstance(val, list):
+        val = val[0]
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def _get_float_tag(data: dict, tag_name: str) -> Optional[float]:
+    val = data.get(tag_name)
+    if val is None:
+        return None
+    if isinstance(val, list):
+        val = val[0]
+    try:
+        parts = str(val).split()
+        return round(float(parts[0]), 2)
+    except (ValueError, TypeError, IndexError):
+        return None
+
+
+def _is_oneway(data: dict, G: Optional[nx.MultiDiGraph] = None, u: Any = None, v: Any = None) -> bool:
+    """
+    Accurately determine if an OSM road segment is one-way according to OSM tagging standards.
+    Distinguishes genuine one-way roads from bidirectional roads without relying on naive bool('no').
+    """
+    oneway = data.get("oneway")
+    if isinstance(oneway, list):
+        oneway = oneway[0]
+
+    if oneway is not None:
+        val = str(oneway).strip().lower()
+        if val in ("yes", "true", "1", "-1"):
+            return True
+        if val in ("no", "false", "0"):
+            return False
+
+    # Roundabouts and circular junctions are inherently one-way
+    junction = data.get("junction")
+    if isinstance(junction, list):
+        junction = junction[0]
+    if junction in ("roundabout", "circular"):
+        return True
+
+    # Motorways and motorway links default to one-way in OpenStreetMap
+    hw = data.get("highway")
+    if isinstance(hw, list):
+        hw = hw[0]
+    if hw in ("motorway", "motorway_link"):
+        return True
+
+    # If graph context is provided and reciprocal edge exists, it is two-way
+    if G is not None and u is not None and v is not None:
+        if G.has_edge(v, u):
+            return False
+
+    return False
 
 
 def _inspect_node_control(
@@ -322,80 +385,117 @@ async def _discover_local_street_names(poly: Polygon) -> tuple[list[str], str]:
 
 
 def _parse_and_clip_xml(path: str, boundary_poly: Polygon) -> nx.MultiDiGraph:
-    """Parse OSM XML file and truncate graph to boundary polygon, filtering non-drivable paths."""
+    """
+    Parse OSM XML file and filter graph to roads that intersect the boundary polygon.
+    Safely preserves boundary-crossing edges and road continuity without dropping exterior nodes.
+    """
     g = ox.graph_from_xml(path, simplify=True)
     if g.number_of_edges() == 0:
         return g
-    g_clipped = ox.truncate.truncate_graph_polygon(g, boundary_poly)
 
     non_drivable = {
         "footway", "cycleway", "steps", "path", "pedestrian",
         "bridleway", "corridor", "platform", "proposed", "construction",
     }
-    edges_to_remove = []
-    for u, v, k, d in g_clipped.edges(keys=True, data=True):
+    retained_edges = []
+    for u, v, k, d in g.edges(keys=True, data=True):
         hw = d.get("highway")
         if isinstance(hw, list):
             hw = hw[0]
         if hw in non_drivable:
-            edges_to_remove.append((u, v, k))
-    for u, v, k in edges_to_remove:
-        g_clipped.remove_edge(u, v, k)
+            continue
 
+        geom = d.get("geometry")
+        if geom is None:
+            if u in g.nodes and v in g.nodes:
+                u_node = g.nodes[u]
+                v_node = g.nodes[v]
+                if "x" in u_node and "y" in u_node and "x" in v_node and "y" in v_node:
+                    geom = LineString([[u_node["x"], u_node["y"]], [v_node["x"], v_node["y"]]])
+
+        if geom is not None and not geom.is_empty:
+            if boundary_poly.intersects(geom):
+                retained_edges.append((u, v, k))
+
+    if not retained_edges:
+        h = nx.MultiDiGraph()
+        h.graph.update(g.graph)
+        return h
+
+    g_clipped = g.edge_subgraph(retained_edges).copy()
     isolated = list(nx.isolates(g_clipped))
     g_clipped.remove_nodes_from(isolated)
     return g_clipped
 
 
-async def _fetch_osm_graph_from_api(poly: Polygon) -> tuple[Optional[nx.MultiDiGraph], Optional[str]]:
+async def _fetch_osm_graph_from_api(
+    poly: Polygon,
+    fallback_poly: Optional[Polygon] = None,
+) -> tuple[Optional[nx.MultiDiGraph], Optional[str]]:
     """
     Fetch road network directly from the official OpenStreetMap database API (v0.6).
     Fast, reliable, and returns real physical road geometries and street tags.
+    If the initial polygon (e.g., with a large buffer) exceeds the 50,000 node limit (HTTP 400),
+    it automatically falls back to fallback_poly (the unbuffered core study polygon).
     Returns (MultiDiGraph, raw_xml_content).
     """
     import httpx
 
-    minx, miny, maxx, maxy = poly.bounds
-    if (maxx - minx) > 0.25 or (maxy - miny) > 0.25:
-        logger.info("Bounding box (%.3f x %.3f) exceeds OSM API limit of 0.25 deg", maxx - minx, maxy - miny)
-        return None, None
+    targets = [poly]
+    if fallback_poly is not None and fallback_poly != poly:
+        targets.append(fallback_poly)
 
-    url = f"https://api.openstreetmap.org/api/0.6/map?bbox={minx:.6f},{miny:.6f},{maxx:.6f},{maxy:.6f}"
     headers = {
         "User-Agent": "GativaTrafficEngine/1.0",
         "Accept-Encoding": "gzip, deflate",
     }
 
-    tmp_path = None
-    try:
-        async with httpx.AsyncClient(timeout=25.0, follow_redirects=True, headers=headers) as client:
-            resp = await client.get(url)
-            if resp.status_code != 200 or len(resp.content) < 100:
-                logger.warning("OSM API v0.6 returned status %d (length %d bytes)", resp.status_code, len(resp.content))
-                return None, None
+    for idx, target_poly in enumerate(targets):
+        minx, miny, maxx, maxy = target_poly.bounds
+        if (maxx - minx) > 0.25 or (maxy - miny) > 0.25:
+            logger.info("Bounding box (%.3f x %.3f) exceeds OSM API limit of 0.25 deg", maxx - minx, maxy - miny)
+            continue
 
-            xml_content = resp.text
-            with tempfile.NamedTemporaryFile(suffix=".osm", delete=False, mode="w", encoding="utf-8") as f:
-                f.write(xml_content)
-                tmp_path = f.name
+        url = f"https://api.openstreetmap.org/api/0.6/map?bbox={minx:.6f},{miny:.6f},{maxx:.6f},{maxy:.6f}"
+        tmp_path = None
+        try:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, headers=headers) as client:
+                resp = await client.get(url)
+                if resp.status_code != 200 or len(resp.content) < 100:
+                    logger.warning(
+                        "OSM API v0.6 target %d (%s) returned status %d (length %d bytes)",
+                        idx,
+                        "primary" if idx == 0 else "fallback",
+                        resp.status_code,
+                        len(resp.content),
+                    )
+                    continue
 
-        G = await asyncio.to_thread(_parse_and_clip_xml, tmp_path, poly)
-        logger.info(
-            "Retrieved real OSM road network via OSM API v0.6: %d nodes, %d edges",
-            G.number_of_nodes(),
-            G.number_of_edges(),
-        )
-        return (G if G.number_of_edges() > 0 else None), xml_content
+                xml_content = resp.text
+                with tempfile.NamedTemporaryFile(suffix=".osm", delete=False, mode="w", encoding="utf-8") as f:
+                    f.write(xml_content)
+                    tmp_path = f.name
 
-    except Exception as exc:
-        logger.warning("OSM API v0.6 retrieval failed: %s", exc)
-        return None, None
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
+            G = await asyncio.to_thread(_parse_and_clip_xml, tmp_path, target_poly)
+            if G is not None and G.number_of_edges() > 0:
+                logger.info(
+                    "Retrieved real OSM road network via OSM API v0.6 (%s): %d nodes, %d edges",
+                    "primary" if idx == 0 else "fallback",
+                    G.number_of_nodes(),
+                    G.number_of_edges(),
+                )
+                return G, xml_content
+
+        except Exception as exc:
+            logger.warning("OSM API v0.6 retrieval error for target %d: %s", idx, exc)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+
+    return None, None
 
 
 async def fetch_road_network(
@@ -460,6 +560,15 @@ async def fetch_road_network(
         # Concurrently discover genuine street names & locality via TomTom
         discovered_streets, locality = await _discover_local_street_names(poly)
 
+        # Determine 500m buffer polygon for seamless simulation boundaries and external road continuity
+        centroid_y = poly.centroid.y
+        lat_rad = math.radians(centroid_y)
+        deg_lat = 500.0 / 111320.0
+        deg_lon = 500.0 / (111320.0 * max(0.1, math.cos(lat_rad)))
+        poly_buffered = poly.buffer(max(deg_lat, deg_lon))
+        min_bx, min_by, max_bx, max_by = poly_buffered.bounds
+        fetch_poly = poly_buffered if (max_bx - min_bx <= 0.25 and max_by - min_by <= 0.25) else poly
+
         G: Optional[nx.MultiDiGraph] = None
         source_channel = "osm_api_v06"
         cache_key = _get_polygon_cache_key(poly, max_area_km2=max_area_km2)
@@ -473,7 +582,7 @@ async def fetch_road_network(
                     f.write(cached_xml)
                     tmp_cache_path = f.name
                 try:
-                    G = await asyncio.to_thread(_parse_and_clip_xml, tmp_cache_path, poly)
+                    G = await asyncio.to_thread(_parse_and_clip_xml, tmp_cache_path, fetch_poly)
                     if G is not None and G.number_of_edges() > 0:
                         source_channel = "osm_spatial_cache"
                         logger.info("Loaded road network from local spatial cache (%d edges)", G.number_of_edges())
@@ -486,7 +595,7 @@ async def fetch_road_network(
         # 2. Attempt official OpenStreetMap API v0.6 if not loaded from cache
         if G is None or G.number_of_edges() == 0:
             try:
-                G, raw_xml = await _fetch_osm_graph_from_api(poly)
+                G, raw_xml = await _fetch_osm_graph_from_api(fetch_poly, fallback_poly=poly)
                 if G is not None and G.number_of_edges() > 0 and raw_xml:
                     source_channel = "osm_api_v06"
                     meta = {
@@ -506,18 +615,21 @@ async def fetch_road_network(
                 "https://overpass-api.de/api/interpreter",
                 "https://overpass.private.coffee/api/interpreter",
             ]:
-                try:
-                    ox.settings.overpass_endpoint = endpoint
-                    logger.info("Attempting Overpass retrieval via %s", endpoint)
-                    G = await asyncio.wait_for(
-                        asyncio.to_thread(ox.graph_from_polygon, poly, network_type="drive", simplify=True),
-                        timeout=20.0,
-                    )
-                    if G is not None and G.number_of_edges() > 0:
-                        source_channel = "osm_overpass"
-                        break
-                except Exception as exc:
-                    logger.warning("Overpass endpoint %s failed: %s", endpoint, exc)
+                for query_poly in [fetch_poly, poly]:
+                    try:
+                        ox.settings.overpass_endpoint = endpoint
+                        logger.info("Attempting Overpass retrieval via %s (%s)", endpoint, "buffered" if query_poly == fetch_poly else "core")
+                        G = await asyncio.wait_for(
+                            asyncio.to_thread(ox.graph_from_polygon, query_poly, network_type="drive", simplify=True),
+                            timeout=20.0,
+                        )
+                        if G is not None and G.number_of_edges() > 0:
+                            source_channel = "osm_overpass"
+                            break
+                    except Exception as exc:
+                        logger.warning("Overpass endpoint %s failed: %s", endpoint, exc)
+                if G is not None and G.number_of_edges() > 0:
+                    break
 
         # 4. Strictly reject synthetic fallback in production
         if G is None or G.number_of_edges() == 0:
@@ -542,9 +654,8 @@ async def fetch_road_network(
                 continue
             seen_canonical_edges.add(canonical_key)
 
-            # Determine physical one-way status:
-            # If oneway tag is True AND there is no reciprocal edge (v, u), it is one-way.
-            is_oneway = bool(data.get("oneway", False)) and not G.has_edge(v, u)
+            # Determine genuine physical one-way status using OSM specifications
+            is_oneway = _is_oneway(data, G, u, v)
 
             # Geometry extraction
             geom = data.get("geometry")
@@ -554,79 +665,161 @@ async def fetch_road_network(
                 if "x" in u_data and "y" in u_data and "x" in v_data and "y" in v_data:
                     geom = LineString([[u_data["x"], u_data["y"]], [v_data["x"], v_data["y"]]])
 
-            # Clip geometry strictly to polygon boundary, preserving all valid fragments (Issue E)
-            clipped_parts = _clip_geometry_to_polygon_parts(geom, poly)
-            if not clipped_parts:
+            if geom is None or geom.is_empty:
                 continue
 
-            for part_idx, clipped_geom in enumerate(clipped_parts):
-                length_m = _compute_geodesic_length_m(clipped_geom)
-                if length_m < 1.0:
-                    continue
+            highway = data.get("highway", "unclassified")
+            road_class = _classify_road(highway)
+            osm_highway_str = highway[0] if isinstance(highway, list) else str(highway)
+            osm_id_val = data.get("osmid")
+            osm_id_str = str(osm_id_val[0]) if isinstance(osm_id_val, list) else str(osm_id_val or "")
 
-                coords_list = [[round(c[0], 6), round(c[1], 6)] for c in clipped_geom.coords]
-                if len(coords_list) < 2:
-                    continue
-                geojson_line = GeoJSONLineString(coordinates=coords_list)
-
-                highway = data.get("highway", "unclassified")
-                road_class = _classify_road(highway)
-                osm_highway_str = highway[0] if isinstance(highway, list) else str(highway)
-                osm_id_val = data.get("osmid")
-                osm_id_str = str(osm_id_val[0]) if isinstance(osm_id_val, list) else str(osm_id_val or "")
-
-                # Street Name
-                name = data.get("name")
-                if isinstance(name, list):
-                    name = name[0]
-                if not name:
-                    loc_prefix = locality or "Corridor"
-                    if road_class == "highway":
-                        name = f"{loc_prefix} Expressway Corridor"
-                    elif road_class == "arterial":
-                        name = f"{loc_prefix} Primary Arterial Corridor"
+            # Street Name
+            name = data.get("name")
+            if isinstance(name, list):
+                name = name[0]
+            if not name:
+                loc_prefix = locality or "Corridor"
+                if road_class == "highway":
+                    name = f"{loc_prefix} Expressway Corridor"
+                elif road_class == "arterial":
+                    name = f"{loc_prefix} Primary Arterial Corridor"
+                else:
+                    hw_tag = data.get("highway")
+                    if isinstance(hw_tag, list):
+                        hw_tag = hw_tag[0]
+                    if hw_tag == "residential":
+                        name = f"{loc_prefix} Residential Way"
+                    elif hw_tag in ("tertiary", "tertiary_link"):
+                        name = f"{loc_prefix} Collector Marg"
                     else:
-                        hw_tag = data.get("highway")
-                        if isinstance(hw_tag, list):
-                            hw_tag = hw_tag[0]
-                        if hw_tag == "residential":
-                            name = f"{loc_prefix} Residential Way"
-                        elif hw_tag in ("tertiary", "tertiary_link"):
-                            name = f"{loc_prefix} Collector Marg"
-                        else:
-                            name = f"{loc_prefix} Sector Street"
+                        name = f"{loc_prefix} Sector Street"
 
-                u_ctrl, u_prov = _inspect_node_control(G.nodes[u] if u in G.nodes else {}, data)
-                v_ctrl, v_prov = _inspect_node_control(G.nodes[v] if v in G.nodes else {}, data)
+            u_ctrl, u_prov = _inspect_node_control(G.nodes[u] if u in G.nodes else {}, data)
+            v_ctrl, v_prov = _inspect_node_control(G.nodes[v] if v in G.nodes else {}, data)
 
-                part_suffix = f"_p{part_idx + 1}" if len(clipped_parts) > 1 else ""
-                seg_id = f"{u}_{v}_{key}{part_suffix}"
+            lanes_total = _get_lanes(data)
+            lanes_fwd = _get_int_tag(data, "lanes:forward")
+            lanes_bwd = _get_int_tag(data, "lanes:backward")
+            speed_val = _get_speed_limit(data)
+            width_val = _get_float_tag(data, "width")
 
-                segments.append(RoadSegment(
-                    segment_id=seg_id,
-                    name=name,
-                    road_type=road_class,
-                    length_m=round(length_m, 1),
-                    geometry=geojson_line,
-                    speed_limit_kmh=_get_speed_limit(data),
-                    lanes=_get_lanes(data),
-                    is_oneway=is_oneway,
-                    osm_highway=osm_highway_str,
-                    osm_id=osm_id_str,
-                    u_control=u_ctrl,
-                    v_control=v_ctrl,
-                    u_provenance=u_prov,
-                    v_provenance=v_prov,
-                    u=str(u),
-                    v=str(v),
-                ))
+            # ─── Part A: Process Core Segments (Inside User-Selected Polygon) ───
+            intersects_poly = poly.intersects(geom)
+            if intersects_poly:
+                core_parts = _clip_geometry_to_polygon_parts(geom, poly)
+                for part_idx, clipped_geom in enumerate(core_parts):
+                    length_m = _compute_geodesic_length_m(clipped_geom)
+                    if length_m < 1.0:
+                        continue
 
-                class_counts[road_class] = class_counts.get(road_class, 0) + 1
-                total_length_m += length_m
+                    coords_list = [[round(c[0], 6), round(c[1], 6)] for c in clipped_geom.coords]
+                    if len(coords_list) < 2:
+                        continue
+                    geojson_line = GeoJSONLineString(coordinates=coords_list)
+
+                    part_suffix = f"_p{part_idx + 1}" if len(core_parts) > 1 else ""
+                    seg_id = f"{u}_{v}_{key}{part_suffix}"
+
+                    segments.append(RoadSegment(
+                        segment_id=seg_id,
+                        name=name,
+                        road_type=road_class,
+                        length_m=round(length_m, 1),
+                        geometry=geojson_line,
+                        speed_limit_kmh=speed_val,
+                        lanes=lanes_total,
+                        lanes_forward=lanes_fwd,
+                        lanes_backward=lanes_bwd,
+                        width_m=width_val,
+                        is_oneway=is_oneway,
+                        is_buffer=False,
+                        osm_highway=osm_highway_str,
+                        osm_id=osm_id_str,
+                        u_control=u_ctrl,
+                        v_control=v_ctrl,
+                        u_provenance=u_prov,
+                        v_provenance=v_prov,
+                        u=str(u),
+                        v=str(v),
+                    ))
+
+                    class_counts[road_class] = class_counts.get(road_class, 0) + 1
+                    total_length_m += length_m
+
+                # ─── Part B: Process External Extension Parts for Boundary Crossings ───
+                try:
+                    ext_diff = geom.difference(poly)
+                    ext_parts = _clip_geometry_to_polygon_parts(ext_diff, poly_buffered)
+                    for ext_idx, ext_geom in enumerate(ext_parts):
+                        ext_len_m = _compute_geodesic_length_m(ext_geom)
+                        if ext_len_m < 2.0:
+                            continue
+                        ext_coords = [[round(c[0], 6), round(c[1], 6)] for c in ext_geom.coords]
+                        if len(ext_coords) < 2:
+                            continue
+                        ext_seg_id = f"{u}_{v}_{key}_ext{ext_idx + 1}"
+                        segments.append(RoadSegment(
+                            segment_id=ext_seg_id,
+                            name=f"{name} (Approach)",
+                            road_type=road_class,
+                            length_m=round(ext_len_m, 1),
+                            geometry=GeoJSONLineString(coordinates=ext_coords),
+                            speed_limit_kmh=speed_val,
+                            lanes=lanes_total,
+                            lanes_forward=lanes_fwd,
+                            lanes_backward=lanes_bwd,
+                            width_m=width_val,
+                            is_oneway=is_oneway,
+                            is_buffer=True,
+                            osm_highway=osm_highway_str,
+                            osm_id=osm_id_str,
+                            u_control=u_ctrl,
+                            v_control=v_ctrl,
+                            u_provenance=u_prov,
+                            v_provenance=v_prov,
+                            u=str(u),
+                            v=str(v),
+                        ))
+                except Exception as exc:
+                    logger.debug("Boundary difference extraction fallback: %s", exc)
+            else:
+                # Road lies completely in the buffer zone outside the core polygon
+                buf_parts = _clip_geometry_to_polygon_parts(geom, poly_buffered)
+                for buf_idx, buf_geom in enumerate(buf_parts):
+                    buf_len_m = _compute_geodesic_length_m(buf_geom)
+                    if buf_len_m < 2.0:
+                        continue
+                    buf_coords = [[round(c[0], 6), round(c[1], 6)] for c in buf_geom.coords]
+                    if len(buf_coords) < 2:
+                        continue
+                    buf_seg_id = f"{u}_{v}_{key}_buf{buf_idx + 1}"
+                    segments.append(RoadSegment(
+                        segment_id=buf_seg_id,
+                        name=f"{name} (Approach)",
+                        road_type=road_class,
+                        length_m=round(buf_len_m, 1),
+                        geometry=GeoJSONLineString(coordinates=buf_coords),
+                        speed_limit_kmh=speed_val,
+                        lanes=lanes_total,
+                        lanes_forward=lanes_fwd,
+                        lanes_backward=lanes_bwd,
+                        width_m=width_val,
+                        is_oneway=is_oneway,
+                        is_buffer=True,
+                        osm_highway=osm_highway_str,
+                        osm_id=osm_id_str,
+                        u_control=u_ctrl,
+                        v_control=v_ctrl,
+                        u_provenance=u_prov,
+                        v_provenance=v_prov,
+                        u=str(u),
+                        v=str(v),
+                    ))
 
         total_length_km = round(total_length_m / 1000.0, 2)
 
-        # ─── Network metrics (Authentic junction controls) ───────────────────
+        # ─── Network metrics (Authentic junction controls for Study Area) ─────
         signalized_nodes = set()
         unsignalized_nodes = set()
         for n in G.nodes:
@@ -642,8 +835,9 @@ async def fetch_road_network(
         intersection_count = sum(1 for n in G.nodes if G.degree(n) >= 3)
         bottlenecks = _detect_structural_bottlenecks(G, locality=locality)
 
+        core_segment_count = sum(1 for s in segments if not s.is_buffer)
         metrics = RoadNetworkMetrics(
-            total_segments=len(segments),
+            total_segments=core_segment_count,
             highway_count=class_counts.get("highway", 0),
             arterial_count=class_counts.get("arterial", 0),
             local_count=class_counts.get("local", 0),

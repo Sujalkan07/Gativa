@@ -108,6 +108,11 @@ class RoadSegment(BaseModel):
     v_provenance: Optional[ControlProvenance] = None
     u: Optional[str] = None
     v: Optional[str] = None
+    lanes_forward: Optional[int] = None
+    lanes_backward: Optional[int] = None
+    is_estimated_lanes: Optional[bool] = False
+    is_buffer: Optional[bool] = False
+    width_m: Optional[float] = None
 
 
 class TrafficIncident(BaseModel):
@@ -317,6 +322,8 @@ class SimulationPrepareRequest(BaseModel):
     is_synthetic_demo: bool = False
     approved_candidate_ids: Optional[list[str]] = None
     initial_population: Optional[int] = None
+    external_buffer_m: Optional[float] = 500.0
+    target_mode: Optional[str] = "network"
 
 
 class VehiclePosition(BaseModel):
@@ -327,6 +334,118 @@ class VehiclePosition(BaseModel):
     angle: float
     type: str = "passenger"
     waiting_time_s: float = 0.0
+    lane_id: Optional[str] = None
+
+
+class NetworkLaneDetail(BaseModel):
+    id: str
+    index: int
+    width_m: float = 3.2
+    speed_kmh: float = 50.0
+    shape: list[list[float]] = []  # [[lng, lat], ...]
+
+
+class NetworkEdgeDetail(BaseModel):
+    id: str
+    edge_id: Optional[str] = None
+    name: str = "Road Segment"
+    from_node: str
+    to_node: str
+    road_type: str = "arterial"
+    speed_kmh: float = 50.0
+    num_lanes: int = 2
+    length_m: float = 0.0
+    is_oneway: bool = False
+    is_buffer: bool = False
+    is_estimated_lanes: bool = False
+    osm_id: Optional[str] = None
+    shape: list[list[float]] = []
+    lanes: list[NetworkLaneDetail] = []
+    current_vehicles_count: int = 0
+    mean_speed_kmh: float = 0.0
+
+
+class NetworkJunctionDetail(BaseModel):
+    id: str
+    junction_id: Optional[str] = None
+    x: float  # lng
+    y: float  # lat
+    type: str = "priority"
+    shape: list[list[float]] = []
+    incoming_edges: list[str] = []
+    outgoing_edges: list[str] = []
+    has_traffic_light: bool = False
+    tl_id: Optional[str] = None
+    current_phase: Optional[str] = None
+    waiting_vehicles_count: int = 0
+
+
+class NetworkSummaryMetrics(BaseModel):
+    total_segments: int = 0
+    total_edges: int = 0
+    directed_edges: int = 0
+    junction_count: int = 0
+    total_lanes: int = 0
+    single_lane_roads: int = 0
+    two_lane_roads: int = 0
+    four_lane_roads: int = 0
+    other_lane_roads: int = 0
+    traffic_signals_count: int = 0
+    connected_components: int = 1
+    entry_points_count: int = 0
+    exit_points_count: int = 0
+    verified_lane_count: int = 0
+    inferred_lane_count: int = 0
+    selected_area_km2: float = 0.0
+    buffer_area_km2: float = 0.0
+    buffer_distance_m: float = 500.0
+
+
+class RoadNetworkGeometryResponse(BaseModel):
+    sim_id: str
+    analysis_id: str
+    bounds: list[float] = [0.0, 0.0, 0.0, 0.0]  # [min_lng, min_lat, max_lng, max_lat]
+    polygon_coords: list[list[float]] = []
+    edges: list[NetworkEdgeDetail] = []
+    junctions: list[NetworkJunctionDetail] = []
+    summary: NetworkSummaryMetrics = Field(default_factory=NetworkSummaryMetrics)
+    diagnostics: dict[str, Any] = Field(default_factory=dict)
+
+
+class RoadDetailResponse(BaseModel):
+    edge_id: str
+    source_segment_id: Optional[str] = None
+    osm_id: Optional[str] = None
+    name: str
+    road_type: str
+    num_lanes: int
+    directional_lanes: dict[str, int] = {}
+    is_oneway: bool
+    speed_limit_kmh: float
+    length_m: float
+    width_m: float = 3.5
+    lane_confidence: str = "verified"
+    current_vehicles_count: int = 0
+    mean_speed_kmh: float = 0.0
+    queue_length_m: float = 0.0
+    occupancy_pct: float = 0.0
+
+
+class JunctionDetailResponse(BaseModel):
+    junction_id: str
+    lat: float
+    lng: float
+    control_type: str
+    incoming_roads: list[str] = []
+    outgoing_roads: list[str] = []
+    incoming_lanes: list[str] = []
+    outgoing_lanes: list[str] = []
+    turning_connections_count: int = 0
+    has_traffic_light: bool = False
+    tl_id: Optional[str] = None
+    current_phase_state: Optional[str] = None
+    waiting_vehicles_count: int = 0
+    queue_length_m: float = 0.0
 
 
 class TrafficLightState(BaseModel):
@@ -403,6 +522,7 @@ class SimulationStatusResponse(BaseModel):
     applied_signals_count: Optional[int] = 0
     initial_vehicles_count: Optional[int] = 0
     selected_fixed_time_plan: Optional[Any] = None
+    external_buffer_distance_m: Optional[float] = 500.0
 
 
 class ScenarioMetricRow(BaseModel):

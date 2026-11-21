@@ -59,6 +59,13 @@ export interface RoadSegment {
   v_control?: JunctionControlType | null
   u_provenance?: ControlProvenance | null
   v_provenance?: ControlProvenance | null
+  u?: string | null
+  v?: string | null
+  lanes_forward?: number | null
+  lanes_backward?: number | null
+  is_estimated_lanes?: boolean
+  is_buffer?: boolean
+  width_m?: number | null
 }
 
 export interface GeoJSONLineString {
@@ -252,6 +259,9 @@ export interface SimulationPrepareRequest {
   demand_data_source?: string
   approved_candidate_ids?: string[]
   initial_population?: number
+  external_buffer_m?: number
+  target_mode?: string
+  is_synthetic_demo?: boolean
 }
 
 export interface VehiclePosition {
@@ -262,6 +272,7 @@ export interface VehiclePosition {
   angle: number
   type: string
   waiting_time_s: number
+  lane_id?: string | null
 }
 
 export interface SimulationMetrics {
@@ -339,6 +350,8 @@ export interface SimulationStatusResponse {
   applied_signals_count?: number
   initial_vehicles_count?: number
   selected_fixed_time_plan?: TimingPlanEvaluation | null
+  external_buffer_distance_m?: number
+  target_mode?: string
 }
 
 export interface ScenarioMetricRow {
@@ -567,4 +580,116 @@ export interface GeocodingSearchResponse {
   count: number
   results: GeocodingResult[]
   provider: string
+}
+
+
+export interface NetworkLaneDetail {
+  id: string
+  index: number
+  width_m: number
+  speed_kmh: number
+  shape: [number, number][]
+}
+
+export interface NetworkEdgeDetail {
+  id: string
+  edge_id?: string
+  name: string
+  from_node: string
+  to_node: string
+  road_type: string
+  speed_kmh: number
+  num_lanes: number
+  length_m: number
+  is_oneway: boolean
+  is_buffer: boolean
+  is_estimated_lanes: boolean
+  osm_id?: string | null
+  shape: [number, number][]
+  lanes: NetworkLaneDetail[]
+  current_vehicles_count?: number
+  mean_speed_kmh?: number
+}
+
+export interface NetworkJunctionDetail {
+  id: string
+  junction_id?: string
+  x: number
+  y: number
+  type: string
+  shape: [number, number][]
+  incoming_edges: string[]
+  outgoing_edges: string[]
+  has_traffic_light: boolean
+  tl_id?: string | null
+  current_phase?: string | null
+  waiting_vehicles_count?: number
+}
+
+export interface NetworkSummaryMetrics {
+  total_segments: number
+  total_edges: number
+  directed_edges: number
+  junction_count: number
+  total_lanes: number
+  single_lane_roads: number
+  two_lane_roads: number
+  four_lane_roads: number
+  other_lane_roads: number
+  traffic_signals_count: number
+  connected_components: number
+  entry_points_count: number
+  exit_points_count: number
+  verified_lane_count: number
+  inferred_lane_count: number
+  selected_area_km2: number
+  buffer_area_km2: number
+  buffer_distance_m: number
+}
+
+export interface RoadNetworkGeometryResponse {
+  sim_id: string
+  analysis_id: string
+  bounds: [number, number, number, number]
+  polygon_coords: [number, number][]
+  edges: NetworkEdgeDetail[]
+  junctions: NetworkJunctionDetail[]
+  summary: NetworkSummaryMetrics
+  diagnostics: Record<string, unknown>
+}
+
+export interface RoadDetailResponse {
+  edge_id: string
+  source_segment_id?: string | null
+  osm_id?: string | null
+  name: string
+  road_type: string
+  num_lanes: number
+  directional_lanes: Record<string, number>
+  is_oneway: boolean
+  speed_limit_kmh: number
+  length_m: number
+  width_m: number
+  lane_confidence: string
+  current_vehicles_count: number
+  mean_speed_kmh: number
+  queue_length_m: number
+  occupancy_pct: number
+}
+
+export interface JunctionDetailResponse {
+  junction_id: string
+  lat: number
+  lng: number
+  control_type: string
+  incoming_roads: string[]
+  outgoing_roads: string[]
+  incoming_lanes: string[]
+  outgoing_lanes: string[]
+  turning_connections_count: number
+  has_traffic_light: boolean
+  tl_id?: string | null
+  current_phase_state?: string | null
+  waiting_vehicles_count: number
+  queue_length_m: number
 }

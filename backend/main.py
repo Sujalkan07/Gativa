@@ -39,6 +39,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.get("/", tags=["Root"])
+async def root():
+    """Root endpoint welcoming the user and providing dashboard and API documentation links."""
+    return {
+        "service": "Gativa Smart Traffic Optimization API",
+        "status": "online",
+        "version": "1.0.0",
+        "dashboard_url": "http://localhost:5173",
+        "docs_url": "http://localhost:8000/docs",
+        "health_check": "http://localhost:8000/api/health",
+    }
+
+
 # Routers
 app.include_router(health.router, prefix="/api")
 app.include_router(analyses.router, prefix="/api")

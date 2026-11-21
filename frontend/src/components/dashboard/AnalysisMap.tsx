@@ -236,6 +236,7 @@ export default function AnalysisMap({
     if (!showRoads) return
 
     segments.forEach((seg) => {
+      if (seg.is_buffer) return // Core analysis map presents the user's selected study area roads
       if (!seg.geometry || !seg.geometry.coordinates || seg.geometry.coordinates.length < 2) return
 
       const latLngs: L.LatLngExpression[] = seg.geometry.coordinates.map((c) => [c[1], c[0]])

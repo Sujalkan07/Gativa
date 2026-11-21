@@ -18,6 +18,9 @@ from app.models.schemas import (
     SignalListResponse,
     SimulationPrepareRequest,
     SimulationStatusResponse,
+    RoadNetworkGeometryResponse,
+    RoadDetailResponse,
+    JunctionDetailResponse,
 )
 from app.services.analysis import get_analysis_by_id
 from app.simulation.service import simulation_service
@@ -152,6 +155,51 @@ async def get_simulation_status(sim_id: str):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Simulation {sim_id} not found",
+        )
+
+
+@router.get(
+    "/{sim_id}/network",
+    response_model=RoadNetworkGeometryResponse,
+    summary="Get complete compiled road network geometry with lane-level paths and junction shapes",
+)
+async def get_road_network_geometry(sim_id: str):
+    try:
+        return simulation_service.get_road_network_geometry(sim_id)
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Simulation {sim_id} not found",
+        )
+
+
+@router.get(
+    "/{sim_id}/road-detail/{edge_id:path}",
+    response_model=RoadDetailResponse,
+    summary="Get detailed metadata, lane configuration, and live state for a road edge",
+)
+async def get_road_detail(sim_id: str, edge_id: str):
+    try:
+        return simulation_service.get_road_detail(sim_id, edge_id)
+    except KeyError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e).strip("'\""),
+        )
+
+
+@router.get(
+    "/{sim_id}/junction-detail/{junction_id:path}",
+    response_model=JunctionDetailResponse,
+    summary="Get detailed geometry, turning connections, and signal state for a junction",
+)
+async def get_junction_detail(sim_id: str, junction_id: str):
+    try:
+        return simulation_service.get_junction_detail(sim_id, junction_id)
+    except KeyError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e).strip("'\""),
         )
 
 

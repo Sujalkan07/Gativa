@@ -30,6 +30,10 @@ from app.models.schemas import (
     SimulationPrepareRequest,
     SimulationStatusResponse,
     TimingPlanEvaluation,
+    RoadNetworkGeometryResponse,
+    RoadDetailResponse,
+    JunctionDetailResponse,
+    NetworkSummaryMetrics,
 )
 from app.services.analysis import get_analysis_by_id
 from app.simulation.manifest import create_experiment_manifest
@@ -121,6 +125,8 @@ class SimulationService:
                 approved_candidate_ids.intersection_update(valid_candidate_ids)
 
             seed = req.seed if req.seed is not None else 42
+            external_buffer_m = float(getattr(req, "external_buffer_m", 500.0) or 500.0)
+            target_mode = str(getattr(req, "target_mode", "single") or "single")
             # The custom count is a controlled initial-population experiment.  It
             # must not be reduced by the automatic initial-demand share.
             initial_population = req.manual_vehicle_count if req.manual_vehicle_count is not None else req.initial_population
@@ -140,6 +146,7 @@ class SimulationService:
                 allow_synthetic=is_demo,
                 approved_signal_junctions=None,
                 initial_population=initial_population,
+                external_buffer_m=external_buffer_m,
             )
 
             # 2. Build SUMO network files for Optimized Scenario (Compiles user-approved candidate junctions as traffic lights)
@@ -157,6 +164,7 @@ class SimulationService:
                 allow_synthetic=is_demo,
                 approved_signal_junctions=approved_candidate_ids,
                 initial_population=initial_population,
+                external_buffer_m=external_buffer_m,
             )
 
             # Guarantee 100% Demand Parity: Both scenarios execute the EXACT same routes and initial vehicles
@@ -168,7 +176,7 @@ class SimulationService:
             optimizer_validation_passed: bool = False
             optimizer_status: str = "none"
 
-            if applied_signals_count > 0:
+            if applied_signals_count > 0 and target_mode != "network":
                 try:
                     optimizer = FixedTimeSignalOptimizer(opt_dir)
                     opt_result = optimizer.optimize(
@@ -207,9 +215,9 @@ class SimulationService:
                     plan_name = selected_plan.name
                     optimized_strat = f"Optimized ({plan_name})"
                 else:
-                    optimized_strat = f"Intervention ({applied_signals_count} Signals Applied - Baseline Timing Preserved)"
+                    optimized_strat = f"Optimized Intervention ({applied_signals_count} Signals Applied - Baseline Timing Preserved)"
             else:
-                optimized_strat = "Intervention (No Signals Approved)"
+                optimized_strat = "Optimized Intervention (No Signals Approved)"
 
             # 1. Primary/Optimized Session (rendered on frontend map)
             opt_session = SimulationSession(
@@ -240,6 +248,9 @@ class SimulationService:
                 selected_fixed_time_plan=selected_plan,
                 optimizer_validation_passed=optimizer_validation_passed,
                 optimizer_status=optimizer_status,
+                target_mode=target_mode,
+                network_geometry=build_meta_opt.get("network_geometry"),
+                external_buffer_distance_m=external_buffer_m,
             )
             opt_session._segment_edge_map = build_meta_opt.get("segment_edge_map", {})
             opt_session._edge_segment_map = build_meta_opt.get("edge_segment_map", {})
@@ -621,6 +632,90 @@ class SimulationService:
 
     def reset_signals(self, sim_id: str) -> dict[str, Any]:
         return self.edit_signal(sim_id, "all", SignalEditRequest(action="restore_original")).model_dump()
+
+    def get_road_network_geometry(self, sim_id: str) -> RoadNetworkGeometryResponse:
+        session = self._sessions.get(sim_id)
+        if not session:
+            raise KeyError(f"Simulation '{sim_id}' not found.")
+        geom = session.network_geometry or {}
+        return RoadNetworkGeometryResponse(
+            sim_id=session.sim_id,
+            analysis_id=session.analysis_id,
+            bounds=geom.get("bounds", [0.0, 0.0, 0.0, 0.0]),
+            polygon_coords=geom.get("polygon_coords") or session.polygon_coords or [],
+            edges=geom.get("edges", []),
+            junctions=geom.get("junctions", []),
+            summary=geom.get("summary") or NetworkSummaryMetrics(),
+            diagnostics=geom.get("diagnostics", {}),
+        )
+
+    def get_road_detail(self, sim_id: str, edge_id: str) -> RoadDetailResponse:
+        session = self._sessions.get(sim_id)
+        if not session:
+            raise KeyError(f"Simulation '{sim_id}' not found.")
+        geom = session.network_geometry or {}
+        edges = geom.get("edges", [])
+        edge = next((e for e in edges if e.get("edge_id") == edge_id or e.get("id") == edge_id), None)
+        if not edge:
+            edge = next((e for e in edges if edge_id in (e.get("edge_id", ""), e.get("id", ""))), None)
+        if not edge:
+            raise KeyError(f"Road edge '{edge_id}' not found in simulation '{sim_id}'.")
+
+        num_lanes = edge.get("num_lanes", len(edge.get("lanes", [1])))
+        lanes = edge.get("lanes", [])
+        lane_ids = {l.get("lane_id") for l in lanes}
+        active_veh = [v for v in session.cached_vehicles if getattr(v, "lane_id", None) in lane_ids or (hasattr(v, "edge_id") and v.edge_id == edge_id)]
+        mean_speed = sum(v.speed_kmh for v in active_veh) / len(active_veh) if active_veh else edge.get("speed_limit_kmh", 50.0)
+
+        tel_samples = session._edge_telemetry.get(edge_id, [])
+        latest_tel = tel_samples[-1] if tel_samples else {}
+
+        return RoadDetailResponse(
+            edge_id=edge_id,
+            source_segment_id=edge.get("source_segment_id"),
+            osm_id=edge.get("osm_id"),
+            name=edge.get("name", f"Road {edge_id}"),
+            road_type=edge.get("road_type", "urban"),
+            num_lanes=num_lanes,
+            directional_lanes={"forward": num_lanes, "backward": 0} if edge.get("is_oneway") else {"forward": max(1, num_lanes // 2), "backward": max(1, num_lanes // 2)},
+            is_oneway=edge.get("is_oneway", False),
+            speed_limit_kmh=edge.get("speed_limit_kmh", 50.0),
+            length_m=edge.get("length_m", 100.0),
+            width_m=edge.get("width_m", num_lanes * 3.5),
+            lane_confidence="inferred" if edge.get("is_estimated_lanes") else "verified",
+            current_vehicles_count=len(active_veh),
+            mean_speed_kmh=round(mean_speed, 1),
+            queue_length_m=round(latest_tel.get("halting_vehicles", 0) * 7.5, 1),
+            occupancy_pct=round(latest_tel.get("occupancy_pct", 0.0), 1),
+        )
+
+    def get_junction_detail(self, sim_id: str, junction_id: str) -> JunctionDetailResponse:
+        session = self._sessions.get(sim_id)
+        if not session:
+            raise KeyError(f"Simulation '{sim_id}' not found.")
+        geom = session.network_geometry or {}
+        junctions = geom.get("junctions", [])
+        junc = next((j for j in junctions if j.get("junction_id") == junction_id or j.get("id") == junction_id), None)
+        if not junc:
+            raise KeyError(f"Junction '{junction_id}' not found in simulation '{sim_id}'.")
+
+        tl_match = next((tl for tl in session.cached_signals if tl.id == junction_id or junction_id in tl.controlled_junctions), None)
+        return JunctionDetailResponse(
+            junction_id=junction_id,
+            lat=junc.get("lat", 0.0),
+            lng=junc.get("lng", 0.0),
+            control_type=junc.get("control_type", "priority"),
+            incoming_roads=junc.get("incoming_roads", []),
+            outgoing_roads=junc.get("outgoing_roads", []),
+            incoming_lanes=junc.get("incoming_lanes", []),
+            outgoing_lanes=junc.get("outgoing_lanes", []),
+            turning_connections_count=junc.get("turning_connections_count", 0),
+            has_traffic_light=bool(junc.get("has_traffic_light") or tl_match is not None),
+            tl_id=tl_match.id if tl_match else None,
+            current_phase_state=tl_match.state if tl_match else None,
+            waiting_vehicles_count=sum(1 for v in session.cached_vehicles if v.waiting_time_s > 0),
+            queue_length_m=round(session.current_metrics.avg_queue_length_m, 1),
+        )
 
 
 # Global singleton instance
