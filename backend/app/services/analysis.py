@@ -39,7 +39,7 @@ from app.models.schemas import (
 
 logger = logging.getLogger(__name__)
 
-MAX_TRAFFIC_SAMPLES = 30  # Max TomTom calls per analysis to stay within rate limits
+MAX_TRAFFIC_SAMPLES = 25  # Max TomTom calls per analysis with connection pooling
 
 
 def _centroid(coords: list[list[float]]) -> tuple[float, float]:
@@ -237,9 +237,15 @@ async def run_analysis(polygon: GeoJSONPolygon) -> AnalysisResult:
     centroid_lat, centroid_lng = _centroid(ring)
     min_lat, min_lng, max_lat, max_lng = _bbox(ring)
 
-    # Reverse geocode area name asynchronously
+    # Launch independent external API tasks concurrently from the start to minimize latency
     area_name_task = asyncio.create_task(
         _reverse_geocode_area_name(centroid_lat, centroid_lng, settings.tomtom_api_key)
+    )
+    incidents_task = asyncio.create_task(
+        fetch_incidents_for_bbox(min_lat, min_lng, max_lat, max_lng)
+    )
+    weather_task = asyncio.create_task(
+        fetch_weather(centroid_lat, centroid_lng)
     )
 
     # Check key configuration warnings (non-fatal)
@@ -285,30 +291,34 @@ async def run_analysis(polygon: GeoJSONPolygon) -> AnalysisResult:
         other_segs = [s for s in segments if s.road_type == "local"]
         sample_segs = (priority_segs + other_segs)[:MAX_TRAFFIC_SAMPLES]
 
-        # Fetch traffic in parallel with a semaphore to avoid overwhelming the API
-        sem = asyncio.Semaphore(6)
+        # Fetch traffic in parallel with HTTP connection pooling to minimize round-trip latency
+        sem = asyncio.Semaphore(12)
 
-        async def fetch_one(seg):
-            async with sem:
-                # Use segment true distance midpoint from geometry if available
-                if seg.geometry and seg.geometry.coordinates and len(seg.geometry.coordinates) >= 2:
-                    coords = seg.geometry.coordinates
-                    try:
-                        from shapely.geometry import LineString
-                        line = LineString([(c[0], c[1]) for c in coords])
-                        mid_pt = line.interpolate(0.5, normalized=True)
-                        lng_pt, lat_pt = mid_pt.x, mid_pt.y
-                    except Exception:
-                        mid_idx = len(coords) // 2
-                        lng_pt, lat_pt = coords[mid_idx][0], coords[mid_idx][1]
-                elif seg.geometry and seg.geometry.coordinates and len(seg.geometry.coordinates) == 1:
-                    lng_pt, lat_pt = seg.geometry.coordinates[0][0], seg.geometry.coordinates[0][1]
-                else:
-                    lat_pt, lng_pt = centroid_lat, centroid_lng
-                return await fetch_flow_for_point(lat_pt, lng_pt, seg.segment_id)
+        async with httpx.AsyncClient(
+            timeout=6.0,
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=30),
+        ) as http_client:
+            async def fetch_one(seg):
+                async with sem:
+                    # Use segment true distance midpoint from geometry if available
+                    if seg.geometry and seg.geometry.coordinates and len(seg.geometry.coordinates) >= 2:
+                        coords = seg.geometry.coordinates
+                        try:
+                            from shapely.geometry import LineString
+                            line = LineString([(c[0], c[1]) for c in coords])
+                            mid_pt = line.interpolate(0.5, normalized=True)
+                            lng_pt, lat_pt = mid_pt.x, mid_pt.y
+                        except Exception:
+                            mid_idx = len(coords) // 2
+                            lng_pt, lat_pt = coords[mid_idx][0], coords[mid_idx][1]
+                    elif seg.geometry and seg.geometry.coordinates and len(seg.geometry.coordinates) == 1:
+                        lng_pt, lat_pt = seg.geometry.coordinates[0][0], seg.geometry.coordinates[0][1]
+                    else:
+                        lat_pt, lng_pt = centroid_lat, centroid_lng
+                    return await fetch_flow_for_point(lat_pt, lng_pt, seg.segment_id, client=http_client)
 
-        tasks = [fetch_one(seg) for seg in sample_segs]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+            tasks = [fetch_one(seg) for seg in sample_segs]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
         failed_requests_count = 0
         unmatched_count = 0
@@ -376,10 +386,14 @@ async def run_analysis(polygon: GeoJSONPolygon) -> AnalysisResult:
                 message=msg,
             ))
 
-    # ─── Step 3: Incidents ───────────────────────────────────────────────────
-    incidents, incidents_coverage = await fetch_incidents_for_bbox(
-        min_lat, min_lng, max_lat, max_lng
-    )
+    # ─── Step 3: Incidents (concurrent task started at t=0) ──────────────────
+    try:
+        incidents, incidents_coverage = await incidents_task
+    except Exception as exc:
+        logger.warning("Incidents task failed: %s", exc)
+        incidents, incidents_coverage = [], DataSourceCoverage(
+            source="tomtom_incidents", status="error", message=str(exc)
+        )
     # Spatially link incidents to affected OSM road segments
     match_incidents_to_segments(incidents, segments)
     data_sources.append(incidents_coverage)
@@ -417,9 +431,14 @@ async def run_analysis(polygon: GeoJSONPolygon) -> AnalysisResult:
 
     road_metrics.potential_bottleneck_count = len(bottlenecks)
 
-    # ─── Step 4: Weather ─────────────────────────────────────────────────────
-    logger.info("Fetching weather context...")
-    weather, weather_coverage = await fetch_weather(centroid_lat, centroid_lng)
+    # ─── Step 4: Weather (concurrent task started at t=0) ────────────────────
+    try:
+        weather, weather_coverage = await weather_task
+    except Exception as exc:
+        logger.warning("Weather task failed: %s", exc)
+        weather, weather_coverage = None, DataSourceCoverage(
+            source="openweather", status="error", message=str(exc)
+        )
     data_sources.append(weather_coverage)
 
     # ─── Step 5: Recommendations ─────────────────────────────────────────────

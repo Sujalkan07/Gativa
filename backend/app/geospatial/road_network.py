@@ -344,20 +344,15 @@ async def _discover_local_street_names(poly: Polygon) -> tuple[list[str], str]:
 
     sample_points = [
         (cy, cx),
-        (miny + 0.25 * (maxy - miny), minx + 0.25 * (maxx - minx)),
-        (miny + 0.25 * (maxy - miny), minx + 0.75 * (maxx - minx)),
-        (miny + 0.75 * (maxy - miny), minx + 0.25 * (maxx - minx)),
-        (miny + 0.75 * (maxy - miny), minx + 0.75 * (maxx - minx)),
-        (cy, minx + 0.25 * (maxx - minx)),
-        (cy, minx + 0.75 * (maxx - minx)),
-        (miny + 0.5 * (maxy - miny), cx),
+        (miny + 0.5 * (maxy - miny), minx + 0.25 * (maxx - minx)),
+        (miny + 0.5 * (maxy - miny), minx + 0.75 * (maxx - minx)),
     ]
 
     discovered_streets: list[str] = []
     locality = ""
 
     try:
-        async with httpx.AsyncClient(timeout=4.0) as client:
+        async with httpx.AsyncClient(timeout=2.5) as client:
             async def _geocode_point(lat: float, lon: float):
                 url = f"https://api.tomtom.com/search/2/reverseGeocode/{lat:.6f},{lon:.6f}.json?key={settings.tomtom_api_key}"
                 try:
@@ -459,7 +454,7 @@ async def _fetch_osm_graph_from_api(
         url = f"https://api.openstreetmap.org/api/0.6/map?bbox={minx:.6f},{miny:.6f},{maxx:.6f},{maxy:.6f}"
         tmp_path = None
         try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, headers=headers) as client:
+            async with httpx.AsyncClient(timeout=8.0, follow_redirects=True, headers=headers) as client:
                 resp = await client.get(url)
                 if resp.status_code != 200 or len(resp.content) < 100:
                     logger.warning(
@@ -469,6 +464,9 @@ async def _fetch_osm_graph_from_api(
                         resp.status_code,
                         len(resp.content),
                     )
+                    # If target 0 failed with a blocking or rate-limiting code, don't stall on target 1
+                    if resp.status_code in (400, 403, 429, 509):
+                        break
                     continue
 
                 xml_content = resp.text
@@ -560,11 +558,12 @@ async def fetch_road_network(
         # Concurrently discover genuine street names & locality via TomTom
         discovered_streets, locality = await _discover_local_street_names(poly)
 
-        # Determine 500m buffer polygon for seamless simulation boundaries and external road continuity
+        # Determine buffer polygon for seamless simulation boundaries and external road continuity
+        # 150m buffer represents standard arterial approach distance without graph inflation
         centroid_y = poly.centroid.y
         lat_rad = math.radians(centroid_y)
-        deg_lat = 500.0 / 111320.0
-        deg_lon = 500.0 / (111320.0 * max(0.1, math.cos(lat_rad)))
+        deg_lat = 150.0 / 111320.0
+        deg_lon = 150.0 / (111320.0 * max(0.1, math.cos(lat_rad)))
         poly_buffered = poly.buffer(max(deg_lat, deg_lon))
         min_bx, min_by, max_bx, max_by = poly_buffered.bounds
         fetch_poly = poly_buffered if (max_bx - min_bx <= 0.25 and max_by - min_by <= 0.25) else poly
@@ -611,25 +610,22 @@ async def fetch_road_network(
         # 3. If OSM API v0.6 did not return edges, attempt Overpass API with mirrors
         if G is None or G.number_of_edges() == 0:
             for endpoint in [
-                "https://overpass.kumi.systems/api/interpreter",
                 "https://overpass-api.de/api/interpreter",
+                "https://overpass.kumi.systems/api/interpreter",
                 "https://overpass.private.coffee/api/interpreter",
             ]:
-                for query_poly in [fetch_poly, poly]:
-                    try:
-                        ox.settings.overpass_endpoint = endpoint
-                        logger.info("Attempting Overpass retrieval via %s (%s)", endpoint, "buffered" if query_poly == fetch_poly else "core")
-                        G = await asyncio.wait_for(
-                            asyncio.to_thread(ox.graph_from_polygon, query_poly, network_type="drive", simplify=True),
-                            timeout=20.0,
-                        )
-                        if G is not None and G.number_of_edges() > 0:
-                            source_channel = "osm_overpass"
-                            break
-                    except Exception as exc:
-                        logger.warning("Overpass endpoint %s failed: %s", endpoint, exc)
-                if G is not None and G.number_of_edges() > 0:
-                    break
+                try:
+                    ox.settings.overpass_endpoint = endpoint
+                    logger.info("Attempting Overpass retrieval via %s (core)", endpoint)
+                    G = await asyncio.wait_for(
+                        asyncio.to_thread(ox.graph_from_polygon, poly, network_type="drive", simplify=True),
+                        timeout=12.0,
+                    )
+                    if G is not None and G.number_of_edges() > 0:
+                        source_channel = "osm_overpass"
+                        break
+                except Exception as exc:
+                    logger.warning("Overpass endpoint %s failed: %s", endpoint, exc)
 
         # 4. Strictly reject synthetic fallback in production
         if G is None or G.number_of_edges() == 0:
@@ -643,6 +639,10 @@ async def fetch_road_network(
         # ─── Build physical road segments list with canonical deduplication ───
         # In a directed MultiDiGraph, bidirectional streets have pairs (u, v) and (v, u).
         # We deduplicate into unique physical centerline segments so metrics, lengths, and visualizations reflect real roadways.
+        from shapely.prepared import prep
+        prep_poly = prep(poly)
+        prep_buf = prep(poly_buffered)
+
         seen_canonical_edges: set[tuple] = set()
         segments: list[RoadSegment] = []
         class_counts: dict[str, int] = {"highway": 0, "arterial": 0, "local": 0}
@@ -705,9 +705,14 @@ async def fetch_road_network(
             width_val = _get_float_tag(data, "width")
 
             # ─── Part A: Process Core Segments (Inside User-Selected Polygon) ───
-            intersects_poly = poly.intersects(geom)
+            intersects_poly = prep_poly.intersects(geom)
             if intersects_poly:
-                core_parts = _clip_geometry_to_polygon_parts(geom, poly)
+                is_contained = prep_poly.contains(geom)
+                if is_contained:
+                    core_parts = [geom]
+                else:
+                    core_parts = _clip_geometry_to_polygon_parts(geom, poly)
+
                 for part_idx, clipped_geom in enumerate(core_parts):
                     length_m = _compute_geodesic_length_m(clipped_geom)
                     if length_m < 1.0:
@@ -748,44 +753,48 @@ async def fetch_road_network(
                     total_length_m += length_m
 
                 # ─── Part B: Process External Extension Parts for Boundary Crossings ───
-                try:
-                    ext_diff = geom.difference(poly)
-                    ext_parts = _clip_geometry_to_polygon_parts(ext_diff, poly_buffered)
-                    for ext_idx, ext_geom in enumerate(ext_parts):
-                        ext_len_m = _compute_geodesic_length_m(ext_geom)
-                        if ext_len_m < 2.0:
-                            continue
-                        ext_coords = [[round(c[0], 6), round(c[1], 6)] for c in ext_geom.coords]
-                        if len(ext_coords) < 2:
-                            continue
-                        ext_seg_id = f"{u}_{v}_{key}_ext{ext_idx + 1}"
-                        segments.append(RoadSegment(
-                            segment_id=ext_seg_id,
-                            name=f"{name} (Approach)",
-                            road_type=road_class,
-                            length_m=round(ext_len_m, 1),
-                            geometry=GeoJSONLineString(coordinates=ext_coords),
-                            speed_limit_kmh=speed_val,
-                            lanes=lanes_total,
-                            lanes_forward=lanes_fwd,
-                            lanes_backward=lanes_bwd,
-                            width_m=width_val,
-                            is_oneway=is_oneway,
-                            is_buffer=True,
-                            osm_highway=osm_highway_str,
-                            osm_id=osm_id_str,
-                            u_control=u_ctrl,
-                            v_control=v_ctrl,
-                            u_provenance=u_prov,
-                            v_provenance=v_prov,
-                            u=str(u),
-                            v=str(v),
-                        ))
-                except Exception as exc:
-                    logger.debug("Boundary difference extraction fallback: %s", exc)
-            else:
+                if not is_contained:
+                    try:
+                        ext_diff = geom.difference(poly)
+                        ext_parts = _clip_geometry_to_polygon_parts(ext_diff, poly_buffered)
+                        for ext_idx, ext_geom in enumerate(ext_parts):
+                            ext_len_m = _compute_geodesic_length_m(ext_geom)
+                            if ext_len_m < 2.0:
+                                continue
+                            ext_coords = [[round(c[0], 6), round(c[1], 6)] for c in ext_geom.coords]
+                            if len(ext_coords) < 2:
+                                continue
+                            ext_seg_id = f"{u}_{v}_{key}_ext{ext_idx + 1}"
+                            segments.append(RoadSegment(
+                                segment_id=ext_seg_id,
+                                name=f"{name} (Approach)",
+                                road_type=road_class,
+                                length_m=round(ext_len_m, 1),
+                                geometry=GeoJSONLineString(coordinates=ext_coords),
+                                speed_limit_kmh=speed_val,
+                                lanes=lanes_total,
+                                lanes_forward=lanes_fwd,
+                                lanes_backward=lanes_bwd,
+                                width_m=width_val,
+                                is_oneway=is_oneway,
+                                is_buffer=True,
+                                osm_highway=osm_highway_str,
+                                osm_id=osm_id_str,
+                                u_control=u_ctrl,
+                                v_control=v_ctrl,
+                                u_provenance=u_prov,
+                                v_provenance=v_prov,
+                                u=str(u),
+                                v=str(v),
+                            ))
+                    except Exception as exc:
+                        logger.debug("Boundary difference extraction fallback: %s", exc)
+            elif prep_buf.intersects(geom):
                 # Road lies completely in the buffer zone outside the core polygon
-                buf_parts = _clip_geometry_to_polygon_parts(geom, poly_buffered)
+                if prep_buf.contains(geom):
+                    buf_parts = [geom]
+                else:
+                    buf_parts = _clip_geometry_to_polygon_parts(geom, poly_buffered)
                 for buf_idx, buf_geom in enumerate(buf_parts):
                     buf_len_m = _compute_geodesic_length_m(buf_geom)
                     if buf_len_m < 2.0:
@@ -904,7 +913,7 @@ def _detect_structural_bottlenecks(
         UG = G.to_undirected()
 
         # Sample nodes for large networks to bound computation time
-        k = min(500, G.number_of_nodes())
+        k = min(200, G.number_of_nodes())
         centrality = nx.betweenness_centrality(UG, k=k, normalized=True, seed=42)
         degree = dict(G.degree())
 

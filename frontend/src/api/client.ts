@@ -37,6 +37,14 @@ const client = axios.create({
 
 function extractError(err: unknown): string {
   if (err instanceof AxiosError) {
+    if (
+      err.code === 'ECONNABORTED' ||
+      err.message?.toLowerCase().includes('timeout') ||
+      err.response?.status === 504 ||
+      err.response?.status === 524
+    ) {
+      return 'Analysis request timed out. The server or external map provider took too long to respond. Please try selecting a slightly smaller area or try again in a few moments.'
+    }
     const data = err.response?.data as ApiError | undefined
     if (data?.detail) return data.detail
     if (err.message) return err.message

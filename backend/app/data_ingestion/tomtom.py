@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 TOMTOM_FLOW_BASE = "https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/10/json"
 TOMTOM_INCIDENTS_BASE = "https://api.tomtom.com/traffic/services/5/incidentDetails"
 
-TIMEOUT = 15.0
+TIMEOUT = 7.0
 
 
 # Mapping of TomTom iconCategory integers to readable string identifiers
@@ -66,9 +66,11 @@ async def fetch_flow_for_point(
     lat: float,
     lng: float,
     segment_id: str,
+    client: Optional[httpx.AsyncClient] = None,
 ) -> tuple[Optional[TrafficObservation], DataSourceCoverage]:
     """
     Fetch traffic flow data for a single geographic point from TomTom.
+    Supports optional shared httpx.AsyncClient for high-performance HTTP connection pooling.
     Returns (observation, coverage).
     """
     settings = get_settings()
@@ -87,8 +89,11 @@ async def fetch_flow_for_point(
     }
 
     try:
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        if client is not None:
             resp = await client.get(TOMTOM_FLOW_BASE, params=params)
+        else:
+            async with httpx.AsyncClient(timeout=TIMEOUT) as c:
+                resp = await c.get(TOMTOM_FLOW_BASE, params=params)
 
         if resp.status_code == 403:
             return None, DataSourceCoverage(
@@ -248,6 +253,7 @@ async def fetch_incidents_for_bbox(
     min_lng: float,
     max_lat: float,
     max_lng: float,
+    client: Optional[httpx.AsyncClient] = None,
 ) -> tuple[list[TrafficIncident], DataSourceCoverage]:
     """
     Fetch traffic incidents for a bounding box from TomTom Incident Details API v5.
@@ -277,8 +283,11 @@ async def fetch_incidents_for_bbox(
     }
 
     try:
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        if client is not None:
             resp = await client.get(TOMTOM_INCIDENTS_BASE, params=params)
+        else:
+            async with httpx.AsyncClient(timeout=TIMEOUT) as c:
+                resp = await c.get(TOMTOM_INCIDENTS_BASE, params=params)
 
         if resp.status_code not in (200, 206):
             return [], DataSourceCoverage(
