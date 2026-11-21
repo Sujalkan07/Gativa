@@ -88,9 +88,10 @@ export interface TrafficObservation {
   road_closure?: boolean
   frc?: string | null
   coordinates?: number[][] | null
-  openlr?: Record<string, unknown> | null
+  openlr?: string | Record<string, unknown> | null
   match_quality?: MatchQuality | string | null
   match_distance_m?: number | null
+  geometry_consistency_warning?: string | null
   speed_reduction_ratio: number | null
   congestion_level: CongestionLevel
   has_incident: boolean
@@ -200,11 +201,11 @@ export interface TrafficIncident {
   magnitude_of_delay?: number | null
   severity_label?: string | null
   description: string | null
-  events?: string[]
+  events?: Array<Record<string, unknown>> | string[]
   event_codes?: number[]
   event_descriptions?: string[]
-  lat: number
-  lng: number
+  lat?: number | null
+  lng?: number | null
   start_time?: string | null
   end_time?: string | null
   from_location?: string | null
@@ -221,6 +222,10 @@ export interface TrafficIncident {
     coordinates: any
   } | null
   match_quality?: string | null
+  retrieval_timestamp?: string | null
+  confirmed_segment_ids?: string[]
+  likely_segment_ids?: string[]
+  nearby_segment_ids?: string[]
   severity: string | null
   affected_segment_ids: string[]
 }

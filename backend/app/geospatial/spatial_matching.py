@@ -210,9 +210,10 @@ def match_incidents_to_segments(
         return
 
     for inc in incidents:
-        matched_ids: set[str] = set()
+        confirmed_ids: set[str] = set()
+        likely_ids: set[str] = set()
+        nearby_ids: set[str] = set()
         best_dist = float("inf")
-        match_quality = "unmatched"
 
         # Check incident geometry
         geom_type = "Point"
@@ -221,45 +222,93 @@ def match_incidents_to_segments(
             geom_type = inc.geometry.get("type", "Point")
             geom_coords = inc.geometry.get("coordinates")
 
+        inc_bearing: Optional[float] = None
         if geom_type == "LineString" and geom_coords and len(geom_coords) >= 2:
             try:
+                inc_bearing = _compute_linestring_bearing(geom_coords)
                 inc_line = LineString([(c[0], c[1]) for c in geom_coords])
-                # Check each segment for proximity to the incident LineString using nearest_points
                 for seg, seg_line, coords in valid_segments:
                     p_seg, p_inc = nearest_points(seg_line, inc_line)
-                    dist_to_inc = _lat_lon_distance_meters(p_seg.y, p_seg.x, p_inc.y, p_inc.x)
-                    if dist_to_inc <= proximity_threshold_m:
-                        matched_ids.add(seg.segment_id)
-                        if dist_to_inc < best_dist:
-                            best_dist = dist_to_inc
+                    dist_m = _lat_lon_distance_meters(p_seg.y, p_seg.x, p_inc.y, p_inc.x)
+                    if dist_m > proximity_threshold_m:
+                        continue
 
-                if matched_ids:
-                    match_quality = "high" if best_dist <= 20.0 else "medium"
+                    if dist_m < best_dist:
+                        best_dist = dist_m
+
+                    # Bearing alignment check
+                    angle_diff: Optional[float] = None
+                    if inc_bearing is not None and len(coords) >= 2:
+                        seg_bearing = _compute_linestring_bearing(coords)
+                        if seg_bearing is not None:
+                            angle_diff = _bearing_difference_degrees(
+                                seg_bearing, inc_bearing, is_oneway=seg.is_oneway
+                            )
+
+                    # Road name / corridor identifier matching
+                    name_match = False
+                    if inc.road_numbers and seg.name:
+                        name_match = any(rn.lower() in seg.name.lower() for rn in inc.road_numbers)
+
+                    # 4-tier classification: CONFIRMED_AFFECTED, LIKELY_AFFECTED, NEARBY
+                    if dist_m <= 15.0 and (angle_diff is None or angle_diff <= 35.0 or name_match):
+                        confirmed_ids.add(seg.segment_id)
+                    elif dist_m <= 25.0 and (angle_diff is None or angle_diff <= 45.0 or name_match):
+                        likely_ids.add(seg.segment_id)
+                    else:
+                        nearby_ids.add(seg.segment_id)
             except Exception as exc:
                 logger.debug("LineString incident matching error for %s: %s", inc.incident_id, exc)
 
         # Fallback to Point proximity (or if geom_type is Point)
-        if not matched_ids:
+        if not confirmed_ids and not likely_ids and not nearby_ids:
             pt_lat = inc.lat
             pt_lng = inc.lng
-            if pt_lat != 0.0 or pt_lng != 0.0:
-                inc_pt_geom = Point(pt_lng, pt_lat)
-                for seg, seg_line, coords in valid_segments:
-                    p_seg, p_inc = nearest_points(seg_line, inc_pt_geom)
-                    dist_m = _lat_lon_distance_meters(p_seg.y, p_seg.x, p_inc.y, p_inc.x)
-                    if dist_m <= proximity_threshold_m:
-                        matched_ids.add(seg.segment_id)
+            if pt_lat is not None and pt_lng is not None and (pt_lat != 0.0 or pt_lng != 0.0):
+                try:
+                    inc_pt_geom = Point(pt_lng, pt_lat)
+                    for seg, seg_line, coords in valid_segments:
+                        p_seg, p_inc = nearest_points(seg_line, inc_pt_geom)
+                        dist_m = _lat_lon_distance_meters(p_seg.y, p_seg.x, p_inc.y, p_inc.x)
+                        if dist_m > proximity_threshold_m:
+                            continue
+
                         if dist_m < best_dist:
                             best_dist = dist_m
 
-                if matched_ids:
-                    match_quality = "high" if best_dist <= 15.0 else "medium"
+                        name_match = False
+                        if inc.road_numbers and seg.name:
+                            name_match = any(rn.lower() in seg.name.lower() for rn in inc.road_numbers)
 
-        inc.affected_segment_ids = sorted(list(matched_ids))
-        inc.match_quality = match_quality if matched_ids else "unmatched"
+                        if dist_m <= 15.0 or name_match:
+                            confirmed_ids.add(seg.segment_id)
+                        elif dist_m <= 25.0:
+                            likely_ids.add(seg.segment_id)
+                        else:
+                            nearby_ids.add(seg.segment_id)
+                except Exception as exc:
+                    logger.debug("Point incident matching error for %s: %s", inc.incident_id, exc)
 
-        # Update has_incident flag on segments
-        for seg_id in matched_ids:
+        # Populate incident matching breakdown
+        inc.confirmed_segment_ids = sorted(list(confirmed_ids))
+        inc.likely_segment_ids = sorted(list(likely_ids))
+        inc.nearby_segment_ids = sorted(list(nearby_ids))
+        
+        # Only confirmed and likely affected segments are considered genuinely affected
+        affected = confirmed_ids.union(likely_ids)
+        inc.affected_segment_ids = sorted(list(affected))
+
+        if confirmed_ids:
+            inc.match_quality = "CONFIRMED_AFFECTED"
+        elif likely_ids:
+            inc.match_quality = "LIKELY_AFFECTED"
+        elif nearby_ids:
+            inc.match_quality = "NEARBY"
+        else:
+            inc.match_quality = "UNMATCHED"
+
+        # Update has_incident flag strictly on confirmed/likely segments
+        for seg_id in affected:
             for seg, _, _ in valid_segments:
                 if seg.segment_id == seg_id:
                     if seg.traffic:

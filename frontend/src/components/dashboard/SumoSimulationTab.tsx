@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
+import { escapeHtml } from '../../lib/sanitize'
 import { attachBaseTileLayer } from '../../lib/mapLayers'
 import { api, GativaApiError } from '../../api/client'
 import RoadNetworkRenderer from './RoadNetworkRenderer'
@@ -450,7 +451,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
           })
 
           line.bindTooltip(
-            `<div class="text-xs font-sans"><b>${seg.name || 'Road Segment'}</b><br/>${seg.road_type} • ${seg.length_m.toFixed(0)}m</div>`,
+            `<div class="text-xs font-sans"><b>${escapeHtml(seg.name || 'Road Segment')}</b><br/>${escapeHtml(seg.road_type)} • ${seg.length_m.toFixed(0)}m</div>`,
             { sticky: true },
           )
 
@@ -545,7 +546,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
 
       const marker = L.marker([cand.lat, cand.lng], { icon })
       marker.bindTooltip(
-        `<div class="text-xs font-sans"><b>${cand.name}</b><br/>Score: ${cand.priority_score.toFixed(1)}/10 • ${cand.degree}-way • Status: ${cand.status}</div>`,
+        `<div class="text-xs font-sans"><b>${escapeHtml(cand.name)}</b><br/>Score: ${cand.priority_score.toFixed(1)}/10 • ${cand.degree}-way • Status: ${escapeHtml(cand.status)}</div>`,
         { sticky: true },
       )
       marker.on('click', () => {
@@ -738,7 +739,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
             html: iconHtml,
           })
 
-          const tooltipHtml = `<div class="text-[11px] font-mono"><b>${veh.id}</b> (${veh.type})<br/>Traffic: ${trafficState}<br/>Speed: ${veh.speed_kmh.toFixed(1)} km/h<br/>Wait: ${veh.waiting_time_s.toFixed(1)}s</div>`
+          const tooltipHtml = `<div class="text-[11px] font-mono"><b>${escapeHtml(veh.id)}</b> (${escapeHtml(veh.type)})<br/>Traffic: ${escapeHtml(trafficState)}<br/>Speed: ${veh.speed_kmh.toFixed(1)} km/h<br/>Wait: ${veh.waiting_time_s.toFixed(1)}s</div>`
 
           const existingMarker = markersMap.get(veh.id)
           if (existingMarker) {
@@ -810,7 +811,7 @@ export default function SumoSimulationTab({ analysis }: SumoSimulationTabProps) 
           const ctrlLabel = isRemoved ? 'Unsignalized Priority' : 'Traffic Signal'
 
           sigMarker.bindTooltip(
-            `<div class="text-[11px] font-sans"><b>Signal ${tl.id}</b> (${ctrlLabel})<br/>Current Phase: <span style="font-weight:bold;color:${stateColor}">${tl.state.toUpperCase()}</span><br/><span class="text-indigo-600 font-semibold underline">Click to inspect / edit</span></div>`,
+            `<div class="text-[11px] font-sans"><b>Signal ${escapeHtml(tl.id)}</b> (${escapeHtml(ctrlLabel)})<br/>Current Phase: <span style="font-weight:bold;color:${stateColor}">${escapeHtml(tl.state.toUpperCase())}</span><br/><span class="text-indigo-600 font-semibold underline">Click to inspect / edit</span></div>`,
           )
 
 

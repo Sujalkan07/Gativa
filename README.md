@@ -115,13 +115,17 @@ The analysis dashboard exposes 4 specialized engineering tabs:
 - **Functional Breakdown**: Road types and lane capacity distribution charts.
 - **Structural Bottlenecks**: Ranked intersection list based on betweenness centrality and capacity constraints.
 
-### Tab 2: Traffic Flow & Level of Service (HCM 6th Edition)
-- **Speed Gradient Map**: Polylines dynamically classified by HCM 6th Edition Level of Service:
-  - 🟢 **LOS A–B** (Free Flow: Speed Ratio $\ge 80\%$)
-  - 🟡 **LOS C–D** (Moderate Delay: Speed Ratio $50\% - 80\%$)
-  - 🔴 **LOS E–F** (Severe Congestion: Speed Ratio $< 50\%$)
+### Tab 2: Traffic Flow & Speed Condition Index (SCI)
+- **Speed Gradient Map**: Polylines dynamically classified by empirical Gativa Speed Condition Index (SCI):
+  - 🟢 **SCI A** (Optimal: Speed Ratio $\ge 85\%$)
+  - 🟢 **SCI B** (Minor Slowdown: Speed Ratio $70\% - 85\%$)
+  - 🟡 **SCI C** (Moderate Delay: Speed Ratio $55\% - 70\%$)
+  - 🟠 **SCI D** (Heavy Delay: Speed Ratio $40\% - 55\%$)
+  - 🔴 **SCI E** (Severe Bottleneck: Speed Ratio $28\% - 40\%$)
+  - 🔴 **SCI F** (Severe Breakdown: Speed Ratio $< 28\%$)
+  - ⚫ **SCI CLOSED** (Documented Road Closures)
 - **Directional Speed Matrix**: Directional speed comparisons against free-flow limits.
-- **Incident Stream**: Real-time traffic alerts, road works, and hazard feeds from TomTom.
+- **Incident Stream**: Real-time traffic alerts, road works, and hazard feeds from TomTom with 4-tier corridor matching (`CONFIRMED_AFFECTED`, `LIKELY_AFFECTED`, `NEARBY`, `UNMATCHED`).
 
 ### Tab 3: Infrastructure Recommendations & Planning
 - **Traffic Optimization**: Signal coordination, roundabout conversion, road widening, and one-way flow channelization.
@@ -241,8 +245,14 @@ flowchart TD
 2. **Road Network Extraction**: OSMnx downloads the drivable street network (`network_type="drive"`) within the polygon boundary.
 3. **Boundary Clipping**: Uses Shapely to clip multi-line geometries strictly against the polygon boundary, rejecting out-of-bounds road segments.
 4. **Graph Centrality**: Evaluates NetworkX betweenness centrality across all network nodes to identify key structural bottlenecks.
-5. **Level of Service (LOS)**: Computed according to HCM 6th Edition speed ratios ($v_{\text{current}} / v_{\text{free-flow}}$):
-   - $\text{LOS A} \ge 0.85$, $\text{LOS B} \ge 0.70$, $\text{LOS C} \ge 0.55$, $\text{LOS D} \ge 0.40$, $\text{LOS E} \ge 0.25$, $\text{LOS F} < 0.25$.
+5. **Gativa Speed Condition Index (SCI)**: Evaluated from live TomTom Flow v4 telemetry relative to empirical free-flow speeds ($v_{\text{observed}} / v_{\text{free-flow}}$):
+   - $\text{SCI A} \ge 0.85$ (Optimal flow)
+   - $\text{SCI B} \in [0.70, 0.85)$ (Minor slowdown)
+   - $\text{SCI C} \in [0.55, 0.70)$ (Moderate delay)
+   - $\text{SCI D} \in [0.40, 0.55)$ (Heavy delay)
+   - $\text{SCI E} \in [0.28, 0.40)$ (Severe bottleneck)
+   - $\text{SCI F} < 0.28$ (Severe breakdown)
+   - Unsampled road links display $\text{—}$ without fabricated values.
 
 ---
 

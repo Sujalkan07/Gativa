@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import logging
-from typing import Optional
+import math
+from typing import Optional, Any
 import httpx
 
 from app.core.config import get_settings
@@ -209,6 +210,18 @@ async def fetch_flow_for_point(
             except Exception:
                 provider_ts = None
 
+        # Travel-time and geometry consistency check
+        geometry_warning: Optional[str] = None
+        if freeflow is not None and freeflow > 0 and ff_tt_sec is not None and ff_tt_sec > 0:
+            implied_ff_len_m = (freeflow / 3.6) * ff_tt_sec
+            if observed is not None and observed > 0 and cur_tt_sec is not None and cur_tt_sec > 0:
+                implied_cur_len_m = (observed / 3.6) * cur_tt_sec
+                ratio = implied_cur_len_m / implied_ff_len_m
+                if ratio < 0.25 or ratio > 4.0:
+                    geometry_warning = (
+                        f"Implied segment length disparity: current={implied_cur_len_m:.0f}m vs freeflow={implied_ff_len_m:.0f}m"
+                    )
+
         retrieval_ts = datetime.now(timezone.utc).isoformat()
         obs = TrafficObservation(
             segment_id=segment_id,
@@ -230,6 +243,7 @@ async def fetch_flow_for_point(
             frc=str(fd.get("frc")) if fd.get("frc") else None,
             coordinates=parsed_coords,
             openlr=str(fd.get("openlr") or fd.get("openLr")) if (fd.get("openlr") or fd.get("openLr")) else None,
+            geometry_consistency_warning=geometry_warning,
         )
         return obs, DataSourceCoverage(source="tomtom_flow", status="ok")
 
@@ -300,126 +314,151 @@ async def fetch_incidents_for_bbox(
         incidents_raw = data.get("incidents", [])
         incidents: list[TrafficIncident] = []
 
+        inc_retrieval_ts = datetime.now(timezone.utc).isoformat()
         for inc in incidents_raw:
-            props = inc.get("properties", {})
-            geom = inc.get("geometry", {})
-            geom_type = geom.get("type", "Point")
-            raw_coords = geom.get("coordinates", [])
+            try:
+                props = inc.get("properties", {})
+                geom = inc.get("geometry", {})
+                geom_type = geom.get("type", "Point")
+                raw_coords = geom.get("coordinates", [])
 
-            # Extract full geometry and a representative point
-            lat_pt, lng_pt = 0.0, 0.0
-            parsed_geometry: Optional[dict[str, Any]] = None
+                # Extract full geometry and a representative point (None if missing or invalid, never (0,0))
+                lat_pt: Optional[float] = None
+                lng_pt: Optional[float] = None
+                parsed_geometry: Optional[dict[str, Any]] = None
 
-            if geom_type == "Point" and raw_coords:
-                if len(raw_coords) >= 2:
-                    lng_pt = float(raw_coords[0])
-                    lat_pt = float(raw_coords[1])
-                    parsed_geometry = {"type": "Point", "coordinates": [lng_pt, lat_pt]}
-            elif geom_type == "LineString" and raw_coords:
-                # LineString coordinates are a list of [lng, lat]
-                coords_list: list[list[float]] = []
-                for pt in raw_coords:
-                    if isinstance(pt, (list, tuple)) and len(pt) >= 2:
-                        coords_list.append([float(pt[0]), float(pt[1])])
-                if coords_list:
-                    parsed_geometry = {"type": "LineString", "coordinates": coords_list}
-                    # Representative point is midpoint of line
-                    mid_pt = coords_list[len(coords_list) // 2]
-                    lng_pt = mid_pt[0]
-                    lat_pt = mid_pt[1]
-            elif raw_coords:
-                # Handle generic coordinate sequence fallback
-                if isinstance(raw_coords[0], (list, tuple)):
-                    coords_list = [[float(c[0]), float(c[1])] for c in raw_coords if len(c) >= 2]
+                if geom_type == "Point" and raw_coords and len(raw_coords) >= 2:
+                    p_lng, p_lat = float(raw_coords[0]), float(raw_coords[1])
+                    if math.isfinite(p_lng) and math.isfinite(p_lat) and -180 <= p_lng <= 180 and -90 <= p_lat <= 90:
+                        lng_pt, lat_pt = p_lng, p_lat
+                        parsed_geometry = {"type": "Point", "coordinates": [lng_pt, lat_pt]}
+                elif geom_type == "LineString" and raw_coords:
+                    coords_list: list[list[float]] = []
+                    for pt in raw_coords:
+                        if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+                            p_lng, p_lat = float(pt[0]), float(pt[1])
+                            if math.isfinite(p_lng) and math.isfinite(p_lat) and -180 <= p_lng <= 180 and -90 <= p_lat <= 90:
+                                coords_list.append([p_lng, p_lat])
                     if coords_list:
                         parsed_geometry = {"type": "LineString", "coordinates": coords_list}
-                        lng_pt, lat_pt = coords_list[len(coords_list) // 2][0], coords_list[len(coords_list) // 2][1]
-                elif len(raw_coords) >= 2:
-                    lng_pt, lat_pt = float(raw_coords[0]), float(raw_coords[1])
-                    parsed_geometry = {"type": "Point", "coordinates": [lng_pt, lat_pt]}
+                        mid_pt = coords_list[len(coords_list) // 2]
+                        lng_pt = mid_pt[0]
+                        lat_pt = mid_pt[1]
+                elif raw_coords:
+                    if isinstance(raw_coords[0], (list, tuple)):
+                        coords_list = []
+                        for c in raw_coords:
+                            if len(c) >= 2:
+                                p_lng, p_lat = float(c[0]), float(c[1])
+                                if math.isfinite(p_lng) and math.isfinite(p_lat) and -180 <= p_lng <= 180 and -90 <= p_lat <= 90:
+                                    coords_list.append([p_lng, p_lat])
+                        if coords_list:
+                            parsed_geometry = {"type": "LineString", "coordinates": coords_list}
+                            mid_pt = coords_list[len(coords_list) // 2]
+                            lng_pt, lat_pt = mid_pt[0], mid_pt[1]
+                    elif len(raw_coords) >= 2:
+                        p_lng, p_lat = float(raw_coords[0]), float(raw_coords[1])
+                        if math.isfinite(p_lng) and math.isfinite(p_lat) and -180 <= p_lng <= 180 and -90 <= p_lat <= 90:
+                            lng_pt, lat_pt = p_lng, p_lat
+                            parsed_geometry = {"type": "Point", "coordinates": [lng_pt, lat_pt]}
 
-            # Events
-            events_raw = props.get("events", [])
-            events_list: list[dict[str, Any]] = []
-            event_codes: list[int] = []
-            event_descriptions: list[str] = []
+                # Events
+                events_raw = props.get("events", [])
+                events_list: list[dict[str, Any]] = []
+                event_codes: list[int] = []
+                event_descriptions: list[str] = []
 
-            for ev in events_raw:
-                if isinstance(ev, dict):
-                    events_list.append(ev)
-                    if "code" in ev and ev["code"] is not None:
-                        try:
-                            event_codes.append(int(ev["code"]))
-                        except (ValueError, TypeError):
-                            pass
-                    if ev.get("description"):
-                        event_descriptions.append(str(ev["description"]))
+                for ev in events_raw:
+                    if isinstance(ev, dict):
+                        events_list.append(ev)
+                        if "code" in ev and ev["code"] is not None:
+                            try:
+                                code_int = int(ev["code"])
+                                if math.isfinite(code_int):
+                                    event_codes.append(code_int)
+                            except (ValueError, TypeError):
+                                pass
+                        if ev.get("description"):
+                            event_descriptions.append(str(ev["description"]))
 
-            description = event_descriptions[0] if event_descriptions else None
+                description = event_descriptions[0] if event_descriptions else None
 
-            # Icon category and magnitude
-            raw_icon = props.get("iconCategory")
-            icon_cat_int: Optional[int] = None
-            if raw_icon is not None:
-                try:
-                    icon_cat_int = int(raw_icon)
-                except (ValueError, TypeError):
-                    pass
-            icon_cat_name = ICON_CATEGORY_MAP.get(icon_cat_int, "unknown") if icon_cat_int is not None else "unknown"
+                # Icon category and magnitude with safe fallbacks
+                raw_icon = props.get("iconCategory")
+                icon_cat_int: Optional[int] = None
+                if raw_icon is not None:
+                    try:
+                        icon_cat_int = int(raw_icon)
+                    except (ValueError, TypeError):
+                        pass
+                icon_cat_name = ICON_CATEGORY_MAP.get(icon_cat_int, "Unclassified incident") if icon_cat_int is not None else "Unclassified incident"
 
-            raw_mag = props.get("magnitudeOfDelay")
-            mag_int: Optional[int] = None
-            if raw_mag is not None:
-                try:
-                    mag_int = int(raw_mag)
-                except (ValueError, TypeError):
-                    pass
-            severity_label = MAGNITUDE_OF_DELAY_MAP.get(mag_int, "unknown") if mag_int is not None else "unknown"
+                raw_mag = props.get("magnitudeOfDelay")
+                mag_int: Optional[int] = None
+                if raw_mag is not None:
+                    try:
+                        mag_int = int(raw_mag)
+                    except (ValueError, TypeError):
+                        pass
+                severity_label = MAGNITUDE_OF_DELAY_MAP.get(mag_int, "Severity unavailable") if mag_int is not None else "Severity unavailable"
 
-            # Length and delay
-            length_val = props.get("length")
-            delay_val = props.get("delay")
-            length_m = float(length_val) if length_val is not None and isinstance(length_val, (int, float)) else None
-            delay_sec = float(delay_val) if delay_val is not None and isinstance(delay_val, (int, float)) else None
+                # Finite numeric parsing for length and delay
+                length_val = props.get("length")
+                delay_val = props.get("delay")
+                length_m: Optional[float] = None
+                if length_val is not None and isinstance(length_val, (int, float)):
+                    val = float(length_val)
+                    if math.isfinite(val) and val >= 0:
+                        length_m = val
 
-            # Road numbers
-            road_numbers_raw = props.get("roadNumbers", [])
-            road_numbers = [str(rn) for rn in road_numbers_raw] if isinstance(road_numbers_raw, list) else []
+                delay_sec: Optional[float] = None
+                if delay_val is not None and isinstance(delay_val, (int, float)):
+                    val = float(delay_val)
+                    if math.isfinite(val) and val >= 0:
+                        delay_sec = val
 
-            # ACI fallback fields
-            aci = props.get("aci", {}) or {}
-            prob = props.get("probabilityOfOccurrence") or aci.get("probabilityOfOccurrence")
-            num_reports = props.get("numberOfReports") or aci.get("numberOfReports")
-            last_report = props.get("lastReportTime") or aci.get("lastReportTime")
+                # Road numbers
+                road_numbers_raw = props.get("roadNumbers", [])
+                road_numbers = [str(rn) for rn in road_numbers_raw] if isinstance(road_numbers_raw, list) else []
 
-            incidents.append(TrafficIncident(
-                incident_id=str(props.get("id", f"inc_{len(incidents)}")),
-                type=icon_cat_name,
-                description=description,
-                lat=lat_pt,
-                lng=lng_pt,
-                severity=str(props.get("magnitudeOfDelay", severity_label)),
-                affected_segment_ids=[],
-                icon_category=icon_cat_int,
-                icon_category_name=icon_cat_name,
-                magnitude_of_delay=mag_int,
-                severity_label=severity_label,
-                events=events_list,
-                event_codes=event_codes,
-                event_descriptions=event_descriptions,
-                start_time=props.get("startTime"),
-                end_time=props.get("endTime"),
-                from_location=props.get("from"),
-                to_location=props.get("to"),
-                length_m=length_m,
-                delay_seconds=delay_sec,
-                road_numbers=road_numbers,
-                time_validity=props.get("timeValidity"),
-                probability_of_occurrence=str(prob) if prob is not None else None,
-                number_of_reports=int(num_reports) if num_reports is not None else None,
-                last_report_time=str(last_report) if last_report is not None else None,
-                geometry=parsed_geometry,
-            ))
+                # ACI fallback fields without truthiness 0 bug
+                aci = props.get("aci", {}) or {}
+                prob = props.get("probabilityOfOccurrence") if props.get("probabilityOfOccurrence") is not None else aci.get("probabilityOfOccurrence")
+                num_reports = props.get("numberOfReports") if props.get("numberOfReports") is not None else aci.get("numberOfReports")
+                last_report = props.get("lastReportTime") if props.get("lastReportTime") is not None else aci.get("lastReportTime")
+
+                incidents.append(TrafficIncident(
+                    incident_id=str(props.get("id", f"inc_{len(incidents)}")),
+                    type=icon_cat_name,
+                    description=description,
+                    lat=lat_pt,
+                    lng=lng_pt,
+                    severity=str(props.get("magnitudeOfDelay", severity_label)),
+                    affected_segment_ids=[],
+                    icon_category=icon_cat_int,
+                    icon_category_name=icon_cat_name,
+                    magnitude_of_delay=mag_int,
+                    severity_label=severity_label,
+                    events=events_list,
+                    event_codes=event_codes,
+                    event_descriptions=event_descriptions,
+                    start_time=props.get("startTime"),
+                    end_time=props.get("endTime"),
+                    from_location=props.get("from"),
+                    to_location=props.get("to"),
+                    length_m=length_m,
+                    delay_seconds=delay_sec,
+                    road_numbers=road_numbers,
+                    time_validity=props.get("timeValidity"),
+                    probability_of_occurrence=str(prob) if prob is not None else None,
+                    number_of_reports=int(num_reports) if (num_reports is not None and isinstance(num_reports, (int, float)) and math.isfinite(num_reports)) else None,
+                    last_report_time=str(last_report) if last_report is not None else None,
+                    geometry=parsed_geometry,
+                    retrieval_timestamp=inc_retrieval_ts,
+                ))
+            except Exception as inc_exc:
+                logger.warning("Error parsing individual TomTom incident: %s", inc_exc)
+                continue
 
         return incidents, DataSourceCoverage(source="tomtom_incidents", status="ok")
 

@@ -257,7 +257,7 @@ async def run_analysis(polygon: GeoJSONPolygon) -> AnalysisResult:
     # ─── Step 1: Road Network ────────────────────────────────────────────────
     logger.info("Fetching road network...")
     G, segments, road_metrics, bottlenecks, osm_coverage = await fetch_road_network(
-        polygon_coords=ring,
+        polygon_coords=polygon.coordinates if len(polygon.coordinates) > 1 else ring,
         max_area_km2=settings.max_area_km2,
     )
 

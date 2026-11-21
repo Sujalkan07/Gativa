@@ -518,9 +518,14 @@ async def fetch_road_network(
         Tuple of (graph, segments, metrics, bottlenecks, coverage).
     """
     try:
-        # Build shapely polygon from GeoJSON coords (lng, lat)
-        coords_tuples = [(c[0], c[1]) for c in polygon_coords]
-        poly = Polygon(coords_tuples)
+        # Build shapely polygon from GeoJSON coords (lng, lat), supporting holes
+        if polygon_coords and isinstance(polygon_coords[0][0], (list, tuple)):
+            shell = [(c[0], c[1]) for c in polygon_coords[0]]
+            holes = [[(c[0], c[1]) for c in hole] for hole in polygon_coords[1:]]
+            poly = Polygon(shell=shell, holes=holes)
+        else:
+            coords_tuples = [(c[0], c[1]) for c in polygon_coords]
+            poly = Polygon(coords_tuples)
         if not poly.is_valid:
             poly = poly.buffer(0)
             if not poly.is_valid or poly.is_empty:

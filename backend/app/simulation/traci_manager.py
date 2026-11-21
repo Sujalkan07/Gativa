@@ -1129,6 +1129,19 @@ class SimulationSession:
                 self.is_connected = False
             self.state = "stopped"
 
+    def cleanup(self):
+        """Terminate the TraCI connection, stop simulation, and safely remove workspace files."""
+        self.stop()
+        with self._lock:
+            self.state = "cleaned"
+            if self.work_dir and self.work_dir.exists():
+                try:
+                    import shutil
+                    shutil.rmtree(self.work_dir, ignore_errors=True)
+                    logger.info("Cleaned up workspace directory for simulation %s: %s", self.sim_id, self.work_dir)
+                except Exception as exc:
+                    logger.warning("Error cleaning workspace for simulation %s: %s", self.sim_id, exc)
+
     def get_status(self) -> dict[str, Any]:
         """Return the current complete session state."""
         return {

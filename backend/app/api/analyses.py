@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import json
-from fastapi import APIRouter, HTTPException, Response
+import logging
+from fastapi import APIRouter, HTTPException, Depends, Request, Response
 from app.models.schemas import (
     CreateAnalysisRequest,
     AnalysisResult,
@@ -15,33 +16,43 @@ from app.services.analysis import (
     get_traffic_flow_by_id,
     get_recommendations_by_id,
 )
+from app.core.security import get_current_user, get_analysis_semaphore, sanitize_exception_detail
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/analyses", tags=["Analyses"])
 
 
 @router.post("", response_model=AnalysisResult, status_code=200)
-async def create_analysis(request: CreateAnalysisRequest):
+async def create_analysis(
+    request: CreateAnalysisRequest,
+    req: Request,
+    user: str = Depends(get_current_user),
+):
     """
     Submit a polygon for smart traffic and infrastructure analysis.
-
-    Validates polygon coordinates, retrieves road-network from OpenStreetMap,
-    gathers TomTom traffic telemetry and OpenWeather context, identifies bottlenecks,
-    and produces evidence-backed infrastructure recommendations.
+    Protected by authentication and concurrency controls.
     """
+    cid = getattr(req.state, "correlation_id", None)
+    sem = get_analysis_semaphore()
     try:
-        result = await run_analysis(request.polygon)
-        return result
+        async with sem:
+            result = await run_analysis(request.polygon)
+            return result
     except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
+        raise HTTPException(status_code=400, detail=sanitize_exception_detail(ve, correlation_id=cid))
     except Exception as exc:
+        logger.exception("Analysis error [Ref: %s]: %s", cid, exc)
         raise HTTPException(
             status_code=500,
-            detail=f"Analysis pipeline error: {exc}",
+            detail=sanitize_exception_detail(exc, correlation_id=cid),
         )
 
 
 @router.get("/{analysis_id}", response_model=AnalysisResult)
-async def get_analysis(analysis_id: str):
+async def get_analysis(
+    analysis_id: str,
+    user: str = Depends(get_current_user),
+):
     """Retrieve saved analysis overview by its unique identifier."""
     result = await get_analysis_by_id(analysis_id)
     if not result:
@@ -50,7 +61,10 @@ async def get_analysis(analysis_id: str):
 
 
 @router.get("/{analysis_id}/traffic-flow", response_model=TrafficFlowResult)
-async def get_traffic_flow(analysis_id: str):
+async def get_traffic_flow(
+    analysis_id: str,
+    user: str = Depends(get_current_user),
+):
     """Retrieve road-level traffic flow, speed metrics, and active incidents for the analysis."""
     result = await get_traffic_flow_by_id(analysis_id)
     if not result:
@@ -59,7 +73,10 @@ async def get_traffic_flow(analysis_id: str):
 
 
 @router.get("/{analysis_id}/recommendations", response_model=RecommendationsResult)
-async def get_recommendations(analysis_id: str):
+async def get_recommendations(
+    analysis_id: str,
+    user: str = Depends(get_current_user),
+):
     """Retrieve ranked, evidence-backed engineering recommendations for the analysis."""
     result = await get_recommendations_by_id(analysis_id)
     if not result:
@@ -68,7 +85,10 @@ async def get_recommendations(analysis_id: str):
 
 
 @router.get("/{analysis_id}/export/geojson")
-async def export_geojson(analysis_id: str):
+async def export_geojson(
+    analysis_id: str,
+    user: str = Depends(get_current_user),
+):
     """Export analysis road segments, bottlenecks, and polygon as a standardized GeoJSON FeatureCollection."""
     analysis = await get_analysis_by_id(analysis_id)
     if not analysis:

@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
+import { escapeHtml } from '../../lib/sanitize'
+import { classifyTrafficFlow } from '../../lib/trafficClassification'
 import {
   type BaseLayerType,
   type BaseMapStatus,
@@ -269,34 +271,19 @@ export default function AnalysisMap({
       let opacity = 0.75
       let dashArray: string | undefined = undefined
 
-      if (mode === 'flow') {
-        const level = seg.traffic?.congestion_level
-        if (isClosed) {
-          // Closed road: distinct dark charcoal/black with prominent dash
-          color = '#1e1b18'
-          weight = isSelected ? 7 : 5.5
-          opacity = 1.0
-          dashArray = '6, 6'
-        } else if (level === 'severe') {
-          color = '#ba1a1a'
-          weight = isSelected ? 7 : 5
-          opacity = 0.95
-        } else if (level === 'moderate') {
-          color = '#ff9933'
-          weight = isSelected ? 6 : 4
-          opacity = 0.9
-        } else if (level === 'free_flow') {
-          color = '#138808'
-          weight = isSelected ? 5.5 : 3.5
-          opacity = 0.85
-        } else {
-          // Unobserved / unknown
-          color = '#94a3b8'
-          weight = isSelected ? 4 : 2
-          opacity = 0.55
-        }
+      const sci = classifyTrafficFlow(
+        seg.traffic?.observed_speed_kmh,
+        seg.traffic?.free_flow_speed_kmh,
+        isClosed
+      )
 
-        if (isLowMatch && !isClosed) {
+      if (mode === 'flow') {
+        color = sci.mapColor
+        weight = sci.mapWeight(isSelected)
+        opacity = sci.mapOpacity
+        if (isClosed) {
+          dashArray = '6, 6'
+        } else if (isLowMatch) {
           dashArray = '4, 4'
         }
       } else {
@@ -338,31 +325,23 @@ export default function AnalysisMap({
           ? `${seg.traffic.match_quality}${seg.traffic.match_distance_m != null ? ` (${seg.traffic.match_distance_m.toFixed(1)}m)` : ''}`
           : 'osm-midpoint'
 
-        const statusBadge = isClosed
-          ? '<span class="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase bg-zinc-900 text-red-400 border border-red-500">ROAD CLOSED</span>'
-          : seg.traffic?.congestion_level === 'severe'
-          ? '<span class="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase bg-[#ffdad6] text-[#ba1a1a]">Severe Delay</span>'
-          : seg.traffic?.congestion_level === 'moderate'
-          ? '<span class="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase bg-[#ffeedb] text-[#b45309]">Moderate Congestion</span>'
-          : seg.traffic?.congestion_level === 'free_flow'
-          ? '<span class="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase bg-[#e6f4ea] text-[#138808]">Free Flow</span>'
-          : '<span class="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase bg-slate-100 text-slate-600">Unsampled</span>'
+        const statusBadge = `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase font-mono ${sci.badgeClass}">${escapeHtml(sci.grade)}</span>`
 
         polyline.bindTooltip(
           `<div class="font-sans text-xs min-w-[210px]">
             <div class="flex items-center justify-between gap-1 pb-1 mb-1 border-b border-slate-200">
-              <span class="font-bold text-[#0b1c30] text-[13px] truncate">${roadTitle}</span>
+              <span class="font-bold text-[#0b1c30] text-[13px] truncate">${escapeHtml(roadTitle)}</span>
               ${statusBadge}
             </div>
             <div class="grid grid-cols-2 gap-x-2 gap-y-1 text-[11px] text-[#334155] my-1">
               <div><span class="text-slate-500">Observed:</span> <strong>${obs}</strong></div>
               <div><span class="text-slate-500">Free-Flow:</span> <strong>${ff}</strong></div>
               <div><span class="text-slate-500">Delay:</span> <strong>${delayStr}</strong></div>
-              <div><span class="text-slate-500">Confidence:</span> <strong>${confStr}</strong></div>
+              <div><span class="text-slate-500">TomTom Confidence:</span> <strong>${confStr}</strong></div>
             </div>
             <div class="text-[10px] text-slate-500 border-t border-slate-100 pt-1 flex justify-between">
-              <span>${seg.road_type} • ${seg.length_m.toFixed(0)}m</span>
-              <span>Match: ${matchStr}</span>
+              <span>${escapeHtml(seg.road_type)} • ${seg.length_m.toFixed(0)}m</span>
+              <span>Match: ${escapeHtml(matchStr)}</span>
             </div>
           </div>`,
           { sticky: true, opacity: 0.98 }
@@ -439,8 +418,8 @@ export default function AnalysisMap({
         })
         incLine.bindTooltip(
           `<div class="font-sans text-xs">
-            <p class="font-bold text-[#ba1a1a]">${inc.type}</p>
-            <p class="text-[11px] text-slate-700">${inc.description || 'Traffic incident on corridor'}</p>
+            <p class="font-bold text-[#ba1a1a]">${escapeHtml(inc.type)}</p>
+            <p class="text-[11px] text-slate-700">${escapeHtml(inc.description || 'Traffic incident on corridor')}</p>
             ${inc.delay_seconds ? `<p class="font-bold text-red-700 text-[11px]">Delay: +${Math.round(inc.delay_seconds / 60)} min (${inc.delay_seconds.toFixed(0)}s)</p>` : ''}
           </div>`,
           { sticky: true }
@@ -452,7 +431,17 @@ export default function AnalysisMap({
         incidentMarkersMapRef.current.set(`line_${inc.incident_id}`, incLine)
       }
 
-      // 2. Incident Pin at [inc.lat, inc.lng]
+      // 2. Incident Pin at [inc.lat, inc.lng] (skip if coordinates invalid or (0,0))
+      if (
+        inc.lat == null ||
+        inc.lng == null ||
+        isNaN(inc.lat) ||
+        isNaN(inc.lng) ||
+        (inc.lat === 0 && inc.lng === 0)
+      ) {
+        return
+      }
+
       const delayBadge =
         inc.delay_seconds && inc.delay_seconds > 0
           ? `+${Math.round(inc.delay_seconds / 60)}m`
@@ -478,7 +467,7 @@ export default function AnalysisMap({
               <span class="material-symbols-outlined text-[13px]">${pinIcon}</span>
             </div>
             <span class="absolute -bottom-2 bg-red-950 text-white text-[9px] px-1 py-0.2 rounded font-mono font-bold shadow-xs whitespace-nowrap">
-              ${delayBadge}
+              ${escapeHtml(delayBadge)}
             </span>
           </div>
         `,
@@ -491,23 +480,23 @@ export default function AnalysisMap({
           <div class="flex items-center justify-between gap-2 border-b border-[#e2e8f0] pb-1.5 mb-2">
             <div class="flex items-center gap-1.5">
               <span class="w-2.5 h-2.5 rounded-full" style="background-color: ${pinBg};"></span>
-              <span class="font-bold text-xs uppercase tracking-tight text-[#ba1a1a]">${inc.type}</span>
+              <span class="font-bold text-xs uppercase tracking-tight text-[#ba1a1a]">${escapeHtml(inc.type)}</span>
             </div>
             <span class="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase ${
               isClosure ? 'bg-zinc-800 text-white' : 'bg-[#ffdad6] text-[#ba1a1a]'
-            }">${inc.severity_label || inc.severity || 'Active'}</span>
+            }">${escapeHtml(inc.severity_label || inc.severity || 'Active')}</span>
           </div>
 
-          <p class="font-bold text-[#0b1c30] text-sm leading-snug mb-1">${inc.description || 'Active incident impacting traffic corridor.'}</p>
+          <p class="font-bold text-[#0b1c30] text-sm leading-snug mb-1">${escapeHtml(inc.description || 'Active incident impacting traffic corridor.')}</p>
 
           ${
             inc.road_numbers && inc.road_numbers.length > 0
-              ? `<p class="text-[11px] text-[#554336] mb-1 font-semibold">Affected Corridor: ${inc.road_numbers.join(', ')}</p>`
+              ? `<p class="text-[11px] text-[#554336] mb-1 font-semibold">Affected Corridor: ${escapeHtml(inc.road_numbers.join(', '))}</p>`
               : ''
           }
           ${
             inc.from_location || inc.to_location
-              ? `<p class="text-[10px] text-slate-500 mb-1.5">Between: ${inc.from_location || '—'} &rarr; ${inc.to_location || '—'}</p>`
+              ? `<p class="text-[10px] text-slate-500 mb-1.5">Between: ${escapeHtml(inc.from_location || '—')} &rarr; ${escapeHtml(inc.to_location || '—')}</p>`
               : ''
           }
 
@@ -531,8 +520,32 @@ export default function AnalysisMap({
             ${
               inc.start_time
                 ? `<div class="flex justify-between text-[10px] text-slate-600">
-                    <span>Reported:</span>
+                    <span>Incident started:</span>
                     <span>${new Date(inc.start_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                   </div>`
+                : ''
+            }
+            ${
+              inc.last_report_time
+                ? `<div class="flex justify-between text-[10px] text-slate-600">
+                    <span>Last reported:</span>
+                    <span>${new Date(inc.last_report_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                   </div>`
+                : ''
+            }
+            ${
+              inc.end_time
+                ? `<div class="flex justify-between text-[10px] text-slate-600">
+                    <span>Incident ends:</span>
+                    <span>${new Date(inc.end_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                   </div>`
+                : ''
+            }
+            ${
+              inc.retrieval_timestamp
+                ? `<div class="flex justify-between text-[10px] text-slate-500">
+                    <span>Retrieved:</span>
+                    <span>${new Date(inc.retrieval_timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                    </div>`
                 : ''
             }
@@ -540,7 +553,7 @@ export default function AnalysisMap({
 
           <div class="flex items-center justify-between text-[10px] text-[#64748b] bg-[#f8fafc] p-1.5 rounded">
             <span>Correlated Segments: <strong>${inc.affected_segment_ids.length}</strong></span>
-            <span>Match: <strong>${inc.match_quality || 'spatial'}</strong></span>
+            <span>Match: <strong>${escapeHtml(inc.match_quality || 'spatial')}</strong></span>
           </div>
         </div>
       `
@@ -601,26 +614,26 @@ export default function AnalysisMap({
           <div class="flex items-center justify-between gap-2 border-b border-[#e2e8f0] pb-1.5 mb-2">
             <div class="flex items-center gap-1.5">
               <span class="w-2.5 h-2.5 rounded-full ${isHigh ? 'bg-[#ba1a1a]' : 'bg-[#ff9933]'}"></span>
-              <span class="font-bold text-[#ba1a1a] text-xs uppercase tracking-tight">Traffic Problem ${label}</span>
+              <span class="font-bold text-[#ba1a1a] text-xs uppercase tracking-tight">Traffic Problem ${escapeHtml(label)}</span>
             </div>
             <span class="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase ${
               isHigh ? 'bg-[#ffdad6] text-[#ba1a1a]' : 'bg-[#ffeedb] text-[#855400]'
-            }">${b.severity}</span>
+            }">${escapeHtml(b.severity)}</span>
           </div>
 
-          <p class="font-bold text-[#0b1c30] text-sm leading-snug mb-1.5">${locationLabel}</p>
+          <p class="font-bold text-[#0b1c30] text-sm leading-snug mb-1.5">${escapeHtml(locationLabel)}</p>
 
           <div class="bg-[#f8f9ff] p-2 rounded-lg border border-[#e0e7ff] mb-2">
             <p class="text-[10px] font-semibold text-[#545a90] uppercase mb-1">Diagnosis Evidence</p>
             <ul class="text-[11px] text-[#334155] space-y-0.5 pl-3 list-disc">
-              ${b.evidence.map((ev) => `<li>${ev}</li>`).join('')}
+              ${b.evidence.map((ev) => `<li>${escapeHtml(ev)}</li>`).join('')}
             </ul>
           </div>
 
           ${
             matchingRec
               ? `<div class="bg-[#e6f4ea] border border-[#a8dab5] p-2 rounded-lg text-[11px] text-[#0d652d]">
-                  <p class="font-bold">Proposed Fix: ${matchingRec.title}</p>
+                  <p class="font-bold">Proposed Fix: ${escapeHtml(matchingRec.title)}</p>
                   <p class="text-[10px] text-[#137333] mt-0.5">Impact Score: ${matchingRec.impact_score.toFixed(1)}/10</p>
                  </div>`
               : ''
@@ -676,7 +689,7 @@ export default function AnalysisMap({
           <div class="relative w-8 h-8 flex items-center justify-center cursor-pointer group">
             <span class="absolute w-7 h-7 rounded-full" style="background-color: ${haloColor};"></span>
             <div class="relative w-7 h-7 rounded-full flex items-center justify-center shadow-lg border-2 border-white font-mono text-[10px] font-bold text-white transition-transform transform group-hover:scale-110" style="background-color: ${pinBg};">
-              ${label}
+              ${escapeHtml(label)}
             </div>
           </div>
         `,
@@ -698,26 +711,26 @@ export default function AnalysisMap({
           <div class="flex items-center justify-between gap-2 border-b border-[#e2e8f0] pb-1.5 mb-2">
             <div class="flex items-center gap-1.5">
               <span class="w-2.5 h-2.5 rounded-full" style="background-color: ${pinBg};"></span>
-              <span class="font-bold text-xs uppercase tracking-tight" style="color: ${pinBg};">${label}</span>
+              <span class="font-bold text-xs uppercase tracking-tight" style="color: ${pinBg};">${escapeHtml(label)}</span>
               ${categoryBadge}
             </div>
-            <span class="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase ${priorityBadgeClass}">${rec.priority} Priority</span>
+            <span class="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase ${priorityBadgeClass}">${escapeHtml(rec.priority)} Priority</span>
           </div>
 
-          <p class="font-bold text-[#0b1c30] text-sm leading-snug mb-1">${rec.title}</p>
-          <p class="text-[11px] text-[#554336] mb-2 font-medium">📍 ${locationLabel}</p>
+          <p class="font-bold text-[#0b1c30] text-sm leading-snug mb-1">${escapeHtml(rec.title)}</p>
+          <p class="text-[11px] text-[#554336] mb-2 font-medium">📍 ${escapeHtml(locationLabel)}</p>
 
           <div class="bg-[#f0fdf4] p-2 rounded-lg border border-[#bbf7d0] mb-2">
             <div class="flex items-center justify-between mb-1">
               <span class="text-[10px] font-bold uppercase text-[#166534]">Impact Rating</span>
               <span class="font-mono font-bold text-xs text-[#166534]">${rec.impact_score.toFixed(1)} / 10</span>
             </div>
-            <p class="text-[11px] text-[#1e293b] leading-relaxed">${rec.description}</p>
+            <p class="text-[11px] text-[#1e293b] leading-relaxed">${escapeHtml(rec.description)}</p>
           </div>
 
           <div class="flex items-center justify-between text-[10px] text-[#64748b] bg-[#f8fafc] p-1.5 rounded">
-            <span>Intervention: <strong>${rec.intervention_type.replace(/_/g, ' ')}</strong></span>
-            <span>Confidence: <strong>${rec.confidence}</strong></span>
+            <span>Intervention: <strong>${escapeHtml(rec.intervention_type.replace(/_/g, ' '))}</strong></span>
+            <span>Confidence: <strong>${escapeHtml(rec.confidence)}</strong></span>
           </div>
         </div>
       `
@@ -794,7 +807,7 @@ export default function AnalysisMap({
 
     if (selectedIncidentId) {
       const inc = incidents.find((i) => i.incident_id === selectedIncidentId)
-      if (inc) {
+      if (inc && inc.lat != null && inc.lng != null) {
         map.flyTo([inc.lat, inc.lng], 16, { duration: 0.8 })
         const marker = incidentMarkersMapRef.current.get(`marker_${inc.incident_id}`) as L.Marker | undefined
         if (marker && typeof marker.openPopup === 'function') {

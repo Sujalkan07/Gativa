@@ -1,6 +1,7 @@
 import { useState, useMemo } from 'react'
 import AnalysisMap from './AnalysisMap'
 import type { AnalysisResult, TrafficFlowResult, RoadSegment } from '../../types/api'
+import { classifyTrafficFlow } from '../../lib/trafficClassification'
 
 interface TrafficFlowTabProps {
   analysis: AnalysisResult
@@ -47,70 +48,14 @@ export default function TrafficFlowTab({
     return trafficData?.incidents ?? []
   }, [trafficData])
 
-  // Gativa Speed Condition Index Heuristic (Replaces misleading LOS)
+  // Gativa Speed Condition Index Heuristic (Replaces misleading LOS) via unified classifier
   const getGativaSpeedIndex = (obsSpeed?: number | null, freeFlowSpeed?: number | null, isClosed?: boolean) => {
-    if (isClosed) {
-      return {
-        grade: 'CLOSED',
-        label: 'Road Closed',
-        color: 'bg-zinc-900 text-red-400 border border-red-500',
-        ratio: 0,
-      }
-    }
-    if (obsSpeed == null || freeFlowSpeed == null || freeFlowSpeed <= 0) {
-      return {
-        grade: '—',
-        label: 'Unsampled',
-        color: 'bg-slate-100 text-slate-500 border border-slate-200',
-        ratio: null,
-      }
-    }
-    const ratio = obsSpeed / freeFlowSpeed
-    if (ratio >= 0.85) {
-      return {
-        grade: 'SCI A',
-        label: 'Optimal (≥85%)',
-        color: 'bg-[#138808]/15 text-[#138808] border border-[#138808]/30',
-        ratio,
-      }
-    }
-    if (ratio >= 0.70) {
-      return {
-        grade: 'SCI B',
-        label: 'Minor Slowdown (70-85%)',
-        color: 'bg-[#138808]/10 text-[#138808] border border-[#138808]/20',
-        ratio,
-      }
-    }
-    if (ratio >= 0.55) {
-      return {
-        grade: 'SCI C',
-        label: 'Moderate Delay (55-70%)',
-        color: 'bg-[#ff9933]/15 text-[#b45309] border border-[#ff9933]/30',
-        ratio,
-      }
-    }
-    if (ratio >= 0.40) {
-      return {
-        grade: 'SCI D',
-        label: 'Heavy Delay (40-55%)',
-        color: 'bg-[#ff9933]/25 text-[#b45309] border border-[#ff9933]/40',
-        ratio,
-      }
-    }
-    if (ratio >= 0.28) {
-      return {
-        grade: 'SCI E',
-        label: 'Severe Bottleneck (28-40%)',
-        color: 'bg-[#ba1a1a]/15 text-[#ba1a1a] border border-[#ba1a1a]/30',
-        ratio,
-      }
-    }
+    const res = classifyTrafficFlow(obsSpeed, freeFlowSpeed, isClosed)
     return {
-      grade: 'SCI F',
-      label: 'Severe Breakdown (<28%)',
-      color: 'bg-[#ba1a1a]/25 text-[#ba1a1a] border border-[#ba1a1a]/40',
-      ratio,
+      grade: res.grade === 'SCI CLOSED' ? 'CLOSED' : res.grade,
+      label: res.label,
+      color: res.badgeClass,
+      ratio: res.ratio,
     }
   }
 

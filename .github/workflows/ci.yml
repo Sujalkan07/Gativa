@@ -38,7 +38,7 @@ jobs:
         run: python -m pytest -q -k "not live"
 
   frontend:
-    name: Frontend typecheck and production build
+    name: Frontend lint, test, typecheck and build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -50,6 +50,12 @@ jobs:
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci
+      - name: Lint frontend code
+        working-directory: frontend
+        run: npm run lint
+      - name: Run frontend unit tests
+        working-directory: frontend
+        run: npm test
       - name: Typecheck and build
         working-directory: frontend
         run: npm run build

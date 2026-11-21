@@ -1,6 +1,7 @@
 """Pydantic schemas for all API request/response contracts."""
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field, field_validator
@@ -20,18 +21,50 @@ class GeoJSONPolygon(BaseModel):
     def validate_polygon(cls, v: list[list[list[float]]]) -> list[list[list[float]]]:
         if not v or len(v) == 0:
             raise ValueError("Polygon must have at least one ring")
-        ring = v[0]
-        if len(ring) < 4:
-            raise ValueError("Polygon ring must have at least 4 coordinate pairs (3 points + closing point)")
-        for coord in ring:
-            if len(coord) != 2:
-                raise ValueError("Each coordinate must be [longitude, latitude]")
-            lng, lat = coord
-            if not (-180 <= lng <= 180):
-                raise ValueError(f"Longitude {lng} out of range [-180, 180]")
-            if not (-90 <= lat <= 90):
-                raise ValueError(f"Latitude {lat} out of range [-90, 90]")
-        return v
+        cleaned_rings: list[list[list[float]]] = []
+        for ring_idx, ring in enumerate(v):
+            if not ring or len(ring) < 4:
+                raise ValueError(
+                    f"Polygon ring {ring_idx} must have at least 4 coordinate pairs (3 points + closing point)"
+                )
+            cleaned_ring: list[list[float]] = []
+            for coord_idx, coord in enumerate(ring):
+                if len(coord) != 2:
+                    raise ValueError(f"Ring {ring_idx} coordinate {coord_idx} must be [longitude, latitude]")
+                try:
+                    lng, lat = float(coord[0]), float(coord[1])
+                except (ValueError, TypeError):
+                    raise ValueError(f"Ring {ring_idx} coordinate {coord_idx} contains non-numeric values")
+                if not (math.isfinite(lng) and math.isfinite(lat)):
+                    raise ValueError(f"Ring {ring_idx} coordinate {coord_idx} contains non-finite numbers")
+                if not (-180 <= lng <= 180):
+                    raise ValueError(f"Longitude {lng} out of range [-180, 180]")
+                if not (-90 <= lat <= 90):
+                    raise ValueError(f"Latitude {lat} out of range [-90, 90]")
+                cleaned_ring.append([lng, lat])
+
+            # Check ring closure (first point equals last point)
+            if abs(cleaned_ring[0][0] - cleaned_ring[-1][0]) > 1e-6 or abs(cleaned_ring[0][1] - cleaned_ring[-1][1]) > 1e-6:
+                raise ValueError(f"Polygon ring {ring_idx} must be closed (first and last coordinates must match)")
+            cleaned_rings.append(cleaned_ring)
+
+        # If interior rings exist, validate geometry with Shapely
+        if len(cleaned_rings) > 1:
+            try:
+                from shapely.geometry import Polygon as SPolygon
+                shell = cleaned_rings[0]
+                holes = cleaned_rings[1:]
+                poly = SPolygon(shell=shell, holes=holes)
+                if not poly.is_valid:
+                    raise ValueError("Polygon geometry with interior rings (holes) is topologically invalid")
+            except ImportError:
+                pass
+            except Exception as e:
+                if isinstance(e, ValueError):
+                    raise
+                raise ValueError(f"Invalid polygon geometry with holes: {e}")
+
+        return cleaned_rings
 
 
 class GeoJSONLineString(BaseModel):
@@ -100,6 +133,7 @@ class TrafficObservation(BaseModel):
     openlr: Optional[str] = None
     match_quality: Optional[str] = None
     match_distance_m: Optional[float] = None
+    geometry_consistency_warning: Optional[str] = None
 
 
 class RoadSegment(BaseModel):
@@ -131,10 +165,10 @@ class TrafficIncident(BaseModel):
     incident_id: str
     type: str
     description: Optional[str] = None
-    lat: float
-    lng: float
+    lat: Optional[float] = None
+    lng: Optional[float] = None
     severity: Optional[str] = None
-    affected_segment_ids: list[str] = []
+    affected_segment_ids: list[str] = Field(default_factory=list)
     # Phase 1 Extended Fields
     icon_category: Optional[int] = None
     icon_category_name: Optional[str] = None
@@ -156,6 +190,10 @@ class TrafficIncident(BaseModel):
     last_report_time: Optional[str] = None
     geometry: Optional[dict[str, Any]] = None
     match_quality: Optional[str] = None
+    retrieval_timestamp: Optional[str] = None
+    confirmed_segment_ids: list[str] = Field(default_factory=list)
+    likely_segment_ids: list[str] = Field(default_factory=list)
+    nearby_segment_ids: list[str] = Field(default_factory=list)
 
 
 class TrafficSummary(BaseModel):
@@ -379,14 +417,38 @@ class SimulationPrepareRequest(BaseModel):
     demand_level: Optional[DemandLevel] = "normal"
     demand_profile: Optional[DemandProfile] = "peak"
     vehicle_types: Optional[dict[str, float]] = None
-    manual_vehicle_count: Optional[int] = None
-    seed: Optional[int] = 42
+    manual_vehicle_count: Optional[int] = Field(default=None, ge=0, le=10000)
+    seed: Optional[int] = Field(default=42, ge=0, le=2147483647)
     demand_data_source: Optional[str] = None
     is_synthetic_demo: bool = False
-    approved_candidate_ids: Optional[list[str]] = None
-    initial_population: Optional[int] = None
-    external_buffer_m: Optional[float] = 500.0
+    approved_candidate_ids: Optional[list[str]] = Field(default=None, max_length=200)
+    initial_population: Optional[int] = Field(default=None, ge=0, le=10000)
+    external_buffer_m: Optional[float] = Field(default=500.0, ge=0.0, le=2000.0)
     target_mode: Optional[str] = "network"
+
+    @field_validator("approved_candidate_ids")
+    @classmethod
+    def validate_candidate_ids(cls, v: Optional[list[str]]) -> Optional[list[str]]:
+        if v is None:
+            return None
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for item in v:
+            clean = str(item).strip()
+            if clean and clean not in seen:
+                seen.add(clean)
+                deduped.append(clean)
+        return deduped
+
+    @field_validator("vehicle_types")
+    @classmethod
+    def validate_vehicle_types(cls, v: Optional[dict[str, float]]) -> Optional[dict[str, float]]:
+        if v is None:
+            return None
+        for k, weight in v.items():
+            if weight < 0 or not math.isfinite(weight):
+                raise ValueError(f"Vehicle type weight for '{k}' must be non-negative and finite")
+        return v
 
 
 class VehiclePosition(BaseModel):

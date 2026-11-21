@@ -391,6 +391,17 @@ class SimulationService:
 
         return SimulationStatusResponse(**session.get_status())
 
+    def cleanup(self, sim_id: str) -> dict[str, str]:
+        session = self._sessions.pop(sim_id, None)
+        base_session = self._baseline_sessions.pop(sim_id, None)
+        if not session and not base_session:
+            raise KeyError(f"Simulation {sim_id} not found")
+        if session:
+            session.cleanup()
+        if base_session:
+            base_session.cleanup()
+        return {"sim_id": sim_id, "status": "cleaned"}
+
     def get_status(self, sim_id: str) -> SimulationStatusResponse:
         session = self._sessions.get(sim_id)
         if not session:

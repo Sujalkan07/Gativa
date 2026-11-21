@@ -19,7 +19,14 @@ This is not a multi-tenant or horizontally scalable design. SUMO sessions live i
 
 ## Request and resource limits
 
-The API currently enforces a maximum analysis area (`MAX_AREA_KM2`, default 50 km²), geocoding query bounds, simulation duration (60–3600 seconds), demand bounds (100–10,000 vehicles/hour), step batches (1–20), and a network cap of 1,000 road segments. These are application validation limits, not protection against request floods.
+The API enforces a maximum analysis area (`MAX_AREA_KM2`, default 50 km²), geocoding query bounds, simulation duration (60–3600 seconds), demand bounds (100–10,000 vehicles/hour), step batches (1–20), and a network cap of 1,200 road segments (`MAX_SEGMENTS`).
+
+Additionally, the backend natively enforces security perimeter controls:
+- **Rate limiting**: In-memory sliding-window rate limiting (`RATE_LIMIT_PER_MINUTE`, default 120 req/min) returning HTTP 429 when exceeded.
+- **Concurrency semaphores**: Strictly caps concurrent heavy operations (`MAX_CONCURRENT_ANALYSES`, default 3; `MAX_CONCURRENT_SIMULATIONS`, default 2).
+- **Session lifecycle**: Session cleanup via `DELETE /api/simulations/{sim_id}` safely terminates child TraCI processes and cleans temporary scratch directories, while auto-purging old inactive sessions when `MAX_ACTIVE_SESSIONS` (default 5) is reached.
+- **Request payload limits**: Enforces a 5 MB maximum request body size with streaming verification.
+- **Safe server binding**: Defaults to loopback `127.0.0.1`; external binding requires explicit opt-in (`ALLOW_EXTERNAL_BINDING=true`).
 
 For a private hosted deployment, configure reverse-proxy limits before opening access:
 
